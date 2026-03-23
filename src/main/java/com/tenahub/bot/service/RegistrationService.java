@@ -16,6 +16,8 @@ public interface RegistrationService {
 
     void saveLocation(Long telegramId, Double latitude, Double longitude);
 
+    void saveLocationDetails(Long telegramId, String formattedAddress, String landmark, String plusCode);
+
     Long saveLicense(Long telegramId, String fileId);
 
     Long approve(Long registrationId);

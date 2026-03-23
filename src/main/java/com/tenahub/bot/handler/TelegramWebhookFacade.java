@@ -2480,6 +2480,13 @@ String area = (session.getArea() == null || session.getArea().isBlank())
             registrationService.saveLocation(chatId, session.getLatitude(), session.getLongitude());
         }
 
+        registrationService.saveLocationDetails(
+                chatId,
+                session.getFormattedAddress(),
+                session.getLandmark(),
+                session.getPlusCode()
+        );
+
         Long registrationId = registrationService.saveLicense(chatId, fileId);
         var reg = registrationService.getRegistration(registrationId);
 
@@ -5233,6 +5240,18 @@ private boolean handleRegistrationLocationText(Long chatId, String text) {
 
     String value = text == null ? "" : text.trim();
     String normalized = value.toLowerCase();
+
+    // Handle landmark input / skip
+    if (session.isWaitingForLandmark()) {
+        if (normalized.equals("⏭ skip landmark")) {
+            session.setLandmark(null);
+        } else {
+            session.setLandmark(value);
+        }
+        session.clearLocationFlags();
+        telegramClient.sendMessage(chatId, "Step 7/7\n📄 Now upload your pharmacy license.");
+        return true;
+    }
 
 if (normalized.equals("📍 share exact pharmacy location".toLowerCase())
         || normalized.equals("📍 send pharmacy location".toLowerCase())) {
