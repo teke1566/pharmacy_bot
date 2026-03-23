@@ -2479,8 +2479,8 @@ String area = (session.getArea() == null || session.getArea().isBlank())
                     chatId
             );
 
-            registrationService.saveLocation(chatId, session.getLatitude(), session.getLongitude(),
-                    session.getFormattedAddress(), session.getPlusCode(), session.getLandmark());
+            registrationService.saveLocation(chatId, session.getLatitude(), session.getLongitude());
+            registrationService.saveLocationDetails(chatId, session.getFormattedAddress(), session.getLandmark(), session.getPlusCode());
         }
 
         Long registrationId = registrationService.saveLicense(chatId, fileId);
@@ -5455,6 +5455,17 @@ if (session.isWaitingForAreaSelection()) {
     finalizeRegistrationLocation(chatId, session);
     return true;
 }
+
+    if (session.isWaitingForLandmark()) {
+        if (normalized.equals("⏭ skip landmark")) {
+            session.setWaitingForLandmark(false);
+        } else {
+            session.setLandmark(value);
+            session.setWaitingForLandmark(false);
+        }
+        telegramClient.sendMessage(chatId, "Step 7/7\n📄 Now upload your pharmacy license.");
+        return true;
+    }
 
     return false;
 }

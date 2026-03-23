@@ -68,6 +68,23 @@ public Long register(String name,
 
         registrationRepository.save(reg);
     }
+
+    @Override
+    public void saveLocationDetails(Long telegramId, String formattedAddress, String landmark, String plusCode) {
+        Optional<PharmacyRegistration> optional =
+                registrationRepository.findFirstByTelegramIdAndStatusOrderByIdDesc(telegramId, "PENDING");
+
+        if (optional.isEmpty()) {
+            return;
+        }
+
+        PharmacyRegistration reg = optional.get();
+        reg.setFormattedAddress(formattedAddress);
+        reg.setLandmark(landmark);
+        reg.setPlusCode(plusCode);
+
+        registrationRepository.save(reg);
+    }
     
 
     @Override
@@ -106,8 +123,8 @@ public Long register(String name,
                 .latitude(reg.getLatitude())
                 .longitude(reg.getLongitude())
                 .formattedAddress(reg.getFormattedAddress())
-                .plusCode(reg.getPlusCode())
                 .landmark(reg.getLandmark())
+                .plusCode(reg.getPlusCode())
                 .telegramId(reg.getTelegramId())
                 .licenseFileId(reg.getLicenseFileId())
                 .approved(true)
