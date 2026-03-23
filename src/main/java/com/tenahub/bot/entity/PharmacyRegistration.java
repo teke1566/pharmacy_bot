@@ -34,8 +34,4 @@ public class PharmacyRegistration {
 
     @Column(name = "rejection_reason")
     private String rejectionReason;
-
-    private String formattedAddress;
-    private String landmark;
-    private String plusCode;
 }
