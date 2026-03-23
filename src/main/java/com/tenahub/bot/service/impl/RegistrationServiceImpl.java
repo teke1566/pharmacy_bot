@@ -85,7 +85,25 @@ public Long register(String name,
 
         registrationRepository.save(reg);
     }
-    
+
+    @Override
+    public void saveLocationDetails(Long telegramId, String formattedAddress, String landmark, String plusCode) {
+        Optional<PharmacyRegistration> optional =
+                registrationRepository.findFirstByTelegramIdAndStatusOrderByIdDesc(telegramId, "PENDING");
+
+        if (optional.isEmpty()) {
+            System.out.println("saveLocationDetails: no pending registration found for telegramId=" + telegramId);
+            return;
+        }
+
+        PharmacyRegistration reg = optional.get();
+        reg.setFormattedAddress(formattedAddress);
+        reg.setLandmark(landmark);
+        reg.setPlusCode(plusCode);
+
+        registrationRepository.save(reg);
+    }
+
 
     @Override
     public Long saveLicense(Long telegramId, String fileId) {
