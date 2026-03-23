@@ -14,7 +14,8 @@ public interface RegistrationService {
                   String closeTime,
                   Long telegramId);
 
-    void saveLocation(Long telegramId, Double latitude, Double longitude);
+    void saveLocation(Long telegramId, Double latitude, Double longitude,
+                      String formattedAddress, String plusCode, String landmark);
 
     Long saveLicense(Long telegramId, String fileId);
 
