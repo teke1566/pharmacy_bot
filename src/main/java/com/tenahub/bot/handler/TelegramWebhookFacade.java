@@ -2457,6 +2457,8 @@ if (RegistrationSessionManager.exists(chatId)) {
                 telegramClient.sendMessage(chatId, "⚠️ License already uploaded.");
                 return;
             }
+            registrationService.saveLocation(chatId, session.getLatitude(), session.getLongitude(),
+                    session.getFormattedAddress(), session.getPlusCode(), session.getLandmark());
         } else {
             String city = (session.getCity() == null || session.getCity().isBlank())
         ? "Unknown City"
@@ -2789,7 +2791,7 @@ if (normalizedText.contains("share exact pharmacy location")) {
         session.setLongitude(regLon);
         session.clearLocationFlags();
 
-        registrationService.saveLocation(chatId, regLat, regLon);
+        registrationService.saveLocation(chatId, regLat, regLon, null, null, null);
 
         telegramClient.sendLocation(chatId, regLat, regLon);
         telegramClient.sendMessage(
@@ -5311,6 +5313,18 @@ if (normalized.equals("📍 share exact pharmacy location".toLowerCase())
         RegistrationSessionManager.remove(chatId);
         telegramClient.sendMessage(chatId, "❌ Registration cancelled.");
         restoreKeyboard(chatId);
+        return true;
+    }
+
+    if (session.isWaitingForLandmark()) {
+        if (normalized.equals("⏭ skip landmark")) {
+            session.setWaitingForLandmark(false);
+            session.setLandmark(null);
+        } else {
+            session.setLandmark(value);
+            session.setWaitingForLandmark(false);
+        }
+        telegramClient.sendMessage(chatId, "Step 7/7\n📄 Now upload your pharmacy license.");
         return true;
     }
 

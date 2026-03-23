@@ -28,6 +28,10 @@ public class PharmacyRegistration {
     private String openTime;
     private String closeTime;
 
+    private String formattedAddress;
+    private String landmark;
+    private String plusCode;
+
     @Column(name = "rejection_reason")
     private String rejectionReason;
 
