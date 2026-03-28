@@ -1,6 +1,9 @@
 package com.tenahub.bot.util;
 
 import com.tenahub.bot.registration.RegistrationStep;
+import jakarta.annotation.PostConstruct;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.*;
 import org.springframework.stereotype.Component;
@@ -16,12 +19,23 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 @Component
+@Slf4j
 public class TelegramClient {
 
     private final RestTemplate restTemplate = new RestTemplate();
 
-    private final String botToken = "";
-    private final String apiUrl = "https://api.telegram.org/bot" + botToken;
+    @Value("${telegram.bot-token}")
+    private String botToken;
+
+    @Value("${telegram.api-url}")
+    private String baseApiUrl;
+
+    private String apiUrl;
+
+    @PostConstruct
+    public void init() {
+        this.apiUrl = baseApiUrl + "/bot" + botToken;
+    }
 
     /* ---------------- BASIC SEND ---------------- */
 
@@ -36,7 +50,7 @@ public class TelegramClient {
 
             restTemplate.postForObject(url, body, String.class);
         } catch (Exception e) {
-            System.out.println("Telegram sendMessage error: " + e.getMessage());
+            log.warn("Telegram sendMessage error: {}", e.getMessage());
         }
     }
 
@@ -52,7 +66,7 @@ public class TelegramClient {
 
             restTemplate.postForObject(url, body, String.class);
         } catch (Exception e) {
-            System.out.println("Telegram sendPhoto error: " + e.getMessage());
+            log.warn("Telegram sendPhoto error: {}", e.getMessage());
         }
     }
 
@@ -68,7 +82,7 @@ public class TelegramClient {
 
             restTemplate.postForObject(url, body, String.class);
         } catch (Exception e) {
-            System.out.println("Telegram sendDocument error: " + e.getMessage());
+            log.warn("Telegram sendDocument error: {}", e.getMessage());
         }
     }
 
