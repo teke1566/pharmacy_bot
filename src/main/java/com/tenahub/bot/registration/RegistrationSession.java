@@ -2,6 +2,8 @@ package com.tenahub.bot.registration;
 
 import lombok.Data;
 
+import java.time.LocalDate;
+
 @Data
 public class RegistrationSession {
 
@@ -22,7 +24,12 @@ public class RegistrationSession {
     private String formattedAddress;
     private String landmark;
 private boolean waitingForLandmark;
+    private boolean waitingForPlusCode;
+    private boolean waitingForExactAddress;
+    private boolean waitingForLicenseExpiryDate;
     private String plusCode;
+    private String exactAddress;
+    private LocalDate licenseExpiryDate;
 
     private boolean waitingForExactLocation;
     private boolean waitingForGoogleMapLink;
@@ -44,6 +51,9 @@ private boolean waitingForLandmark;
         this.waitingForSubCitySelection = false;
         this.waitingForAreaSelection = false;
         this.waitingForLandmark = false;
+        this.waitingForPlusCode = false;
+        this.waitingForExactAddress = false;
+        this.waitingForLicenseExpiryDate = false;
     }
 
     public void setExactLocationMode() {
@@ -88,4 +98,17 @@ private boolean waitingForLandmark;
     clearLocationFlags();
     this.waitingForLandmark = true;
 }
+    public void setPlusCodeMode() {
+        clearLocationFlags();
+        this.waitingForPlusCode = true;
+    }
+    public void setExactAddressMode() {
+        clearLocationFlags();
+        this.waitingForExactAddress = true;
+    }
+
+    public void setLicenseExpiryDateMode() {
+        clearLocationFlags();
+        this.waitingForLicenseExpiryDate = true;
+    }
 }

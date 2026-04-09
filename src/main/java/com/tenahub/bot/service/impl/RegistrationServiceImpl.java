@@ -6,9 +6,11 @@ import com.tenahub.bot.repository.PharmacyRegistrationRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
 import com.tenahub.bot.service.InventoryService;
 import com.tenahub.bot.service.RegistrationService;
+import com.tenahub.bot.util.MedicineSearchNormalizer;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
@@ -40,7 +42,7 @@ public Long register(String name,
     registration.setCity(city);
     registration.setArea(area);
     registration.setPhone(phone);
-    registration.setMedicines(medicines);
+    registration.setMedicines(MedicineSearchNormalizer.normalizeCommaSeparatedMedicines(medicines));
     registration.setOpenTime(openTime);
     registration.setCloseTime(closeTime);
     registration.setTelegramId(telegramId);
@@ -87,6 +89,20 @@ public Long register(String name,
         registrationRepository.save(reg);
     }
 
+    @Override
+    public void saveLicenseExpiryDate(Long telegramId, LocalDate expiryDate) {
+        Optional<PharmacyRegistration> optional =
+                registrationRepository.findFirstByTelegramIdAndStatusOrderByIdDesc(telegramId, "PENDING");
+
+        if (optional.isEmpty()) {
+            return;
+        }
+
+        PharmacyRegistration reg = optional.get();
+        reg.setLicenseExpiryDate(expiryDate);
+        registrationRepository.save(reg);
+    }
+
 
     @Override
     public Long saveLicense(Long telegramId, String fileId) {
@@ -126,6 +142,9 @@ public Long register(String name,
                 .formattedAddress(reg.getFormattedAddress())
                 .landmark(reg.getLandmark())
                 .plusCode(reg.getPlusCode())
+                .licenseExpiryDate(reg.getLicenseExpiryDate())
+                .licenseSuspended(false)
+                .lastExpiryAlertSentDate(null)
                 .telegramId(reg.getTelegramId())
                 .licenseFileId(reg.getLicenseFileId())
                 .approved(true)

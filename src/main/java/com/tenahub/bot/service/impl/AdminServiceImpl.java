@@ -14,6 +14,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 
@@ -553,5 +554,242 @@ public String viewReservationsByStatus(MedicineReservationStatus status) {
     @Override
     public Page<Pharmacy> getPendingLicenseUpdatesPage(int page, int size) {
         return pharmacyRepository.findByLicenseUpdateStatusOrderByIdDesc("PENDING", PageRequest.of(page, size));
+    }
+
+    @Override
+    public Page<Pharmacy> getPharmacyManagementPage(int page, int size) {
+        return pharmacyRepository.findAllByOrderByIdDesc(PageRequest.of(page, size));
+    }
+
+    @Override
+    public Page<Pharmacy> searchPharmaciesByName(String name, int page, int size) {
+        return pharmacyRepository.findByNameContainingIgnoreCaseOrderByIdDesc(name, PageRequest.of(page, size));
+    }
+
+    @Override
+    public Page<Pharmacy> searchPharmaciesByPhone(String phone, int page, int size) {
+        return pharmacyRepository.findByPhoneContainingIgnoreCaseOrderByIdDesc(phone, PageRequest.of(page, size));
+    }
+
+    @Override
+    public Page<Pharmacy> searchPharmaciesByTelegramId(String telegramIdText, int page, int size) {
+        return pharmacyRepository.searchByTelegramIdText(telegramIdText, PageRequest.of(page, size));
+    }
+
+    @Override
+    public Pharmacy getPharmacy(Long pharmacyId) {
+        return pharmacyRepository.findById(pharmacyId)
+                .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+    }
+
+    @Override
+    public long countInventoryItems(Long pharmacyId) {
+        return pharmacyInventoryRepository.countByPharmacyId(pharmacyId);
+    }
+
+    @Override
+    public long countReservations(Long pharmacyId, MedicineReservationStatus status) {
+        return reservationRepository.countByPharmacyIdAndStatus(pharmacyId, status);
+    }
+
+    @Override
+    public void approvePharmacy(Long pharmacyId) {
+        Pharmacy pharmacy = getPharmacy(pharmacyId);
+        pharmacy.setApproved(true);
+        pharmacy.setLicenseSuspended(false);
+        pharmacyRepository.save(pharmacy);
+    }
+
+    @Override
+    public void setPharmacyNotApproved(Long pharmacyId) {
+        Pharmacy pharmacy = getPharmacy(pharmacyId);
+        pharmacy.setApproved(false);
+        pharmacy.setLicenseSuspended(false);
+        pharmacyRepository.save(pharmacy);
+    }
+
+    @Override
+    public void suspendPharmacy(Long pharmacyId) {
+        Pharmacy pharmacy = getPharmacy(pharmacyId);
+        pharmacy.setApproved(false);
+        pharmacy.setLicenseSuspended(true);
+        pharmacyRepository.save(pharmacy);
+    }
+
+    @Override
+    public void reactivatePharmacy(Long pharmacyId) {
+        Pharmacy pharmacy = getPharmacy(pharmacyId);
+        pharmacy.setApproved(true);
+        pharmacy.setLicenseSuspended(false);
+        pharmacyRepository.save(pharmacy);
+    }
+
+    @Override
+    public void updatePharmacyName(Long pharmacyId, String name) {
+        Pharmacy pharmacy = getPharmacy(pharmacyId);
+        pharmacy.setName(name);
+        pharmacyRepository.save(pharmacy);
+    }
+
+    @Override
+    public void updatePharmacyPhone(Long pharmacyId, String phone) {
+        Pharmacy pharmacy = getPharmacy(pharmacyId);
+        pharmacy.setPhone(phone);
+        pharmacyRepository.save(pharmacy);
+    }
+
+    @Override
+    public void updatePharmacyLandmark(Long pharmacyId, String landmark) {
+        Pharmacy pharmacy = getPharmacy(pharmacyId);
+        pharmacy.setLandmark(landmark);
+        pharmacyRepository.save(pharmacy);
+    }
+
+    @Override
+    public void updatePharmacyHours(Long pharmacyId, LocalTime openTime, LocalTime closeTime) {
+        Pharmacy pharmacy = getPharmacy(pharmacyId);
+        pharmacy.setOpenTime(openTime);
+        pharmacy.setCloseTime(closeTime);
+        pharmacyRepository.save(pharmacy);
+    }
+
+    @Override
+    public void updatePharmacyLocation(Long pharmacyId, Double latitude, Double longitude, String city, String area) {
+        Pharmacy pharmacy = getPharmacy(pharmacyId);
+        pharmacy.setLatitude(latitude);
+        pharmacy.setLongitude(longitude);
+        pharmacy.setCity(city);
+        pharmacy.setArea(area);
+        pharmacyRepository.save(pharmacy);
+    }
+
+    // ---- Admin Reservation Deep View ----
+
+    @Override
+    public MedicineReservation getReservation(Long id) {
+        return reservationRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("Reservation not found: " + id));
+    }
+
+    @Override
+    public String buildAdminReservationDetail(Long id) {
+        MedicineReservation r = getReservation(id);
+        Pharmacy pharmacy = pharmacyRepository.findById(r.getPharmacyId()).orElse(null);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("📋 <b>Reservation #").append(r.getId()).append("</b>\n\n");
+        if (r.getQrToken() != null && !r.getQrToken().isBlank()) {
+            sb.append("🔐 <b>QR Token:</b> ").append(r.getQrToken()).append("\n");
+        }
+        sb.append("💊 <b>Medicine:</b> ").append(nullSafe(r.getMedicineName())).append("\n");
+        sb.append("🔢 <b>Qty:</b> ").append(r.getRequestedQuantity()).append("\n");
+        sb.append("📊 <b>Status:</b> ").append(r.getStatus()).append("\n\n");
+
+        sb.append("👤 <b>Customer:</b>\n");
+        sb.append("  Name: ").append(nullSafe(r.getCustomerName())).append("\n");
+        sb.append("  Phone: ").append(nullSafe(r.getCustomerPhone())).append("\n");
+        sb.append("  User ID: ").append(r.getUserId()).append("\n\n");
+
+        sb.append("🏥 <b>Pharmacy:</b>\n");
+        if (pharmacy != null) {
+            sb.append("  Name: ").append(nullSafe(pharmacy.getName())).append("\n");
+            sb.append("  Phone: ").append(nullSafe(pharmacy.getPhone())).append("\n");
+            sb.append("  Location: ").append(nullSafe(pharmacy.getCity()))
+              .append(", ").append(nullSafe(pharmacy.getArea())).append("\n");
+            sb.append("  Telegram ID: ").append(pharmacy.getTelegramId()).append("\n\n");
+        } else {
+            sb.append("  Pharmacy ID: ").append(r.getPharmacyId()).append("\n\n");
+        }
+
+        sb.append("📅 <b>Timeline:</b>\n");
+        if (r.getCreatedAt() != null) {
+            sb.append("  Created: ").append(r.getCreatedAt().format(FORMATTER)).append("\n");
+        }
+        if (r.getApprovedAt() != null) {
+            sb.append("  Approved: ").append(r.getApprovedAt().format(FORMATTER)).append("\n");
+        }
+        if (r.getExpiresAt() != null) {
+            sb.append("  ⏳ Hold Until: ").append(r.getExpiresAt().format(FORMATTER)).append("\n");
+        }
+        if (r.getFulfilledAt() != null) {
+            sb.append("  Fulfilled: ").append(r.getFulfilledAt().format(FORMATTER)).append("\n");
+        }
+        if (r.getRejectionReason() != null && !r.getRejectionReason().isBlank()) {
+            sb.append("\n❌ <b>Rejection Reason:</b> ").append(r.getRejectionReason()).append("\n");
+        }
+        if (r.getNote() != null && !r.getNote().isBlank()) {
+            sb.append("\n📝 <b>Note:</b> ").append(r.getNote()).append("\n");
+        }
+        sb.append("\n🔒 Inventory held: ").append(r.isInventoryHeld() ? "Yes" : "No");
+
+        return sb.toString().trim();
+    }
+
+    private void releaseInventoryIfHeld(MedicineReservation reservation) {
+        if (!reservation.isInventoryHeld()) return;
+        var inventory = pharmacyInventoryRepository
+                .findByPharmacyIdAndMedicineNameIgnoreCase(
+                        reservation.getPharmacyId(),
+                        reservation.getMedicineName())
+                .orElse(null);
+        if (inventory != null) {
+            int qty = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
+            int release = reservation.getRequestedQuantity() == null ? 0 : reservation.getRequestedQuantity();
+            int newQty = qty + Math.max(release, 0);
+            inventory.setQuantity(newQty);
+            inventory.setOutOfStock(newQty <= 0);
+            pharmacyInventoryRepository.save(inventory);
+        }
+        reservation.setInventoryHeld(false);
+    }
+
+    @Override
+    public void adminCancelReservation(Long id) {
+        MedicineReservation r = getReservation(id);
+        if (r.getStatus() == MedicineReservationStatus.FULFILLED
+                || r.getStatus() == MedicineReservationStatus.CANCELLED
+                || r.getStatus() == MedicineReservationStatus.REJECTED
+                || r.getStatus() == MedicineReservationStatus.EXPIRED) {
+            throw new RuntimeException("Reservation is already in a terminal state: " + r.getStatus());
+        }
+        releaseInventoryIfHeld(r);
+        r.setStatus(MedicineReservationStatus.CANCELLED);
+        r.setNote("ADMIN_FORCED_CANCEL");
+        reservationRepository.save(r);
+    }
+
+    @Override
+    public void adminExpireReservation(Long id) {
+        MedicineReservation r = getReservation(id);
+        if (r.getStatus() != MedicineReservationStatus.PENDING
+                && r.getStatus() != MedicineReservationStatus.APPROVED) {
+            throw new RuntimeException("Only active (PENDING/APPROVED) reservations can be force-expired.");
+        }
+        releaseInventoryIfHeld(r);
+        r.setStatus(MedicineReservationStatus.EXPIRED);
+        reservationRepository.save(r);
+    }
+
+    @Override
+    public void adminFulfillReservation(Long id) {
+        MedicineReservation r = getReservation(id);
+        if (r.getStatus() == MedicineReservationStatus.FULFILLED
+                || r.getStatus() == MedicineReservationStatus.CANCELLED
+                || r.getStatus() == MedicineReservationStatus.REJECTED
+                || r.getStatus() == MedicineReservationStatus.EXPIRED) {
+            throw new RuntimeException("Reservation is already in a terminal state: " + r.getStatus());
+        }
+        // Consuming held inventory — do not release back to stock.
+        r.setInventoryHeld(false);
+        r.setStatus(MedicineReservationStatus.FULFILLED);
+        r.setFulfilledAt(LocalDateTime.now());
+        reservationRepository.save(r);
+    }
+
+    @Override
+    public org.springframework.data.domain.Page<MedicineReservation> getReservationsByStatusPage(
+            MedicineReservationStatus status, int page, int size) {
+        return reservationRepository.findByStatusOrderByCreatedAtDesc(
+                status, PageRequest.of(page, size));
     }
 }

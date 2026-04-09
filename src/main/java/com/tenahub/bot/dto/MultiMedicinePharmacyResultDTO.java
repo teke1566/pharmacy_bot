@@ -18,5 +18,6 @@ public class MultiMedicinePharmacyResultDTO {
     private boolean openNow;
     private int matchedCount;
     private List<String> matchedMedicines = new ArrayList<>();
+    private List<Long> matchedMedicineIds = new ArrayList<>();
     private List<String> missingMedicines = new ArrayList<>();
 }

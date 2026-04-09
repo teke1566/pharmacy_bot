@@ -12,6 +12,8 @@ public class TelegramMessageDTO {
 
     private Chat chat;
 
+    private From from;
+
     private String text;
 
     private Location location;
@@ -27,6 +29,11 @@ public class TelegramMessageDTO {
 
     @Data
     public static class Chat {
+        private Long id;
+    }
+
+    @Data
+    public static class From {
         private Long id;
     }
 

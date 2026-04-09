@@ -2,7 +2,6 @@ package com.tenahub.bot.util;
 
 import com.tenahub.bot.entity.BotTranslation;
 import com.tenahub.bot.repository.BotTranslationRepository;
-import com.tenahub.bot.service.UserLocationService;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
@@ -20,7 +19,6 @@ public class LocalizationService {
 
         private static final String AM_HOME = "🏠 መነሻ";
 
-    private final UserLocationService userLocationService;
     private final BotTranslationRepository translationRepository;
 
     /** Static fallback maps — used as seed data and as fallback when DB key is missing. */
@@ -39,16 +37,22 @@ public class LocalizationService {
     public void initTranslations() {
         for (BotLanguage lang : BotLanguage.values()) {
             List<BotTranslation> existing = translationRepository.findByLanguageCode(lang.getCode());
-            if (existing.isEmpty()) {
-                Map<String, String> defaults = STATIC_TEXTS.getOrDefault(lang, STATIC_TEXTS.get(BotLanguage.ENGLISH));
-                List<BotTranslation> toSave = defaults.entrySet().stream()
-                        .map(e -> BotTranslation.builder()
-                                .languageCode(lang.getCode())
-                                .translationKey(e.getKey())
-                                .value(e.getValue())
-                                .build())
-                        .collect(Collectors.toList());
-                translationRepository.saveAll(toSave);
+            Map<String, String> defaults = STATIC_TEXTS.getOrDefault(lang, STATIC_TEXTS.get(BotLanguage.ENGLISH));
+
+            Map<String, String> existingByKey = existing.stream()
+                    .collect(Collectors.toMap(BotTranslation::getTranslationKey, BotTranslation::getValue, (a, b) -> a));
+
+            List<BotTranslation> missingRows = defaults.entrySet().stream()
+                    .filter(e -> !existingByKey.containsKey(e.getKey()))
+                    .map(e -> BotTranslation.builder()
+                            .languageCode(lang.getCode())
+                            .translationKey(e.getKey())
+                            .value(e.getValue())
+                            .build())
+                    .collect(Collectors.toList());
+
+            if (!missingRows.isEmpty()) {
+                translationRepository.saveAll(missingRows);
             }
         }
         refreshCache();
@@ -79,15 +83,24 @@ public class LocalizationService {
     }
 
     public String text(BotLanguage language, String key, Object... args) {
-        Map<String, String> localized = cache.isEmpty()
-                ? STATIC_TEXTS.getOrDefault(language, STATIC_TEXTS.get(BotLanguage.ENGLISH))
-                : cache.getOrDefault(language, cache.get(BotLanguage.ENGLISH));
-        String template = localized != null ? localized.get(key) : null;
+                Map<String, String> localized = new HashMap<>(
+                                STATIC_TEXTS.getOrDefault(language, STATIC_TEXTS.get(BotLanguage.ENGLISH))
+                );
+
+                if (!cache.isEmpty()) {
+                        Map<String, String> cached = cache.getOrDefault(language, cache.get(BotLanguage.ENGLISH));
+                        if (cached != null) {
+                                localized.putAll(cached);
+                        }
+                }
+
+                String template = localized.get(key);
         if (template == null) {
-            Map<String, String> englishMap = cache.isEmpty()
-                    ? STATIC_TEXTS.get(BotLanguage.ENGLISH)
-                    : cache.get(BotLanguage.ENGLISH);
-            template = englishMap != null ? englishMap.getOrDefault(key, key) : key;
+                        Map<String, String> englishMap = new HashMap<>(STATIC_TEXTS.get(BotLanguage.ENGLISH));
+                        if (!cache.isEmpty() && cache.get(BotLanguage.ENGLISH) != null) {
+                                englishMap.putAll(cache.get(BotLanguage.ENGLISH));
+                        }
+                        template = englishMap.getOrDefault(key, key);
         }
         return args == null || args.length == 0 ? template : String.format(template, args);
     }
@@ -303,7 +316,17 @@ public class LocalizationService {
                 Map.entry("language_changed", "🌐 Language changed to <b>%s</b>."),
                 Map.entry("how_to_use_text", "❓ <b>How to Use TenaHub</b>\n\n1. Share your location\n2. Search for a medicine\n3. View nearby pharmacies\n4. Tap Reserve if available\n5. Enter quantity, name, and phone\n6. Wait for pharmacy approval\n7. Pick up before the hold time expires"),
                 Map.entry("information_text", "📖 <b>About TenaHub</b>\n\nTenaHub helps users find nearby pharmacies, check medicine availability, and reserve medicines before visiting.\n\nPharmacy owners can manage inventory, reservations, and profile information through the bot."),
+                Map.entry("information_menu_title", "📖 <b>Information</b>\n\nChoose an option:"),
+                Map.entry("about_tenahub_button", "ℹ️ About TenaHub"),
+                Map.entry("contacts_button", "📞 Contacts"),
+                Map.entry("contacts_text_title", "📞 <b>Contacts</b>"),
+                Map.entry("contacts_website_label", "🌐 <b>Website:</b> %s"),
+                Map.entry("contacts_phone_label", "📞 <b>Support Phone:</b> %s"),
+                Map.entry("contacts_email_label", "📧 <b>Support Email:</b> %s"),
+                Map.entry("contacts_telegram_label", "💬 <b>Telegram Support:</b> %s"),
+                Map.entry("contacts_partnership_label", "🤝 <b>Partnership:</b> %s"),
                 Map.entry("feedback_prompt", "📝 Please type your feedback.\n\nWe will use it to improve TenaHub."),
+                Map.entry("feedback_received", "✅ Thank you for your feedback! We appreciate it."),
                 Map.entry("search_medicine_prompt", "🔎 Send medicine name to search."),
                 Map.entry("invalid_medicine_selection", "⚠️ Invalid medicine selection."),
                 Map.entry("share_location_first", "⚠️ Please share your location first."),
@@ -317,6 +340,8 @@ public class LocalizationService {
                 Map.entry("search_filters_title", "🔎 <b>Search Filters</b>\n\nActive: <b>%s</b>\nChoose a filter below."),
                 Map.entry("multi_medicine_mode_text", "🧺 Multi-medicine mode is active."),
                 Map.entry("multi_search_title", "🔎🛒 Multi-Medicine Search\n\nChoose location option first."),
+                Map.entry("multi_search_intro", "🔎🛒 <b>Multi-Medicine Search</b>\n\nFind one pharmacy matching several medicines.\n\nChoose location option first."),
+                Map.entry("multi_share_exact_location_prompt", "📍 <b>Share Current Location</b>\n\nTap the button below to send your exact location for multi-medicine search."),
                 Map.entry("use_saved_location_button", "📍 Use Saved Location"),
                 Map.entry("share_current_location_button", "📌 Share Current Location"),
                 Map.entry("change_location_button", "📍 Change Location"),
@@ -393,10 +418,39 @@ public class LocalizationService {
                 Map.entry("please_share_exact_location", "📍 Please share your exact location."),
                 Map.entry("exact_location_not_ethiopia", "✅ Exact location received.\n\n⚠️ This point does not match a nearby Ethiopia pharmacy area.\n\nUse one of these instead:\n• 🔗 Paste Google Maps Link\n• 🗺 Select Ethiopia Region"),
                 Map.entry("reg_name_prompt", "🏥 <b>Pharmacy Registration</b>\n\nStep 1/7\nPlease enter your pharmacy name."),
+                Map.entry("reg_region_prompt", "🏥 <b>Pharmacy Registration</b>\n\nStep 2/7\n🗺 Select your region in Ethiopia."),
+                Map.entry("reg_city_prompt", "🏥 <b>Pharmacy Registration</b>\n\nStep 2/7\n📍 Enter your city"),
+                Map.entry("reg_area_prompt", "🏥 <b>Pharmacy Registration</b>\n\nStep 3/7\n📌 Enter your area"),
                 Map.entry("reg_phone_prompt", "🏥 <b>Pharmacy Registration</b>\n\nStep 2/7\n📞 Enter phone number\nExample: 0912345678\n\nOr tap <b>Share Phone Number</b> below."),
+                Map.entry("reg_google_map_help_text", "🔗 <b>Paste Google Maps Link</b>\n\nPaste a valid Google Maps link or coordinates.\n\nExample:\nhttps://maps.google.com/?q=8.9806,38.7578\n\nor\n8.9806,38.7578"),
+                Map.entry("reg_exact_location_help_text", "📍 <b>Share Exact Pharmacy Location</b>\n\nTap below to send the exact pharmacy location."),
                 Map.entry("reg_license_step", "📄 Now upload your pharmacy license (photo, PDF, DOC, or other document)."),
                 Map.entry("reg_license_expiry_step", "📅 Enter your license expiry date in <b>YYYY-MM-DD</b> format.\nExample: 2027-12-31\n\nOr tap <b>📅 Pick Date</b> from the bottom keyboard."),
+                Map.entry("expiry_picker_reg_title", "📅 <b>Set License Expiry Date</b>"),
+                Map.entry("expiry_picker_update_title", "📅 <b>Update License Expiry Date</b>"),
+                Map.entry("expiry_picker_hint", "Tap a year ▶ month ▶ day — or type <b>YYYY-MM-DD</b> manually."),
+                Map.entry("expiry_picker_confirmed", "✅ <b>Expiry Date Set</b> — %s"),
+                Map.entry("license_update_expiry_prompt", "📅 Enter the new license expiry date in <b>YYYY-MM-DD</b> format.\nExample: 2027-12-31"),
+                Map.entry("license_expiry_invalid", "⚠️ Invalid expiry date. Use <b>YYYY-MM-DD</b> and enter today or a future date."),
+                Map.entry("license_update_received_pending", "📄 License and expiry date received.\nWaiting admin approval."),
+                Map.entry("license_missing_expiry_suspended", "⛔ <b>License Compliance Required</b>\n\nYour pharmacy does not have a recorded license expiry date.\nYour account is suspended until you upload a license with expiry date and admin approves."),
+                Map.entry("license_expiry_reminder", "⚠️ <b>License Expiry Reminder</b>\n\nYour pharmacy license will expire on <b>%s</b> (%d day(s) left).\n\nPlease update your license and expiry date before it expires."),
+                Map.entry("license_expired_suspended", "⛔ <b>License Expired - Account Suspended</b>\n\nYour license expired on <b>%s</b>.\nYour pharmacy account is now suspended.\n\nUpdate your license and expiry date to reactivate."),
                 Map.entry("share_phone_number_button", "📱 Share Phone Number"),
+                Map.entry("send_pharmacy_location_button", "📍 Send Pharmacy Location"),
+                Map.entry("reg_select_region_title", "🗺 <b>Select region:</b>"),
+                Map.entry("reg_select_city_title", "🏙 <b>Select City in %s Region</b>"),
+                Map.entry("reg_select_subcity_addis_title", "🏙 <b>Select Sub-City in Addis Ababa</b>"),
+                Map.entry("reg_select_subcity_title", "🏙 <b>Select Sub-City in %s</b>"),
+                Map.entry("reg_select_region_plain", "🗺 Select region:"),
+                Map.entry("reg_select_city_plain", "🏙 Select city in %s:"),
+                Map.entry("reg_select_area_plain", "📌 Select area in %s:"),
+                Map.entry("reg_landmark_keyboard_text", "🏢 Send a landmark or tap Skip."),
+                Map.entry("btn_skip_landmark", "⏭ Skip Landmark"),
+                Map.entry("reg_plus_code_prompt", "➕ <b>Plus Code (Optional)</b>\n\nA Plus Code is a short location code (e.g. <code>7FG2+QW</code>).\n\nYou can find it in Google Maps by long-pressing your pharmacy location.\n\nSend your Plus Code or tap Skip."),
+                Map.entry("btn_skip_plus_code", "⏭ Skip Plus Code"),
+                Map.entry("reg_exact_address_prompt", "📍 <b>Exact Address (Optional)</b>\n\nType a descriptive street address for your pharmacy.\n\nExample: Bole Road, near Total Fuel Station\n\nSend the address or tap Skip."),
+                Map.entry("btn_skip_exact_address", "⏭ Skip Exact Address"),
                 Map.entry("reg_step3_open_hour", "Step 3/7\n⏰ Select opening hour"),
                 Map.entry("reg_step4_close_hour", "Step 4/7\n🌙 Select closing hour"),
                 Map.entry("opening_time_set", "✅ Opening time set to %s"),
@@ -415,8 +469,11 @@ public class LocalizationService {
                 Map.entry("pick_date_button", "📅 Pick Date"),
                 // Pharmacy card labels
                 Map.entry("card_km_away", "km away"),
+                Map.entry("card_km", "km"),
                 Map.entry("card_open_now", "🟢 Open now"),
                 Map.entry("card_closed", "🔴 Closed"),
+                Map.entry("card_temporarily_closed", "🔴 Temporarily closed"),
+                Map.entry("card_temporarily_closed_reason", "🔴 Temporarily closed (%s)"),
                 Map.entry("card_out_of_stock", "❌ Out of stock"),
                 Map.entry("card_available", "✅ Available: %d left"),
                 Map.entry("card_status_open", "Open now"),
@@ -426,16 +483,107 @@ public class LocalizationService {
                 Map.entry("card_hours_not_set", "Not set"),
                 Map.entry("card_price_not_set", "not set"),
                 Map.entry("card_navigate_btn", "🧭 Navigate"),
+                Map.entry("card_open_map_btn", "📍 Open Map"),
+                Map.entry("card_call_btn", "📞 Call"),
                 Map.entry("card_reserve_btn", "📦 Reserve"),
                 Map.entry("card_close_reserve_btn", "📦 Close Reserve"),
                 Map.entry("card_details_btn", "ℹ️ Details"),
                 Map.entry("card_rate_btn", "⭐ Rate"),
                 Map.entry("card_save_btn", "❤️ Save"),
                 Map.entry("card_saved_btn", "✅ Saved"),
+                Map.entry("card_view_pharmacy_photo_btn", "🖼 View Pharmacy Photo"),
+                Map.entry("card_view_medicine_photos_btn", "🖼 View Medicine Photos"),
                 Map.entry("card_hide_details_btn", "🔽 Hide Details"),
                 Map.entry("card_report_btn", "⚠️ Report issue"),
                 Map.entry("card_reserve_matched_btn", "📦 Reserve Matched"),
-                Map.entry("card_reserve_all_later_btn", "🧺 Reserve All Later")
+                Map.entry("card_reserve_one_matched_btn", "📦 Reserve One Matched"),
+                Map.entry("card_multi_reserve_btn", "🧺 Multi Reserve"),
+                Map.entry("card_reserve_all_later_btn", "🧺 Reserve All Later"),
+                Map.entry("multi_reserve_unavailable_title", "🚧 <b>Multi-Medicine Reservation</b>"),
+                Map.entry("multi_reserve_unavailable_msg", "Multi-medicine reservation in one request is not available yet.\n\nFor now, choose <b>Reserve One Matched</b> to reserve one available medicine at a time."),
+                Map.entry("issue_report_choose_type", "Choose issue type"),
+                Map.entry("issue_type_price", "💰 Wrong Price"),
+                Map.entry("issue_type_stock", "📦 Wrong Stock"),
+                Map.entry("issue_type_location", "📍 Wrong Location"),
+                Map.entry("issue_type_service", "🧾 Bad Service"),
+                Map.entry("issue_type_stock_short", "⚠️ Stock not available"),
+                Map.entry("issue_type_phone_short", "⚠️ Wrong phone"),
+                Map.entry("issue_type_closed_short", "⚠️ Pharmacy closed"),
+                Map.entry("issue_type_location_short", "📍 Wrong location"),
+                Map.entry("issue_type_service_short", "🧾 Bad service"),
+                Map.entry("issue_type_other", "✍️ Other"),
+                Map.entry("issue_type_cancel", "❌ Cancel"),
+                Map.entry("issue_menu_title", "⚠️ Report issue"),
+                Map.entry("issue_menu_close", "🔽 Close"),
+                Map.entry("issue_report_prompt_other", "✍️ Please type your issue details."),
+                Map.entry("issue_report_received", "✅ Issue reported. Thank you."),
+                Map.entry("issue_already_reported", "⚠️ You already reported this issue. Please wait before reporting again."),
+                Map.entry("btn_other", "✍️ Other"),
+                Map.entry("btn_back", "⬅️ Back"),
+                Map.entry("btn_main", "🏠 Main"),
+                Map.entry("btn_cancel", "❌ Cancel"),
+                Map.entry("btn_rated", "✅ Rated"),
+                Map.entry("btn_use_saved_location", "📍 Use Saved Location"),
+                Map.entry("btn_share_current_location", "📌 Share Current Location"),
+                Map.entry("btn_search_pharmacies", "🔍 Search Pharmacies"),
+                Map.entry("btn_add_more", "➕ Add More"),
+                Map.entry("btn_clear", "🗑 Clear"),
+                Map.entry("btn_change_location", "📍 Change Location"),
+                Map.entry("btn_notify_available", "🔔 Notify me when available"),
+                Map.entry("btn_home", "🏠 Home"),
+                Map.entry("medicine_suggestion_picker_title", "💊 <b>Suggested medicines for:</b> %s\nChoose one below or use your typed value."),
+                Map.entry("medicine_suggestion_alternative_hint", "💡 Similar or alternative medicines are also included below."),
+                Map.entry("medicine_suggestion_use_typed", "✅ Use \"%s\""),
+                Map.entry("medicine_suggestion_no_exact", "❌ <b>No exact match found for:</b> %s"),
+                Map.entry("medicine_suggestion_did_you_mean", "💊 <b>Did you mean one of these?</b>"),
+                Map.entry("medicine_suggestion_alternatives_title", "💡 <b>Possible alternatives:</b>"),
+                Map.entry("medicine_suggestion_notify_for", "🔔 Notify Me for %s"),
+                Map.entry("medicine_no_pharmacies_found", "❌ <b>No pharmacies found for:</b> %s\n\nYou can create an alert and get notified when it becomes available."),
+                Map.entry("btn_refresh", "🔄 Refresh"),
+                Map.entry("btn_favorite_pharmacies", "❤️ Favorite Pharmacies"),
+                Map.entry("btn_profile", "⚙️ Profile"),
+                Map.entry("btn_remove", "🗑 Remove"),
+                Map.entry("btn_remove_all_alerts", "🗑 Remove All Alerts"),
+                Map.entry("btn_remove_alert", "❌ Remove Alert"),
+                Map.entry("btn_search_now", "🔎 Search Now"),
+                Map.entry("card_pharmacy_details_title", "Pharmacy Details"),
+                Map.entry("card_name_label", "Name:"),
+                Map.entry("card_medicine_label", "Medicine:"),
+                Map.entry("card_address_label", "Address:"),
+                Map.entry("card_exact_address_label", "Exact Address:"),
+                Map.entry("card_landmark_label", "Landmark:"),
+                Map.entry("card_plus_code_label", "Plus Code:"),
+                Map.entry("card_phone_label", "Phone:"),
+                Map.entry("card_distance_label", "Distance:"),
+                Map.entry("card_rating_label", "Rating:"),
+                Map.entry("card_price_label", "Price:"),
+                Map.entry("card_hours_label", "Hours:"),
+                Map.entry("card_status_label", "Status:"),
+                Map.entry("card_stock_label", "Stock:"),
+                Map.entry("card_last_stock_update_label", "Last Stock Update:"),
+                Map.entry("reservation_blocked_temp_closed", "🚫 This pharmacy is temporarily closed.\n\nReservations are disabled right now.%n%s"),
+                // Reservation history card
+                Map.entry("res_hist_title", "📜 <b>Reservation History</b>"),
+                Map.entry("res_hist_empty", "📜 <b>Reservation History</b>\n\nNo reservations found."),
+                Map.entry("res_hist_section_pending", "⏳ Pending"),
+                Map.entry("res_hist_section_approved", "✅ Approved"),
+                Map.entry("res_hist_section_fulfilled", "📦 Fulfilled"),
+                Map.entry("res_hist_section_cancelled", "❌ Cancelled"),
+                Map.entry("res_hist_section_expired", "⌛ Expired"),
+                Map.entry("res_hist_section_rejected", "🚫 Rejected"),
+                Map.entry("res_hist_hold_until", "Hold Until"),
+                Map.entry("res_hist_reason", "Reason"),
+                Map.entry("res_status_pending", "Pending"),
+                Map.entry("res_status_approved", "Approved"),
+                Map.entry("res_status_fulfilled", "Fulfilled"),
+                Map.entry("res_status_cancelled", "Cancelled"),
+                Map.entry("res_status_expired", "Expired"),
+                                Map.entry("res_status_rejected", "Rejected"),
+                                Map.entry("res_card_id_label", "ID:"),
+                                Map.entry("res_card_pharmacy_label", "Pharmacy:"),
+                                Map.entry("res_card_quantity_label", "Quantity:"),
+                                Map.entry("res_card_reserve_again_btn", "🔁 Reserve Again"),
+                                Map.entry("res_section_reserve_latest_btn", "🔁 Reserve Again (Latest)")
         );
     }
 
@@ -486,7 +634,17 @@ public class LocalizationService {
                 Map.entry("language_changed", "🌐 ቋንቋው ወደ <b>%s</b> ተቀይሯል።"),
                 Map.entry("how_to_use_text", "❓ <b>TenaHub እንዴት እንደሚጠቀሙ</b>\n\n1. አካባቢዎን ያጋሩ\n2. መድሃኒት ይፈልጉ\n3. አቅራቢያዎ ያሉ ፋርማሲዎችን ይመልከቱ\n4. ካለ ቦታ ያስይዙ\n5. ብዛት፣ ስም እና ስልክ ያስገቡ\n6. የፋርማሲ ማጽደቅን ይጠብቁ\n7. የተያዘው ጊዜ ከማለፉ በፊት ይውሰዱ"),
                 Map.entry("information_text", "📖 <b>ስለ TenaHub</b>\n\nTenaHub ተጠቃሚዎች አቅራቢያቸው ያሉ ፋርማሲዎችን እንዲያገኙ፣ የመድሃኒት አቅርቦትን እንዲያዩ እና ከመሄዳቸው በፊት መድሃኒት እንዲያስይዙ ይረዳል።\n\nየፋርማሲ ባለቤቶችም በቦቱ ውስጥ ዕቃ ዝርዝር፣ ቦታ ማስያዣዎች እና መለያ መረጃ ማስተዳደር ይችላሉ።"),
+                Map.entry("information_menu_title", "📖 <b>መረጃ</b>\n\nአንዱን ይምረጡ:"),
+                Map.entry("about_tenahub_button", "ℹ️ ስለ TenaHub"),
+                Map.entry("contacts_button", "📞 አድራሻዎች"),
+                Map.entry("contacts_text_title", "📞 <b>አድራሻዎች</b>"),
+                Map.entry("contacts_website_label", "🌐 <b>ድህረ ገጽ:</b> %s"),
+                Map.entry("contacts_phone_label", "📞 <b>የድጋፍ ስልክ:</b> %s"),
+                Map.entry("contacts_email_label", "📧 <b>የድጋፍ ኢሜይል:</b> %s"),
+                Map.entry("contacts_telegram_label", "💬 <b>የTelegram ድጋፍ:</b> %s"),
+                Map.entry("contacts_partnership_label", "🤝 <b>የቢዝነስ ትብብር:</b> %s"),
                 Map.entry("feedback_prompt", "📝 እባክዎ አስተያየትዎን ይጻፉ።\n\nአገልግሎቱን ለማሻሻል እንጠቀምበታለን።"),
+                Map.entry("feedback_received", "✅ አስተያየትዎ ደርሷل። እናመሰግናለን!"),
                 Map.entry("search_medicine_prompt", "🔎 ለመፈለግ የመድሃኒት ስም ይላኩ።"),
                 Map.entry("invalid_medicine_selection", "⚠️ የመድሃኒት ምርጫ ልክ አይደለም።"),
                 Map.entry("share_location_first", "⚠️ እባክዎ መጀመሪያ አካባቢዎን ያጋሩ።"),
@@ -500,6 +658,8 @@ public class LocalizationService {
                 Map.entry("search_filters_title", "🔎 <b>የፍለጋ ማጣሪያዎች</b>\n\nንቁ ማጣሪያ: <b>%s</b>\nከታች ይምረጡ።"),
                 Map.entry("multi_medicine_mode_text", "🧺 የብዙ መድሃኒት ሁኔታ ንቁ ነው።"),
                 Map.entry("multi_search_title", "🔎🛒 ብዙ መድሃኒት ፍለጋ\n\nመጀመሪያ የአካባቢ አማራጭ ይምረጡ።"),
+                Map.entry("multi_search_intro", "🔎🛒 <b>ብዙ መድሃኒት ፍለጋ</b>\n\nበርካታ መድሃኒቶችን የሚያቀርብ አንድ ፋርማሲ ያግኙ።\n\nመጀመሪያ የአካባቢ አማራጭ ይምረጡ።"),
+                Map.entry("multi_share_exact_location_prompt", "📍 <b>የአሁኑን አካባቢ አጋራ</b>\n\nለብዙ መድሃኒት ፍለጋ ትክክለኛ አካባቢዎን ለመላክ ከታች ያለውን ቁልፍ ይጫኑ።"),
                 Map.entry("use_saved_location_button", "📍 የተቀመጠ አካባቢ ተጠቀም"),
                 Map.entry("share_current_location_button", "📌 የአሁኑን አካባቢ አጋራ"),
                 Map.entry("change_location_button", "📍 አካባቢ ቀይር"),
@@ -576,10 +736,39 @@ public class LocalizationService {
                 Map.entry("please_share_exact_location", "📍 ትክክለኛ አካባቢዎን ያጋሩ።"),
                 Map.entry("exact_location_not_ethiopia", "✅ ትክክለኛ አካባቢ ደረሰ።\n\n⚠️ ይህ ቦታ ቅርብ ኢትዮጵያ ፋርማሲ አካባቢን አይዛመድም።\n\nከዚህ ይምረጡ:\n• 🔗 Google Maps ሊንክ ለጥፍ\n• 🗺 የኢትዮጵያ ክልል ምረጥ"),
                 Map.entry("reg_name_prompt", "🏥 <b>ፋርማሲ ምዝገባ</b>\n\nደረጃ 1/7\nእባክዎ የፋርማሲዎን ስም ያስገቡ።"),
+                Map.entry("reg_region_prompt", "🏥 <b>ፋርማሲ ምዝገባ</b>\n\nደረጃ 2/7\n🗺 በኢትዮጵያ ያለውን ክልል ይምረጡ።"),
+                Map.entry("reg_city_prompt", "🏥 <b>ፋርማሲ ምዝገባ</b>\n\nደረጃ 2/7\n📍 ከተማዎን ያስገቡ"),
+                Map.entry("reg_area_prompt", "🏥 <b>ፋርማሲ ምዝገባ</b>\n\nደረጃ 3/7\n📌 አካባቢዎን ያስገቡ"),
                 Map.entry("reg_phone_prompt", "🏥 <b>ፋርማሲ ምዝገባ</b>\n\nደረጃ 2/7\n📞 ስልክ ቁጥር ያስገቡ\nምሳሌ: 0912345678\n\nወይም ከታch <b>ስልክ ቁጥር አጋራ</b> ይንኩ።"),
+                Map.entry("reg_google_map_help_text", "🔗 <b>የGoogle Maps ሊንክ ለጥፍ</b>\n\nየሚሰራ Google Maps ሊንክ ወይም ኮኦርዲኔት ያስገቡ።\n\nምሳሌ:\nhttps://maps.google.com/?q=8.9806,38.7578\n\nወይም\n8.9806,38.7578"),
+                Map.entry("reg_exact_location_help_text", "📍 <b>ትክክለኛ የፋርማሲ አካባቢ አጋራ</b>\n\nከታች ያለውን ቁልፍ በመንካት ትክክለኛ የፋርማሲ አካባቢ ያጋሩ።"),
                 Map.entry("reg_license_step", "📄 አሁን የፋርማሲዎ ፈቃድ ያስሰቅሉ (ፎቶ፣ PDF፣ DOC ወይም ሌላ ሰነድ)።"),
                 Map.entry("reg_license_expiry_step", "📅 የፈቃዱ ማብቂያ ቀን <b>YYYY-MM-DD</b> ቅርጸት ያስገቡ።\nምሳሌ: 2027-12-31\n\nወይም ከታch <b>📅 ቀን ምረጥ</b> ይንኩ።"),
+                Map.entry("expiry_picker_reg_title", "📅 <b>የፈቃድ ማብቂያ ቀን ያዘጋጁ</b>"),
+                Map.entry("expiry_picker_update_title", "📅 <b>የፈቃድ ማብቂያ ቀን ያዘምኑ</b>"),
+                Map.entry("expiry_picker_hint", "ዓ.ም ▶ ወር ▶ ቀን ይጫኑ — ወይም <b>YYYY-MM-DD</b> ያስገቡ።"),
+                Map.entry("expiry_picker_confirmed", "✅ <b>ማብቂያ ቀን ተቀምጧል</b> — %s"),
+                Map.entry("license_update_expiry_prompt", "📅 የአዲሱን ፈቃድ ማብቂያ ቀን በ <b>YYYY-MM-DD</b> ቅርጸት ያስገቡ።\nምሳሌ: 2027-12-31"),
+                Map.entry("license_expiry_invalid", "⚠️ ልክ ያልሆነ የማብቂያ ቀን ነው። <b>YYYY-MM-DD</b> ይጠቀሙ እና የዛሬ ወይም ወደፊት ቀን ያስገቡ።"),
+                Map.entry("license_update_received_pending", "📄 ፈቃድ እና የማብቂያ ቀን ደርሰዋል።\nየአስተዳዳሪ ማጽደቅ በመጠባበቅ ላይ ነው።"),
+                Map.entry("license_missing_expiry_suspended", "⛔ <b>የፈቃድ ተገዢነት ያስፈልጋል</b>\n\nለፋርማሲዎ የተመዘገበ የፈቃድ ማብቂያ ቀን የለም።\nፈቃድ ከማብቂያ ቀን ጋር እስክታቀርቡ እና አስተዳዳሪው እስኪያጸድቅ ድረስ መለያዎ ታግዷል።"),
+                Map.entry("license_expiry_reminder", "⚠️ <b>የፈቃድ ማብቂያ አስታዋሽ</b>\n\nየፋርማሲዎ ፈቃድ <b>%s</b> ይያዛል (%d ቀን ቀርቷል)።\n\nከማብቃቱ በፊት ፈቃድዎን እና የማብቂያ ቀኑን ያዘምኑ።"),
+                Map.entry("license_expired_suspended", "⛔ <b>ፈቃድ አልፏል - መለያዎ ታግዷል</b>\n\nፈቃድዎ <b>%s</b> ላይ አልፏል።\nየፋርማሲዎ መለያ አሁን ታግዷል።\n\nእንደገና ለማንቃት ፈቃድዎን እና የማብቂያ ቀኑን ያዘምኑ።"),
                 Map.entry("share_phone_number_button", "📱 ስልክ ቁጥር አጋራ"),
+                Map.entry("send_pharmacy_location_button", "📍 የፋርማሲ አካባቢ ላክ"),
+                Map.entry("reg_select_region_title", "🗺 <b>ክልል ይምረጡ:</b>"),
+                Map.entry("reg_select_city_title", "🏙 <b>በ%s ክልል ውስጥ ከተማ ይምረጡ</b>"),
+                Map.entry("reg_select_subcity_addis_title", "🏙 <b>በአዲስ አበባ ክፍለ ከተማ ይምረጡ</b>"),
+                Map.entry("reg_select_subcity_title", "🏙 <b>በ%s ውስጥ ክፍለ ከተማ ይምረጡ</b>"),
+                Map.entry("reg_select_region_plain", "🗺 ክልል ይምረጡ:"),
+                Map.entry("reg_select_city_plain", "🏙 በ%s ውስጥ ከተማ ይምረጡ:"),
+                Map.entry("reg_select_area_plain", "📌 በ%s ውስጥ አካባቢ ይምረጡ:"),
+                Map.entry("reg_landmark_keyboard_text", "🏢 ምልክተኛ ቦታ ይላኩ ወይም ዝለል ይንኩ።"),
+                Map.entry("btn_skip_landmark", "⏭ ምልክተኛ ዝለል"),
+                Map.entry("reg_plus_code_prompt", "➕ <b>ፕለስ ኮድ (አይደለም ግዴታ)</b>\n\nፕለስ ኮድ አጭር የአካባቢ ኮድ ነው (ምሳሌ: <code>7FG2+QW</code>).\n\nGoogle Maps ላይ የፋርማሲዎን ቦታ ረዘም ሲነኩ ማግኘት ይችላሉ።\n\nፕለስ ኮድዎን ይላኩ ወይም ዝለል ይንኩ።"),
+                Map.entry("btn_skip_plus_code", "⏭ ፕለስ ኮድ ዝለል"),
+                Map.entry("reg_exact_address_prompt", "📍 <b>ትክክለኛ አድራሻ (አይደለም ግዴታ)</b>\n\nለፋርማሲዎ ዝርዝር የጎዳና አድራሻ ይጻፉ።\n\nምሳሌ: ቦሌ ጎዳና፣ Total ነዳጅ ቤት አካባቢ\n\nአድራሻዎን ይላኩ ወይም ዝለል ይንኩ።"),
+                Map.entry("btn_skip_exact_address", "⏭ ትክክለኛ አድራሻ ዝለል"),
                 Map.entry("reg_step3_open_hour", "ደረጃ 3/7\n⏰ የሚከፈትበት ሰዓት ይምረጡ"),
                 Map.entry("reg_step4_close_hour", "ደረጃ 4/7\n🌙 የሚዘጋበት ሰዓት ይምረጡ"),
                 Map.entry("opening_time_set", "✅ የሚከፈትበት ሰዓት %s ሆኗล"),
@@ -598,8 +787,11 @@ public class LocalizationService {
                 Map.entry("pick_date_button", "📅 ቀን ምረጥ"),
                 // Pharmacy card labels
                 Map.entry("card_km_away", "ኪ.ሜ ርቀት"),
+                Map.entry("card_km", "ኪ.ሜ"),
                 Map.entry("card_open_now", "🟢 ክፍት ነው"),
                 Map.entry("card_closed", "🔴 ተዘግቷል"),
+                Map.entry("card_temporarily_closed", "🔴 ለጊዜው ተዘግቷል"),
+                Map.entry("card_temporarily_closed_reason", "🔴 ለጊዜው ተዘግቷል (%s)"),
                 Map.entry("card_out_of_stock", "❌ አልቋል"),
                 Map.entry("card_available", "✅ ይገኛል: %d ቀርቷል"),
                 Map.entry("card_status_open", "ክፍት ነው"),
@@ -609,16 +801,107 @@ public class LocalizationService {
                 Map.entry("card_hours_not_set", "አልተዋቀረም"),
                 Map.entry("card_price_not_set", "አልተወሰነም"),
                 Map.entry("card_navigate_btn", "🧭 አቅጣጫ"),
+                Map.entry("card_open_map_btn", "📍 ካርታ ክፈት"),
+                Map.entry("card_call_btn", "📞 ደውል"),
                 Map.entry("card_reserve_btn", "📦 ቦታ አስይዝ"),
                 Map.entry("card_close_reserve_btn", "📦 ማስያዣ ዝጋ"),
                 Map.entry("card_details_btn", "ℹ️ ዝርዝር"),
                 Map.entry("card_rate_btn", "⭐ ደምድብ"),
                 Map.entry("card_save_btn", "❤️ አስቀምጥ"),
                 Map.entry("card_saved_btn", "✅ ተቀምጧล"),
+                Map.entry("card_view_pharmacy_photo_btn", "🖼 የፋርማሲ ፎቶ እይ"),
+                Map.entry("card_view_medicine_photos_btn", "🖼 የመድሃኒት ፎቶዎችን እይ"),
                 Map.entry("card_hide_details_btn", "🔽 ዝርዝር ደብቅ"),
                 Map.entry("card_report_btn", "⚠️ ችግር ሪፖርት አድርግ"),
                 Map.entry("card_reserve_matched_btn", "📦 ተዛምዶ ፋርማሲ ያስይዙ"),
-                Map.entry("card_reserve_all_later_btn", "🧺 ሁሉን ቆጣቢ")
+                Map.entry("card_reserve_one_matched_btn", "📦 አንድ ተዛምዶ ያስይዙ"),
+                Map.entry("card_multi_reserve_btn", "🧺 ብዙ መድሃኒቶች ያስይዙ"),
+                Map.entry("card_reserve_all_later_btn", "🧺 ሁሉን ቆጣቢ"),
+                Map.entry("multi_reserve_unavailable_title", "🚧 <b>ብዙ መድሃኒቶች ያስያዣ</b>"),
+                Map.entry("multi_reserve_unavailable_msg", "ብዙ መድሃኒቶችን በአንድ ጥያቄ ማስያዝ አሁን አልተቻለም።\n\nለአሁን <b>አንድ ተዛምዶ ያስይዙ</b> ይጠቀሙ በአንድ ጊዜ አንድ ጊዜ መድሃኒት ለማስያዝ።"),
+                Map.entry("issue_report_choose_type", "የችግሩን አይነት ይምረጡ"),
+                Map.entry("issue_type_price", "💰 የተሳሳተ ዋጋ"),
+                Map.entry("issue_type_stock", "📦 የተሳሳተ ስቶክ"),
+                Map.entry("issue_type_location", "📍 የተሳሳተ አካባቢ"),
+                Map.entry("issue_type_service", "🧾 ደካማ አገልግሎት"),
+                Map.entry("issue_type_stock_short", "⚠️ ስቶክ የለም"),
+                Map.entry("issue_type_phone_short", "⚠️ የተሳሳተ ስልክ"),
+                Map.entry("issue_type_closed_short", "⚠️ ፋርማሲው ዝጋ ነው"),
+                Map.entry("issue_type_location_short", "📍 የተሳሳተ አካባቢ"),
+                Map.entry("issue_type_service_short", "🧾 ደካማ አገልግሎት"),
+                Map.entry("issue_type_other", "✍️ ሌላ"),
+                Map.entry("issue_type_cancel", "❌ ሰርዝ"),
+                Map.entry("issue_menu_title", "⚠️ ችግር ሪፖርት አድርግ"),
+                Map.entry("issue_menu_close", "🔽 ዝጋ"),
+                Map.entry("issue_report_prompt_other", "✍️ የችግሩን ዝርዝር ይጻፉ።"),
+                Map.entry("issue_report_received", "✅ ሪፖርቱ ተልኳል። እናመሰግናለን።"),
+                Map.entry("issue_already_reported", "⚠️ ይህን ችግር አስቀድመው ሪፖርት አድርገዋል። ድጋሚ ከማሪፖርትዎ በፊት ትንሽ ይጠብቁ。"),
+                Map.entry("btn_other", "✍️ ሌላ"),
+                Map.entry("btn_back", "⬅️ ተመለስ"),
+                Map.entry("btn_main", "🏠 ዋናው ገጽ"),
+                Map.entry("btn_cancel", "❌ ሰርዝ"),
+                Map.entry("btn_rated", "✅ ደምድቧታል"),
+                Map.entry("btn_use_saved_location", "📍 ተቀምጦ ያለ አካባቢ ጠቀም"),
+                Map.entry("btn_share_current_location", "📌 አሁን ያለህ አካባቢ አጋራ"),
+                Map.entry("btn_search_pharmacies", "🔍 ፋርማሲዎች ፈልግ"),
+                Map.entry("btn_add_more", "➕ ተጨማሪ ጨምር"),
+                Map.entry("btn_clear", "🗑 አጽዳ"),
+                Map.entry("btn_change_location", "📍 አካባቢ ቀይር"),
+                Map.entry("btn_notify_available", "🔔 ሲኖር አሳውቀኝ"),
+                Map.entry("btn_home", "🏠 ዋናው ገጽ"),
+                Map.entry("medicine_suggestion_picker_title", "💊 <b>ለዚህ የተጠቆሙ መድሃኒቶች:</b> %s\nከታች አንዱን ይምረጡ ወይም የጻፉትን ይጠቀሙ።"),
+                Map.entry("medicine_suggestion_alternative_hint", "💡 ተመሳሳይ ወይም ተለዋጭ መድሃኒቶችም ከታች ተካትተዋል።"),
+                Map.entry("medicine_suggestion_use_typed", "✅ \"%s\" ተጠቀም"),
+                Map.entry("medicine_suggestion_no_exact", "❌ <b>ትክክለኛ ተዛማጅ አልተገኘም ለ:</b> %s"),
+                Map.entry("medicine_suggestion_did_you_mean", "💊 <b>ከእነዚህ አንዱን ማለትዎ ነው?</b>"),
+                Map.entry("medicine_suggestion_alternatives_title", "💡 <b>ሊተኩ የሚችሉ አማራጮች:</b>"),
+                Map.entry("medicine_suggestion_notify_for", "🔔 ለ%s ሲኖር አሳውቀኝ"),
+                Map.entry("medicine_no_pharmacies_found", "❌ <b>ለዚህ ምንም ፋርማሲ አልተገኘም:</b> %s\n\nሲገኝ እንዲያሳውቅዎ ማስጠንቀቂያ መፍጠር ይችላሉ።"),
+                Map.entry("btn_refresh", "🔄 አድስ"),
+                Map.entry("btn_favorite_pharmacies", "❤️ ተወዳጅ ፋርማሲዎች"),
+                Map.entry("btn_profile", "⚙️ ፕሮፋይል"),
+                Map.entry("btn_remove", "🗑 አስወግድ"),
+                Map.entry("btn_remove_all_alerts", "🗑 ሁሉም ማስጣንቀቂያዎች አስወግድ"),
+                Map.entry("btn_remove_alert", "❌ ማስጣንቀቂያ አስወግድ"),
+                Map.entry("btn_search_now", "🔎 አሁን ፈልግ"),
+                Map.entry("card_pharmacy_details_title", "የፋርማሲ ዝርዝር"),
+                Map.entry("card_name_label", "ስም:"),
+                Map.entry("card_medicine_label", "መድሃኒት:"),
+                Map.entry("card_address_label", "አድራሻ:"),
+                Map.entry("card_exact_address_label", "ትክክለኛ አድራሻ:"),
+                Map.entry("card_landmark_label", "መለያ ቦታ:"),
+                Map.entry("card_plus_code_label", "ፕላስ ኮድ:"),
+                Map.entry("card_phone_label", "ስልክ:"),
+                Map.entry("card_distance_label", "ርቀት:"),
+                Map.entry("card_rating_label", "ደረጃ:"),
+                Map.entry("card_price_label", "ዋጋ:"),
+                Map.entry("card_hours_label", "ሰዓት:"),
+                Map.entry("card_status_label", "ሁኔታ:"),
+                Map.entry("card_stock_label", "ስቶክ:"),
+                Map.entry("card_last_stock_update_label", "የመጨረሻ የስቶክ ዝማኔ:"),
+                Map.entry("reservation_blocked_temp_closed", "🚫 ይህ ፋርማሲ ጊዜያዊ ዝግ ነው።\n\nአሁን ቦታ ማስያዝ አይቻልም።%n%s"),
+                // Reservation history card
+                Map.entry("res_hist_title", "📜 <b>የቦታ ማስያዣ ታሪክ</b>"),
+                Map.entry("res_hist_empty", "📜 <b>የቦታ ማስያዣ ታሪክ</b>\n\nምንም ቦታ ማስያዣ አልተገኘም።"),
+                Map.entry("res_hist_section_pending", "⏳ በመጠባበቅ ላይ"),
+                Map.entry("res_hist_section_approved", "✅ የጸደቀ"),
+                Map.entry("res_hist_section_fulfilled", "📦 የተጠናቀቀ"),
+                Map.entry("res_hist_section_cancelled", "❌ የተሰረዘ"),
+                Map.entry("res_hist_section_expired", "⌛ ያለፈበት"),
+                Map.entry("res_hist_section_rejected", "🚫 የቀረ"),
+                Map.entry("res_hist_hold_until", "እስከ"),
+                Map.entry("res_hist_reason", "ምክንያት"),
+                Map.entry("res_status_pending", "በመጠባበቅ ላይ"),
+                Map.entry("res_status_approved", "ጸደቀ"),
+                Map.entry("res_status_fulfilled", "ተጠናቀቀ"),
+                Map.entry("res_status_cancelled", "ተሰረዘ"),
+                Map.entry("res_status_expired", "ያለፈበት"),
+                                Map.entry("res_status_rejected", "ቀረ"),
+                                Map.entry("res_card_id_label", "መታወቂያ:"),
+                                Map.entry("res_card_pharmacy_label", "ፋርማሲ:"),
+                                Map.entry("res_card_quantity_label", "ብዛት:"),
+                                Map.entry("res_card_reserve_again_btn", "🔁 እንደገና አስይዝ"),
+                                Map.entry("res_section_reserve_latest_btn", "🔁 ቅርብ እንደገና አስይዝ")
         );
     }
 }

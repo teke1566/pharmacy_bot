@@ -13,4 +13,8 @@ public interface MedicineAvailabilityAlertRepository extends JpaRepository<Medic
     List<MedicineAvailabilityAlert> findByActiveTrueAndMedicineNameIgnoreCase(String medicineName);
 
     Optional<MedicineAvailabilityAlert> findByUserIdAndMedicineNameIgnoreCaseAndActiveTrue(Long userId, String medicineName);
+
+    Optional<MedicineAvailabilityAlert> findTopByUserIdAndMedicineNameIgnoreCaseOrderByIdDesc(Long userId, String medicineName);
+
+    long countByUserIdAndActiveTrue(Long userId);
 }

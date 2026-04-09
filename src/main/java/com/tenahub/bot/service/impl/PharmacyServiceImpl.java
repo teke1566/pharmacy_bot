@@ -1,5 +1,6 @@
 package com.tenahub.bot.service.impl;
 
+import com.tenahub.bot.dto.MedicineSuggestionResult;
 import com.tenahub.bot.dto.MultiMedicinePharmacyResultDTO;
 import com.tenahub.bot.dto.PharmacyResponseDTO;
 import com.tenahub.bot.entity.Pharmacy;
@@ -9,9 +10,13 @@ import com.tenahub.bot.repository.PharmacyRatingRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
 import com.tenahub.bot.service.PharmacyService;
 import com.tenahub.bot.util.GeoUtils;
+import com.tenahub.bot.util.MedicineSearchNormalizer;
+import com.tenahub.bot.util.MedicineSuggestionEngine;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -33,60 +38,74 @@ public class PharmacyServiceImpl implements PharmacyService {
 
     @Override
     public List<PharmacyResponseDTO> searchMedicine(String medicine) {
+        String normalizedMedicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(medicine);
+        if (normalizedMedicine.isBlank()) {
+            return List.of();
+        }
+
         List<PharmacyInventory> inventoryList =
-                inventoryRepository.findByMedicineNameIgnoreCase(medicine);
+                inventoryRepository.findByMedicineNameIgnoreCase(normalizedMedicine);
 
         return inventoryList.stream()
-                .map(item -> pharmacyRepository.findById(item.getPharmacyId()).orElse(null))
-                .filter(p -> p != null)
-                .map(this::mapBasic)
+            .map(item -> pharmacyRepository.findById(item.getPharmacyId())
+                .filter(p -> !p.isLicenseSuspended())
+                .map(p -> mapBasic(p, item))
+                .orElse(null))
+            .filter(dto -> dto != null)
                 .collect(Collectors.toList());
     }
 
     @Override
     public List<PharmacyResponseDTO> searchMedicineWithArea(String medicine, String area) {
+        String normalizedMedicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(medicine);
+        if (normalizedMedicine.isBlank()) {
+            return List.of();
+        }
+
         List<PharmacyInventory> inventoryList =
-                inventoryRepository.findByMedicineNameIgnoreCase(medicine);
+                inventoryRepository.findByMedicineNameIgnoreCase(normalizedMedicine);
 
         return inventoryList.stream()
-                .map(item -> pharmacyRepository.findById(item.getPharmacyId()).orElse(null))
-                .filter(p -> p != null)
+            .map(item -> pharmacyRepository.findById(item.getPharmacyId())
+                .filter(p -> !p.isLicenseSuspended())
                 .filter(p -> p.getArea() != null && p.getArea().toLowerCase().contains(area.toLowerCase()))
-                .map(this::mapBasic)
+                .map(p -> mapBasic(p, item))
+                .orElse(null))
+            .filter(dto -> dto != null)
                 .collect(Collectors.toList());
     }
 
     @Override
     public List<PharmacyResponseDTO> searchMedicineWithCity(String medicine, String city) {
+        String normalizedMedicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(medicine);
+        if (normalizedMedicine.isBlank()) {
+            return List.of();
+        }
+
         List<PharmacyInventory> inventoryList =
-                inventoryRepository.findByMedicineNameIgnoreCase(medicine);
+                inventoryRepository.findByMedicineNameIgnoreCase(normalizedMedicine);
 
         return inventoryList.stream()
-                .map(item -> pharmacyRepository.findById(item.getPharmacyId()).orElse(null))
-                .filter(p -> p != null)
+            .map(item -> pharmacyRepository.findById(item.getPharmacyId())
+                .filter(p -> !p.isLicenseSuspended())
                 .filter(p -> p.getCity() != null && p.getCity().toLowerCase().contains(city.toLowerCase()))
-                .map(this::mapBasic)
+                .map(p -> mapBasic(p, item))
+                .orElse(null))
+            .filter(dto -> dto != null)
                 .collect(Collectors.toList());
     }
 @Override
 public List<String> suggestMedicines(String input) {
+    return suggestMedicineOptions(input).typoSuggestions();
+}
+
+@Override
+public MedicineSuggestionResult suggestMedicineOptions(String input) {
     if (input == null || input.isBlank()) {
-        return List.of();
+        return new MedicineSuggestionResult("", List.of(), List.of());
     }
 
-    String normalizedInput = input.trim().toLowerCase();
-
-    List<String> medicines = inventoryRepository.findAllDistinctMedicineNames();
-
-    return medicines.stream()
-            .filter(m -> m != null && !m.isBlank())
-            .map(String::trim)
-            .map(String::toLowerCase)
-            .filter(m -> m.startsWith(normalizedInput))
-            .distinct()
-            .sorted()
-            .limit(SEARCH_RESULT_LIMIT)
-            .toList();
+    return MedicineSuggestionEngine.build(input, inventoryRepository.findAllDistinctMedicineNames());
 }
 
 @Override
@@ -101,6 +120,7 @@ public List<PharmacyResponseDTO> searchMedicineNearby(
     }
 
     String normalizedMedicine = medicine.trim().toLowerCase();
+    normalizedMedicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(normalizedMedicine);
 
     List<PharmacyInventory> inventoryList =
             inventoryRepository.findByMedicineNameIgnoreCase(normalizedMedicine);
@@ -116,6 +136,10 @@ public List<PharmacyResponseDTO> searchMedicineNearby(
         }
 
         Pharmacy p = pharmacyOpt.get();
+
+        if (p.isLicenseSuspended()) {
+            continue;
+        }
 
         if (p.getLatitude() == null || p.getLongitude() == null) {
             continue;
@@ -138,7 +162,8 @@ public List<PharmacyResponseDTO> searchMedicineNearby(
                         || item.getQuantity() == null
                         || item.getQuantity() <= 0;
 
-        boolean openNow = isOpenNow(p.getOpenTime(), p.getCloseTime());
+        boolean temporaryClosureActive = isTemporaryClosureActive(p);
+        boolean openNow = !temporaryClosureActive && isOpenNow(p.getOpenTime(), p.getCloseTime());
 
         double distanceScore = 100 / (distance + 1);
         double ratingScore = p.getRating() * 10;
@@ -163,15 +188,21 @@ public List<PharmacyResponseDTO> searchMedicineNearby(
                 .distance(distance)
                 .rating(p.getRating())
                 .approved(p.isApproved())
+                .verified(isVerifiedPharmacy(p))
                 .score(totalScore)
                 .canRate(!alreadyRated)
                 .stockQuantity(item.getQuantity())
                 .outOfStock(outOfStock)
                 .medicineName(item.getMedicineName())
+                .medicineId(item.getId())
                 .price(item.getPrice())
+                .requiresPrescription(item.isRequiresPrescription())
                 .openNow(openNow)
                 .openTime(p.getOpenTime() == null ? null : p.getOpenTime().toString())
                 .closeTime(p.getCloseTime() == null ? null : p.getCloseTime().toString())
+                .temporarilyClosed(temporaryClosureActive)
+                .temporaryClosureReason(temporaryClosureActive ? p.getTemporaryClosureReason() : null)
+                .temporaryClosedUntil(temporaryClosureActive ? p.getTemporaryClosedUntil() : null)
                 .build();
 
         allResults.add(dto);
@@ -189,7 +220,7 @@ public List<PharmacyResponseDTO> searchMedicineNearby(
             .limit(SEARCH_RESULT_LIMIT)
             .collect(Collectors.toList());
 }
-   private PharmacyResponseDTO mapBasic(Pharmacy p) {
+   private PharmacyResponseDTO mapBasic(Pharmacy p, PharmacyInventory item) {
     return PharmacyResponseDTO.builder()
             .id(p.getId())
             .name(p.getName())
@@ -199,10 +230,38 @@ public List<PharmacyResponseDTO> searchMedicineNearby(
             .longitude(p.getLongitude())
             .rating(p.getRating())
             .approved(p.isApproved())
-            .openNow(isOpenNow(p.getOpenTime(), p.getCloseTime()))
+            .verified(isVerifiedPharmacy(p))
+        .stockQuantity(item.getQuantity())
+        .outOfStock(item.isOutOfStock() || item.getQuantity() == null || item.getQuantity() <= 0)
+        .medicineName(item.getMedicineName())
+        .medicineId(item.getId())
+        .price(item.getPrice())
+            .requiresPrescription(item.isRequiresPrescription())
+            .openNow(!isTemporaryClosureActive(p) && isOpenNow(p.getOpenTime(), p.getCloseTime()))
             .openTime(p.getOpenTime() == null ? null : p.getOpenTime().toString())
             .closeTime(p.getCloseTime() == null ? null : p.getCloseTime().toString())
+            .temporarilyClosed(isTemporaryClosureActive(p))
+            .temporaryClosureReason(isTemporaryClosureActive(p) ? p.getTemporaryClosureReason() : null)
+            .temporaryClosedUntil(isTemporaryClosureActive(p) ? p.getTemporaryClosedUntil() : null)
             .build();
+}
+
+private boolean isVerifiedPharmacy(Pharmacy pharmacy) {
+    if (pharmacy == null) {
+        return false;
+    }
+
+    boolean licenseApproved = pharmacy.isApproved() && !pharmacy.isLicenseSuspended();
+
+    String normalizedPhone = pharmacy.getPhone() == null
+            ? ""
+            : pharmacy.getPhone().replaceAll("\\s+", "");
+    boolean phoneConfirmed = normalizedPhone.matches("^\\+?[0-9]{7,15}$");
+
+    boolean inventoryUpdatedRecently = pharmacy.getLastInventoryUpdate() != null
+            && pharmacy.getLastInventoryUpdate().isAfter(LocalDateTime.now().minusHours(72));
+
+    return licenseApproved && phoneConfirmed && inventoryUpdatedRecently;
 }
 
   private boolean isOpenNow(LocalTime open, LocalTime close) {
@@ -224,6 +283,15 @@ public List<PharmacyResponseDTO> searchMedicineNearby(
     return (!now.isBefore(open) || !now.isAfter(close));
 }
 
+private boolean isTemporaryClosureActive(Pharmacy pharmacy) {
+    if (pharmacy == null || !pharmacy.isTemporarilyClosed()) {
+        return false;
+    }
+
+    return pharmacy.getTemporaryClosedUntil() == null
+            || pharmacy.getTemporaryClosedUntil().isAfter(LocalDateTime.now());
+}
+
     @Override
     public boolean isRegisteredPharmacy(Long telegramId) {
         return pharmacyRepository.findByTelegramId(telegramId).isPresent();
@@ -243,10 +311,12 @@ public void updateMedicines(Long telegramId, String medicines) {
     Pharmacy pharmacy = pharmacyRepository.findByTelegramId(telegramId)
             .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
 
-    pharmacy.setMedicines(medicines);
+    String normalizedMedicines = MedicineSearchNormalizer.normalizeCommaSeparatedMedicines(medicines);
+
+    pharmacy.setMedicines(normalizedMedicines);
     pharmacyRepository.save(pharmacy);
 
-    List<String> medicineList = Arrays.stream(medicines.split(","))
+    List<String> medicineList = Arrays.stream(normalizedMedicines.split(","))
             .map(String::trim)
             .map(String::toLowerCase)
             .filter(m -> !m.isBlank())
@@ -292,7 +362,32 @@ public void updateMedicines(Long telegramId, String medicines) {
     }
 
     @Override
-    public void savePendingLicenseUpdate(Long telegramId, String fileId) {
+    public void setTemporaryClosure(Long telegramId, String reason, int durationHours) {
+        Pharmacy pharmacy = pharmacyRepository.findByTelegramId(telegramId)
+                .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+
+        int safeDuration = Math.max(1, durationHours);
+        pharmacy.setTemporarilyClosed(true);
+        pharmacy.setTemporaryClosureReason(
+                (reason == null || reason.isBlank()) ? "Temporarily closed by pharmacy" : reason.trim()
+        );
+        pharmacy.setTemporaryClosedUntil(LocalDateTime.now().plusHours(safeDuration));
+        pharmacyRepository.save(pharmacy);
+    }
+
+    @Override
+    public void clearTemporaryClosure(Long telegramId) {
+        Pharmacy pharmacy = pharmacyRepository.findByTelegramId(telegramId)
+                .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+
+        pharmacy.setTemporarilyClosed(false);
+        pharmacy.setTemporaryClosureReason(null);
+        pharmacy.setTemporaryClosedUntil(null);
+        pharmacyRepository.save(pharmacy);
+    }
+
+    @Override
+    public void savePendingLicenseUpdate(Long telegramId, String fileId, LocalDate expiryDate) {
         Pharmacy pharmacy = pharmacyRepository.findByTelegramId(telegramId)
                 .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
 
@@ -301,6 +396,7 @@ public void updateMedicines(Long telegramId, String medicines) {
         }
 
         pharmacy.setPendingLicenseFileId(fileId);
+        pharmacy.setPendingLicenseExpiryDate(expiryDate);
         pharmacy.setLicenseUpdateStatus("PENDING");
         pharmacyRepository.save(pharmacy);
     }
@@ -315,8 +411,12 @@ public void updateMedicines(Long telegramId, String medicines) {
         }
 
         pharmacy.setLicenseFileId(pharmacy.getPendingLicenseFileId());
+        pharmacy.setLicenseExpiryDate(pharmacy.getPendingLicenseExpiryDate());
         pharmacy.setPendingLicenseFileId(null);
+        pharmacy.setPendingLicenseExpiryDate(null);
         pharmacy.setLicenseUpdateStatus("APPROVED");
+        pharmacy.setLicenseSuspended(false);
+        pharmacy.setLastExpiryAlertSentDate(null);
         pharmacyRepository.save(pharmacy);
     }
 
@@ -330,6 +430,7 @@ public void updateMedicines(Long telegramId, String medicines) {
         }
 
         pharmacy.setPendingLicenseFileId(null);
+        pharmacy.setPendingLicenseExpiryDate(null);
         pharmacy.setLicenseUpdateStatus("REJECTED");
         pharmacyRepository.save(pharmacy);
     }
@@ -343,7 +444,7 @@ public List<MultiMedicinePharmacyResultDTO> searchMultipleMedicinesNearby(
     List<Pharmacy> pharmacies = pharmacyRepository.findByApprovedTrue();
 
     List<String> normalizedMedicines = medicines.stream()
-            .map(m -> m == null ? "" : m.trim().toLowerCase())
+            .map(MedicineSearchNormalizer::normalizeToEnglishCanonical)
             .filter(m -> !m.isBlank())
             .distinct()
             .toList();
@@ -351,6 +452,10 @@ public List<MultiMedicinePharmacyResultDTO> searchMultipleMedicinesNearby(
     List<MultiMedicinePharmacyResultDTO> results = new ArrayList<>();
 
     for (Pharmacy pharmacy : pharmacies) {
+
+        if (pharmacy.isLicenseSuspended()) {
+            continue;
+        }
 
         if (pharmacy.getLatitude() == null || pharmacy.getLongitude() == null) {
             continue;
@@ -389,6 +494,7 @@ public List<MultiMedicinePharmacyResultDTO> searchMultipleMedicinesNearby(
 
             if (item != null && !item.isOutOfStock() && item.getQuantity() != null && item.getQuantity() > 0) {
                 dto.getMatchedMedicines().add(medicine);
+                dto.getMatchedMedicineIds().add(item.getId());
             } else {
                 dto.getMissingMedicines().add(medicine);
             }
@@ -412,27 +518,7 @@ public List<MultiMedicinePharmacyResultDTO> searchMultipleMedicinesNearby(
 }
 @Override
 public List<String> suggestAlternativeMedicines(String medicine) {
-    if (medicine == null || medicine.isBlank()) {
-        return List.of();
-    }
-
-    String normalizedInput = medicine.trim().toLowerCase();
-
-    List<String> medicines = inventoryRepository.findAllDistinctMedicineNames();
-
-    return medicines.stream()
-            .filter(m -> m != null && !m.isBlank())
-            .map(String::trim)
-            .map(String::toLowerCase)
-            .filter(m -> {
-                return m.startsWith(normalizedInput)
-                        || m.contains(normalizedInput)
-                        || levenshteinDistance(m, normalizedInput) <= 2;
-            })
-            .distinct()
-            .sorted()
-            .limit(5)
-            .toList();
+    return suggestMedicineOptions(medicine).alternativeSuggestions();
 }
 @Override
 public boolean medicineExistsInCatalog(String medicine) {
@@ -440,33 +526,10 @@ public boolean medicineExistsInCatalog(String medicine) {
         return false;
     }
 
-    String normalized = medicine.trim().toLowerCase();
+    String normalized = MedicineSearchNormalizer.normalizeToEnglishCanonical(medicine);
 
     return inventoryRepository.findAllDistinctMedicineNames().stream()
             .anyMatch(m -> m.equalsIgnoreCase(normalized));
-}
-private int levenshteinDistance(String a, String b) {
-    int[][] dp = new int[a.length() + 1][b.length() + 1];
-
-    for (int i = 0; i <= a.length(); i++) {
-        dp[i][0] = i;
-    }
-    for (int j = 0; j <= b.length(); j++) {
-        dp[0][j] = j;
-    }
-
-    for (int i = 1; i <= a.length(); i++) {
-        for (int j = 1; j <= b.length(); j++) {
-            int cost = a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1;
-
-            dp[i][j] = Math.min(
-                    Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1),
-                    dp[i - 1][j - 1] + cost
-            );
-        }
-    }
-
-    return dp[a.length()][b.length()];
 }
 
 }

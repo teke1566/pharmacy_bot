@@ -3,6 +3,7 @@ package com.tenahub.bot.service.impl;
 import com.tenahub.bot.entity.MedicineSearchLog;
 import com.tenahub.bot.repository.MedicineSearchLogRepository;
 import com.tenahub.bot.service.MedicineSearchLogService;
+import com.tenahub.bot.util.MedicineSearchNormalizer;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
@@ -22,7 +23,7 @@ public class MedicineSearchLogServiceImpl implements MedicineSearchLogService {
 
         MedicineSearchLog log = new MedicineSearchLog();
         log.setUserId(userId);
-        log.setMedicineName(medicineName.trim().toLowerCase());
+        log.setMedicineName(MedicineSearchNormalizer.normalizeToEnglishCanonical(medicineName));
 
         repository.save(log);
     }

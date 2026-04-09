@@ -3,6 +3,7 @@ package com.tenahub.bot.service;
 import com.tenahub.bot.entity.MedicineReservation;
 
 import java.util.List;
+import java.util.Map;
 
 public interface ReservationService {
 
@@ -15,15 +16,33 @@ public interface ReservationService {
             String customerName
     );
 
+    List<MedicineReservation> createReservationGroup(
+            Long userId,
+            Long pharmacyId,
+            Map<String, Integer> medicineQuantities,
+            String customerPhone,
+            String customerName
+    );
+
     MedicineReservation approveReservation(Long reservationId);
 
     MedicineReservation rejectReservation(Long reservationId, String reason);
 
     MedicineReservation fulfillReservation(Long reservationId);
 
+    MedicineReservation fulfillReservationAndNotify(Long reservationId);
+
+    MedicineReservation scanReservationByQrToken(String qrToken, Long pharmacyTelegramId);
+
+    MedicineReservation fulfillReservationForPharmacy(Long reservationId, Long pharmacyTelegramId);
+
+    MedicineReservation fulfillReservationAndNotify(Long reservationId, Long pharmacyTelegramId);
+
     MedicineReservation expireReservation(Long reservationId);
 
     MedicineReservation cancelReservationByUser(Long userId, Long reservationId);
+
+    MedicineReservation autoCancelPendingReservation(Long reservationId, String reason);
 
     String viewActiveReservations(Long chatId);
 

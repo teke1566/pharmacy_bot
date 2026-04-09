@@ -2,6 +2,7 @@ package com.tenahub.bot.service.impl;
 
 import java.util.Map;
 
+import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -15,9 +16,10 @@ import com.tenahub.bot.dto.ReverseGeocodeResult;
 import com.tenahub.bot.service.GeocodingService;
 
 @Service
+@RequiredArgsConstructor
 public class GeocodingServiceImpl implements GeocodingService {
 
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final RestTemplate restTemplate;
 
     @Override
     public ReverseGeocodeResult reverseGeocode(double latitude, double longitude) {

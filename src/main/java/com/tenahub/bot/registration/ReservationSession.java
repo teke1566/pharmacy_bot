@@ -10,6 +10,9 @@ public class ReservationSession {
     private boolean waitingForCustomQuantity;
     private boolean waitingForName;
     private boolean waitingForPhone;
+    private String customerPhone;
+    private boolean editingName;
+    private boolean editingPhone;
 
     // add this
     private Integer sourceMessageId;
@@ -76,5 +79,29 @@ public class ReservationSession {
 
     public void setSourceMessageId(Integer sourceMessageId) {
         this.sourceMessageId = sourceMessageId;
+    }
+
+    public String getCustomerPhone() {
+        return customerPhone;
+    }
+
+    public void setCustomerPhone(String customerPhone) {
+        this.customerPhone = customerPhone;
+    }
+
+    public boolean isEditingName() {
+        return editingName;
+    }
+
+    public void setEditingName(boolean editingName) {
+        this.editingName = editingName;
+    }
+
+    public boolean isEditingPhone() {
+        return editingPhone;
+    }
+
+    public void setEditingPhone(boolean editingPhone) {
+        this.editingPhone = editingPhone;
     }
 }
