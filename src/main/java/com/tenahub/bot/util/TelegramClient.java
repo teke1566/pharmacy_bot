@@ -1,11 +1,13 @@
 package com.tenahub.bot.util;
 
+import com.tenahub.bot.config.TelegramConfig;
 import com.tenahub.bot.registration.RegistrationStep;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.*;
 import org.springframework.stereotype.Component;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
+import org.springframework.util.StringUtils;
 import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
@@ -20,8 +22,20 @@ public class TelegramClient {
 
     private final RestTemplate restTemplate = new RestTemplate();
 
-    private final String botToken = "";
-    private final String apiUrl = "https://api.telegram.org/bot" + botToken;
+    private final String botToken;
+    private final String apiUrl;
+
+    public TelegramClient(TelegramConfig telegramConfig) {
+        this.botToken = telegramConfig.getBotToken() != null ? telegramConfig.getBotToken() : "";
+        if (StringUtils.hasText(telegramConfig.getApiUrl())) {
+            String configured = telegramConfig.getApiUrl().trim();
+            this.apiUrl = configured.endsWith("/")
+                    ? configured.substring(0, configured.length() - 1)
+                    : configured;
+        } else {
+            this.apiUrl = "https://api.telegram.org/bot" + this.botToken;
+        }
+    }
 
     /* ---------------- BASIC SEND ---------------- */
 

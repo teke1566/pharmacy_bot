@@ -1,0 +1,30 @@
+spring:
+  application:
+    name: tenahub-bot
+  datasource:
+    url: jdbc:postgresql://localhost:5432/tenahub
+    username: tenahub
+    password: change-me
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+server:
+  port: 8080
+
+telegram:
+  bot-token: ${TELEGRAM_BOT_TOKEN:replace-with-bot-token}
+  bot-username: ${TELEGRAM_BOT_USERNAME:YourBotUsername}
+  # Full Bot API base including token, e.g. https://api.telegram.org/bot<token>
+  # Leave blank to derive from bot-token.
+  api-url: ${TELEGRAM_API_URL:}
+
+twilio:
+  account-sid: ${TWILIO_ACCOUNT_SID:replace-with-account-sid}
+  auth-token: ${TWILIO_AUTH_TOKEN:replace-with-auth-token}
+  phone-number: ${TWILIO_PHONE_NUMBER:+10000000000}

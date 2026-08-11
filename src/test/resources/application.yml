@@ -1,0 +1,25 @@
+spring:
+  profiles:
+    active: test
+  datasource:
+    url: jdbc:h2:mem:tenahub;MODE=PostgreSQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.H2Dialect
+
+telegram:
+  bot-token: test-token
+  bot-username: TestTenahubBot
+  api-url: https://api.telegram.org/bottest-token
+
+twilio:
+  account-sid: test-account-sid
+  auth-token: test-auth-token
+  phone-number: "+10000000000"
