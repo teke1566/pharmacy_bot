@@ -1,5 +1,6 @@
 package com.tenahub.bot.entity;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 
@@ -57,11 +58,33 @@ public class Pharmacy {
     private Long telegramId;
 
     private String licenseFileId;
+    private LocalDate licenseExpiryDate;
+    private boolean licenseSuspended;
+    private LocalDate lastExpiryAlertSentDate;
 
     // NEW FIELDS FOR LICENSE UPDATE APPROVAL FLOW
     private String pendingLicenseFileId;
+    private LocalDate pendingLicenseExpiryDate;
 
     private String licenseUpdateStatus; // PENDING / APPROVED / REJECTED
+
+    private LocalDate gracePeriodUntil;
+
+    @Column(length = 128)
+    private String lastComplianceAction;
+
+    private LocalDateTime lastComplianceActionAt;
+
+    private Long lastComplianceActionBy;
+
     @Column(name = "photo_file_id")
     private String photoFileId;
+
+    @Column(columnDefinition = "boolean not null default false")
+    private boolean temporarilyClosed;
+
+    @Column(length = 64)
+    private String temporaryClosureReason;
+
+    private LocalDateTime temporaryClosedUntil;
 }

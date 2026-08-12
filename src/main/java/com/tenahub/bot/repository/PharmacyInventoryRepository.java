@@ -10,6 +10,7 @@ import java.util.Optional;
 public interface PharmacyInventoryRepository extends JpaRepository<PharmacyInventory, Long> {
 
     List<PharmacyInventory> findByPharmacyId(Long pharmacyId);
+    long countByPharmacyId(Long pharmacyId);
 
     Optional<PharmacyInventory> findByPharmacyIdAndMedicineNameIgnoreCase(Long pharmacyId, String medicineName);
 

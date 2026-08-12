@@ -3,6 +3,8 @@ package com.tenahub.bot.entity;
 import jakarta.persistence.*;
 import lombok.*;
 
+import java.time.LocalDate;
+
 @Entity
 @Data
 @Builder
@@ -31,6 +33,7 @@ public class PharmacyRegistration {
     private String formattedAddress;
     private String landmark;
     private String plusCode;
+    private LocalDate licenseExpiryDate;
 
     @Column(name = "rejection_reason")
     private String rejectionReason;

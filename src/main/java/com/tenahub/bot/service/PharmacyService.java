@@ -1,7 +1,9 @@
 package com.tenahub.bot.service;
 
+import com.tenahub.bot.dto.MedicineSuggestionResult;
 import com.tenahub.bot.dto.MultiMedicinePharmacyResultDTO;
 import com.tenahub.bot.dto.PharmacyResponseDTO;
+import java.time.LocalDate;
 import java.util.List;
 
 public interface PharmacyService {
@@ -13,6 +15,8 @@ public interface PharmacyService {
     List<PharmacyResponseDTO> searchMedicineWithCity(String medicine, String city);
 
     List<String> suggestMedicines(String input);
+
+    MedicineSuggestionResult suggestMedicineOptions(String input);
 
     List<PharmacyResponseDTO> searchMedicineNearby(
             String medicine,
@@ -31,7 +35,11 @@ public interface PharmacyService {
 
     void updateLicense(Long telegramId, String fileId);
 
-    void savePendingLicenseUpdate(Long telegramId, String fileId);
+    void setTemporaryClosure(Long telegramId, String reason, int durationHours);
+
+    void clearTemporaryClosure(Long telegramId);
+
+        void savePendingLicenseUpdate(Long telegramId, String fileId, LocalDate expiryDate);
 
     void approvePendingLicenseUpdate(Long telegramId);
 

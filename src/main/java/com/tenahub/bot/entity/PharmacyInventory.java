@@ -38,5 +38,10 @@ private BigDecimal price;
 
 @Column(name = "currency")
 private String currency;
+
+@Builder.Default
+@Column(name = "requires_prescription", nullable = false)
+private boolean requiresPrescription = false;
+
 private LocalDateTime updatedAt;
 }

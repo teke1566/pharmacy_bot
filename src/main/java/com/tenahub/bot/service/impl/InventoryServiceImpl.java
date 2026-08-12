@@ -1,9 +1,12 @@
 package com.tenahub.bot.service.impl;
 
+import com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO;
 import com.tenahub.bot.entity.*;
 import com.tenahub.bot.repository.*;
 import com.tenahub.bot.service.InventoryService;
 import com.tenahub.bot.service.MedicineAvailabilityAlertService;
+import com.tenahub.bot.service.PharmacyService;
+import com.tenahub.bot.util.MedicineSearchNormalizer;
 import com.tenahub.bot.util.TelegramClient;
 
 import lombok.RequiredArgsConstructor;
@@ -15,9 +18,13 @@ import java.nio.charset.StandardCharsets;
 import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 @Service
@@ -29,8 +36,10 @@ public class InventoryServiceImpl implements InventoryService {
     private final InventoryHistoryRepository historyRepository;
     private final LowStockThresholdRepository thresholdRepository;
     private final MedicineSearchLogRepository searchLogRepository;
+    private final MedicineReservationRepository reservationRepository;
     private final TelegramClient telegramClient;
     private final MedicineAvailabilityAlertService medicineAvailabilityAlertService;
+    private final PharmacyService pharmacyService;
     
 
 
@@ -40,12 +49,15 @@ public void markOutOfStock(Long telegramId, String medicineName) {
     Pharmacy pharmacy = pharmacyRepository.findByTelegramId(telegramId)
             .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
 
+    LocalDateTime now = LocalDateTime.now();
+    String normalizedMedicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(medicineName);
+
     PharmacyInventory item = inventoryRepository
-            .findByPharmacyIdAndMedicineNameIgnoreCase(pharmacy.getId(), medicineName)
+        .findByPharmacyIdAndMedicineNameIgnoreCase(pharmacy.getId(), normalizedMedicine)
             .orElse(
                     PharmacyInventory.builder()
                             .pharmacyId(pharmacy.getId())
-                            .medicineName(medicineName.toLowerCase().trim())
+                .medicineName(normalizedMedicine)
                             .quantity(0)
                             .outOfStock(true)
                             .lowStockAlertSent(true)
@@ -56,8 +68,12 @@ public void markOutOfStock(Long telegramId, String medicineName) {
     item.setQuantity(0);
     item.setOutOfStock(true);
     item.setLowStockAlertSent(true);
+    item.setUpdatedAt(now);
 
     inventoryRepository.save(item);
+
+    pharmacy.setLastInventoryUpdate(now);
+    pharmacyRepository.save(pharmacy);
 
     historyRepository.save(
             InventoryHistory.builder()
@@ -66,13 +82,13 @@ public void markOutOfStock(Long telegramId, String medicineName) {
                     .oldQuantity(oldQty)
                     .newQuantity(0)
                     .eventType(InventoryEventType.MARKED_OUT)
-                    .createdAt(LocalDateTime.now())
+                    .createdAt(now)
                     .build()
     );
 
     telegramClient.sendMessage(
             telegramId,
-            "📉 <b>Marked Out of Stock</b>\n\n💊 " + item.getMedicineName()
+            "📉 <b>Marked Out of Stock</b>\n\n💊 " + telegramClient.displayMedicine(telegramId, item.getMedicineName())
     );
 }
     @Override
@@ -85,6 +101,45 @@ public void markOutOfStock(Long telegramId, String medicineName) {
                 .sorted(Comparator.comparing(PharmacyInventory::getMedicineName, String.CASE_INSENSITIVE_ORDER))
                 .collect(Collectors.toList());
     }
+
+        @Override
+        public List<PharmacyInventory> getInventoryByPharmacyId(Long pharmacyId) {
+        pharmacyRepository.findById(pharmacyId)
+            .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+
+        return inventoryRepository.findByPharmacyId(pharmacyId)
+            .stream()
+            .sorted(Comparator.comparing(PharmacyInventory::getMedicineName, String.CASE_INSENSITIVE_ORDER))
+            .toList();
+        }
+
+        @Override
+        public PharmacyInventory setRequiresPrescription(Long telegramId, Long medicineId, boolean requiresPrescription) {
+        Pharmacy pharmacy = pharmacyRepository.findByTelegramId(telegramId)
+            .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+        return setRequiresPrescriptionForPharmacy(pharmacy.getId(), medicineId, requiresPrescription);
+        }
+
+        @Override
+        public PharmacyInventory setRequiresPrescriptionForPharmacy(Long pharmacyId, Long medicineId, boolean requiresPrescription) {
+        Pharmacy pharmacy = pharmacyRepository.findById(pharmacyId)
+            .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+        PharmacyInventory item = inventoryRepository.findById(medicineId)
+            .orElseThrow(() -> new RuntimeException("Medicine not found with ID: " + medicineId));
+
+        if (!pharmacyId.equals(item.getPharmacyId())) {
+            throw new RuntimeException("Selected medicine does not belong to the pharmacy");
+        }
+
+        item.setRequiresPrescription(requiresPrescription);
+        item.setUpdatedAt(LocalDateTime.now());
+        inventoryRepository.save(item);
+
+        pharmacy.setLastInventoryUpdate(LocalDateTime.now());
+        pharmacyRepository.save(pharmacy);
+
+        return item;
+        }
 
     @Override
     public byte[] exportInventoryCsv(Long telegramId) {
@@ -119,6 +174,8 @@ public void markOutOfStock(Long telegramId, String medicineName) {
         Pharmacy pharmacy = pharmacyRepository.findByTelegramId(telegramId)
                 .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
 
+        LocalDateTime now = LocalDateTime.now();
+
         String[] lines = csvContent.split("\\r?\\n");
 
         for (int i = 1; i < lines.length; i++) {
@@ -128,7 +185,7 @@ public void markOutOfStock(Long telegramId, String medicineName) {
             String[] parts = line.split(",");
             if (parts.length < 2) continue;
 
-            String medicine = parts[0].replace("\"", "").trim().toLowerCase();
+            String medicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(parts[0].replace("\"", "").trim());
             Integer qty = Integer.parseInt(parts[1].trim());
 
             PharmacyInventory item = inventoryRepository
@@ -144,6 +201,7 @@ public void markOutOfStock(Long telegramId, String medicineName) {
 
             item.setQuantity(qty);
             item.setOutOfStock(qty <= 0);
+            item.setUpdatedAt(now);
             inventoryRepository.save(item);
 
             historyRepository.save(
@@ -153,10 +211,13 @@ public void markOutOfStock(Long telegramId, String medicineName) {
                             .oldQuantity(oldQty)
                             .newQuantity(qty)
                             .eventType(InventoryEventType.CSV_IMPORTED)
-                            .createdAt(LocalDateTime.now())
+                            .createdAt(now)
                             .build()
             );
         }
+
+        pharmacy.setLastInventoryUpdate(now);
+        pharmacyRepository.save(pharmacy);
     }
 
     @Override
@@ -234,9 +295,9 @@ public void markOutOfStock(Long telegramId, String medicineName) {
             int threshold = getThreshold(pharmacy.getId(), item.getMedicineName());
 
             if (item.isOutOfStock() || qty <= 0) {
-                out.append("💊 ").append(item.getMedicineName()).append("\n");
+                out.append("💊 ").append(telegramClient.displayMedicine(telegramId, item.getMedicineName())).append("\n");
             } else if (qty <= threshold) {
-                low.append("💊 ").append(item.getMedicineName()).append(" — ").append(qty).append(" left\n");
+                low.append("💊 ").append(telegramClient.displayMedicine(telegramId, item.getMedicineName())).append(" — ").append(qty).append(" left\n");
             }
         }
 
@@ -262,12 +323,14 @@ public void setLowStockThreshold(Long telegramId, String medicineName, Integer t
     Pharmacy pharmacy = pharmacyRepository.findByTelegramId(telegramId)
             .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
 
+    String normalizedMedicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(medicineName);
+
     LowStockThreshold config = thresholdRepository
-            .findByPharmacyIdAndMedicineNameIgnoreCase(pharmacy.getId(), medicineName)
+        .findByPharmacyIdAndMedicineNameIgnoreCase(pharmacy.getId(), normalizedMedicine)
             .orElse(
                     LowStockThreshold.builder()
                             .pharmacyId(pharmacy.getId())
-                            .medicineName(medicineName.toLowerCase().trim())
+                .medicineName(normalizedMedicine)
                             .build()
             );
 
@@ -275,7 +338,7 @@ public void setLowStockThreshold(Long telegramId, String medicineName, Integer t
     thresholdRepository.save(config);
 
     // also check current inventory and reset alert flag if stock is now safe
-    inventoryRepository.findByPharmacyIdAndMedicineNameIgnoreCase(pharmacy.getId(), medicineName)
+    inventoryRepository.findByPharmacyIdAndMedicineNameIgnoreCase(pharmacy.getId(), normalizedMedicine)
             .ifPresent(item -> {
                 Integer qty = item.getQuantity() == null ? 0 : item.getQuantity();
 
@@ -335,6 +398,148 @@ public void setLowStockThreshold(Long telegramId, String medicineName, Integer t
         return sb.toString().trim();
     }
 
+    @Override
+    public String getAdvancedRestockSuggestions(Long telegramId) {
+        Pharmacy pharmacy = pharmacyRepository.findByTelegramId(telegramId)
+                .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime weekStart = now.minusDays(7);
+
+        List<PharmacyInventory> inventory = inventoryRepository.findByPharmacyId(pharmacy.getId());
+        if (inventory.isEmpty()) {
+            return "💡 <b>Restock Suggestions</b>\n\nNo inventory items found yet. Add medicines first to get recommendations.";
+        }
+
+        Set<String> pharmacyMedicines = inventory.stream()
+                .map(PharmacyInventory::getMedicineName)
+                .filter(name -> name != null && !name.isBlank())
+                .map(name -> name.trim().toLowerCase())
+                .collect(Collectors.toCollection(HashSet::new));
+
+        Map<String, Integer> weeklySearchCount = new HashMap<>();
+        for (MedicineSearchLog log : searchLogRepository.findBySearchedAtBetween(weekStart, now)) {
+            if (log.getMedicineName() == null || log.getMedicineName().isBlank()) {
+                continue;
+            }
+            String medicine = log.getMedicineName().trim().toLowerCase();
+            if (!pharmacyMedicines.contains(medicine)) {
+                continue;
+            }
+            weeklySearchCount.merge(medicine, 1, Integer::sum);
+        }
+
+        Map<String, Integer> weeklyFailureCount = new HashMap<>();
+        for (MedicineReservation reservation : reservationRepository.findByPharmacyIdOrderByCreatedAtDesc(pharmacy.getId())) {
+            if (reservation.getCreatedAt() == null || reservation.getCreatedAt().isBefore(weekStart)) {
+                continue;
+            }
+            if (reservation.getMedicineName() == null || reservation.getMedicineName().isBlank()) {
+                continue;
+            }
+
+            if (reservation.getStatus() != MedicineReservationStatus.REJECTED
+                    && reservation.getStatus() != MedicineReservationStatus.CANCELLED
+                    && reservation.getStatus() != MedicineReservationStatus.EXPIRED) {
+                continue;
+            }
+
+            String medicine = reservation.getMedicineName().trim().toLowerCase();
+            weeklyFailureCount.merge(medicine, 1, Integer::sum);
+        }
+
+        Map<String, Integer> weeklyStockoutCount = new HashMap<>();
+        for (InventoryHistory event : historyRepository.findByPharmacyIdAndCreatedAtBetween(pharmacy.getId(), weekStart, now)) {
+            if (event.getMedicineName() == null || event.getMedicineName().isBlank()) {
+                continue;
+            }
+            if (event.getEventType() != InventoryEventType.MARKED_OUT) {
+                continue;
+            }
+
+            String medicine = event.getMedicineName().trim().toLowerCase();
+            weeklyStockoutCount.merge(medicine, 1, Integer::sum);
+        }
+
+        class Suggestion {
+            String medicine;
+            int demandScore;
+            int searches;
+            int failures;
+            int stockouts;
+            boolean outOfStock;
+            boolean lowStock;
+            int quantity;
+        }
+
+        List<Suggestion> ranked = inventory.stream()
+                .map(item -> {
+                    String medicine = item.getMedicineName() == null ? "" : item.getMedicineName().trim().toLowerCase();
+                    int searches = weeklySearchCount.getOrDefault(medicine, 0);
+                    int failures = weeklyFailureCount.getOrDefault(medicine, 0);
+                    int stockouts = weeklyStockoutCount.getOrDefault(medicine, 0);
+                    int quantity = item.getQuantity() == null ? 0 : item.getQuantity();
+                    int threshold = getThreshold(pharmacy.getId(), medicine);
+                    boolean outOfStock = item.isOutOfStock() || quantity <= 0;
+                    boolean lowStock = !outOfStock && quantity <= threshold;
+
+                    // Weighted weekly demand score across the four signals.
+                    int score = (searches * 2) + (failures * 3) + (stockouts * 2);
+                    if (outOfStock) {
+                        score += 6;
+                    } else if (lowStock) {
+                        score += 3;
+                    }
+
+                    Suggestion suggestion = new Suggestion();
+                    suggestion.medicine = medicine;
+                    suggestion.demandScore = score;
+                    suggestion.searches = searches;
+                    suggestion.failures = failures;
+                    suggestion.stockouts = stockouts;
+                    suggestion.outOfStock = outOfStock;
+                    suggestion.lowStock = lowStock;
+                    suggestion.quantity = quantity;
+                    return suggestion;
+                })
+                .filter(s -> s.demandScore > 0)
+                .sorted((a, b) -> Integer.compare(b.demandScore, a.demandScore))
+                .limit(5)
+                .collect(Collectors.toList());
+
+        if (ranked.isEmpty()) {
+            return "💡 <b>Restock Suggestions</b>\n\nNo strong restock signals this week. Stock levels look stable.";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("💡 <b>Restock Suggestions (Advanced)</b>\n\n");
+        sb.append("Signals used: demand insights, recent searches, reservation failures, stockout frequency.\n\n");
+
+        for (Suggestion s : ranked) {
+            String stockState = s.outOfStock
+                    ? "❌ out of stock"
+                    : (s.lowStock ? "⚠️ low stock" : "✅ in stock");
+
+            sb.append("⚠️ You may want to restock ")
+                    .append(s.medicine)
+                    .append(". Searched ")
+                    .append(s.searches)
+                    .append(" times this week")
+                    .append(s.failures > 0 ? ", reservation failures " + s.failures : "")
+                    .append(s.stockouts > 0 ? ", stockouts " + s.stockouts : "")
+                    .append(".\n")
+                    .append("   • status: ")
+                    .append(stockState)
+                    .append(" | qty: ")
+                    .append(s.quantity)
+                    .append(" | score: ")
+                    .append(s.demandScore)
+                    .append("\n\n");
+        }
+
+        return sb.toString().trim();
+    }
+
     private int getThreshold(Long pharmacyId, String medicineName) {
         return thresholdRepository.findByPharmacyIdAndMedicineNameIgnoreCase(pharmacyId, medicineName)
                 .map(LowStockThreshold::getThreshold)
@@ -350,7 +555,10 @@ public void upsertStock(Long telegramId, String medicineName, Integer quantity, 
     Pharmacy pharmacy = pharmacyRepository.findByTelegramId(telegramId)
             .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
 
+    LocalDateTime now = LocalDateTime.now();
+
     String normalizedMedicine = medicineName.toLowerCase().trim();
+    normalizedMedicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(normalizedMedicine);
 
     PharmacyInventory item = inventoryRepository
             .findByPharmacyIdAndMedicineNameIgnoreCase(pharmacy.getId(), normalizedMedicine)
@@ -370,6 +578,7 @@ public void upsertStock(Long telegramId, String medicineName, Integer quantity, 
     item.setQuantity(quantity);
     item.setPrice(price);
     item.setOutOfStock(quantity == null || quantity <= 0);
+    item.setUpdatedAt(now);
 
     int threshold = getThreshold(pharmacy.getId(), item.getMedicineName());
     boolean alertSent = Boolean.TRUE.equals(item.getLowStockAlertSent());
@@ -394,6 +603,9 @@ public void upsertStock(Long telegramId, String medicineName, Integer quantity, 
 
     inventoryRepository.save(item);
 
+    pharmacy.setLastInventoryUpdate(now);
+    pharmacyRepository.save(pharmacy);
+
     historyRepository.save(
             InventoryHistory.builder()
                     .pharmacyId(pharmacy.getId())
@@ -401,7 +613,7 @@ public void upsertStock(Long telegramId, String medicineName, Integer quantity, 
                     .oldQuantity(oldQty)
                     .newQuantity(quantity)
                     .eventType(InventoryEventType.STOCK_UPDATED)
-                    .createdAt(LocalDateTime.now())
+                    .createdAt(now)
                     .build()
     );
 
@@ -414,6 +626,105 @@ public void upsertStock(Long telegramId, String medicineName, Integer quantity, 
         );
     }
 }
+
+@Override
+public BulkInventoryUpdateResult bulkUpsertFromText(Long telegramId, String bulkText) {
+    if (bulkText == null || bulkText.isBlank()) {
+        return new BulkInventoryUpdateResult(0, 0, 0, List.of("No lines received."));
+    }
+
+    String[] lines = bulkText.split("\\r?\\n");
+    int total = 0;
+    int updated = 0;
+    List<String> errors = new java.util.ArrayList<>();
+
+    for (int i = 0; i < lines.length; i++) {
+        String line = lines[i] == null ? "" : lines[i].trim();
+        if (line.isBlank()) {
+            continue;
+        }
+
+        total++;
+        int displayLine = i + 1;
+
+        String[] parts = line.split("\\|");
+        if (parts.length != 3 && parts.length != 4) {
+            errors.add("Line " + displayLine + ": invalid format. Use medicine | quantity | price [| threshold]");
+            continue;
+        }
+
+        String medicineRaw = parts[0].trim();
+        if (medicineRaw.isBlank()) {
+            errors.add("Line " + displayLine + ": medicine name is empty");
+            continue;
+        }
+
+        Integer quantity;
+        try {
+            quantity = Integer.parseInt(parts[1].trim());
+        } catch (Exception e) {
+            errors.add("Line " + displayLine + ": invalid quantity");
+            continue;
+        }
+
+        if (quantity < 0) {
+            errors.add("Line " + displayLine + ": quantity must be >= 0");
+            continue;
+        }
+
+        BigDecimal price;
+        try {
+            price = new BigDecimal(parts[2].trim());
+        } catch (Exception e) {
+            errors.add("Line " + displayLine + ": invalid price");
+            continue;
+        }
+
+        if (price.compareTo(BigDecimal.ZERO) < 0) {
+            errors.add("Line " + displayLine + ": price must be >= 0");
+            continue;
+        }
+
+        Integer threshold = null;
+        if (parts.length == 4 && !parts[3].trim().isBlank()) {
+            try {
+                threshold = Integer.parseInt(parts[3].trim());
+            } catch (Exception e) {
+                errors.add("Line " + displayLine + ": invalid threshold");
+                continue;
+            }
+
+            if (threshold < 0) {
+                errors.add("Line " + displayLine + ": threshold must be >= 0");
+                continue;
+            }
+        }
+
+        String normalizedMedicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(medicineRaw);
+        if (normalizedMedicine == null || normalizedMedicine.isBlank()) {
+            errors.add("Line " + displayLine + ": unknown medicine name");
+            continue;
+        }
+
+        if (!pharmacyService.medicineExistsInCatalog(normalizedMedicine)) {
+            errors.add("Line " + displayLine + ": unknown medicine name");
+            continue;
+        }
+
+        try {
+            upsertStock(telegramId, normalizedMedicine, quantity, price);
+            if (threshold != null) {
+                setLowStockThreshold(telegramId, normalizedMedicine, threshold);
+            }
+            updated++;
+        } catch (Exception e) {
+            errors.add("Line " + displayLine + ": " + e.getMessage());
+        }
+    }
+
+    int failed = Math.max(0, total - updated);
+    return new BulkInventoryUpdateResult(total, updated, failed, List.copyOf(errors));
+}
  
 @Override
 public void updatePrice(Long pharmacyChatId, String medicineName, BigDecimal price) {
@@ -425,11 +736,13 @@ public void updatePrice(Long pharmacyChatId, String medicineName, BigDecimal pri
         throw new RuntimeException("Price must be 0 or greater.");
     }
 
+        String normalizedMedicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(medicineName);
+
     Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyChatId)
             .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
 
     PharmacyInventory inventory = inventoryRepository
-            .findByPharmacyIdAndMedicineNameIgnoreCase(pharmacy.getId(), medicineName.trim())
+            .findByPharmacyIdAndMedicineNameIgnoreCase(pharmacy.getId(), normalizedMedicine)
             .orElseThrow(() -> new RuntimeException("Medicine not found in inventory"));
 
     inventory.setPrice(price);
@@ -447,7 +760,9 @@ public void initializeInventoryFromMedicines(Long pharmacyId, String medicines) 
         return;
     }
 
-    List<String> medicineList = Arrays.stream(medicines.split(","))
+    String normalizedMedicines = MedicineSearchNormalizer.normalizeCommaSeparatedMedicines(medicines);
+
+    List<String> medicineList = Arrays.stream(normalizedMedicines.split(","))
             .map(String::trim)
             .filter(m -> !m.isBlank())
             .map(String::toLowerCase)
@@ -473,4 +788,176 @@ public void initializeInventoryFromMedicines(Long pharmacyId, String medicines) 
         }
     }
 }
+
+    // ── Pharmacy Mini App Inventory ──────────────────────────────────────
+
+    @Override
+    public List<PharmacyMiniAppInventoryItemDTO> getPharmacyMiniAppInventory(Long pharmacyTelegramId) {
+        Pharmacy pharmacy = resolvePharmacy(pharmacyTelegramId);
+        List<PharmacyInventory> items = inventoryRepository.findByPharmacyId(pharmacy.getId());
+        items.sort(Comparator.comparing(PharmacyInventory::getMedicineName, String.CASE_INSENSITIVE_ORDER));
+        return items.stream().map(this::toMiniAppDTO).toList();
+    }
+
+    @Override
+    public PharmacyMiniAppInventoryItemDTO updateStockFromMiniApp(Long pharmacyTelegramId, Long itemId, Integer quantity) {
+        Pharmacy pharmacy = resolvePharmacy(pharmacyTelegramId);
+        PharmacyInventory item = resolveOwnedItem(pharmacy, itemId);
+
+        Integer oldQty = item.getQuantity();
+        item.setQuantity(quantity);
+        item.setOutOfStock(quantity == null || quantity <= 0);
+        item.setUpdatedAt(LocalDateTime.now());
+
+        inventoryRepository.save(item);
+        recordHistory(pharmacy.getId(), item.getMedicineName(), oldQty, quantity, InventoryEventType.MINIAPP_UPDATED);
+        return toMiniAppDTO(item);
+    }
+
+    @Override
+    public PharmacyMiniAppInventoryItemDTO updatePriceFromMiniApp(Long pharmacyTelegramId, Long itemId, BigDecimal price) {
+        Pharmacy pharmacy = resolvePharmacy(pharmacyTelegramId);
+        PharmacyInventory item = resolveOwnedItem(pharmacy, itemId);
+
+        item.setPrice(price);
+        if (item.getCurrency() == null || item.getCurrency().isBlank()) {
+            item.setCurrency("ETB");
+        }
+        item.setUpdatedAt(LocalDateTime.now());
+
+        inventoryRepository.save(item);
+        recordHistory(pharmacy.getId(), item.getMedicineName(), item.getQuantity(), item.getQuantity(), InventoryEventType.MINIAPP_UPDATED);
+        return toMiniAppDTO(item);
+    }
+
+    @Override
+    public PharmacyMiniAppInventoryItemDTO togglePrescriptionFromMiniApp(Long pharmacyTelegramId, Long itemId, boolean requiresPrescription) {
+        Pharmacy pharmacy = resolvePharmacy(pharmacyTelegramId);
+        PharmacyInventory item = resolveOwnedItem(pharmacy, itemId);
+
+        item.setRequiresPrescription(requiresPrescription);
+        item.setUpdatedAt(LocalDateTime.now());
+
+        inventoryRepository.save(item);
+        return toMiniAppDTO(item);
+    }
+
+    @Override
+    public PharmacyMiniAppInventoryItemDTO toggleAvailabilityFromMiniApp(Long pharmacyTelegramId, Long itemId, boolean available) {
+        Pharmacy pharmacy = resolvePharmacy(pharmacyTelegramId);
+        PharmacyInventory item = resolveOwnedItem(pharmacy, itemId);
+
+        Integer oldQty = item.getQuantity();
+        if (!available) {
+            item.setOutOfStock(true);
+            item.setQuantity(0);
+        } else {
+            item.setOutOfStock(false);
+            if (item.getQuantity() == null || item.getQuantity() <= 0) {
+                item.setQuantity(1);
+            }
+        }
+        item.setUpdatedAt(LocalDateTime.now());
+
+        inventoryRepository.save(item);
+        recordHistory(pharmacy.getId(), item.getMedicineName(), oldQty, item.getQuantity(),
+                available ? InventoryEventType.STOCK_UPDATED : InventoryEventType.MARKED_OUT);
+        return toMiniAppDTO(item);
+    }
+
+    private Pharmacy resolvePharmacy(Long pharmacyTelegramId) {
+        if (pharmacyTelegramId == null || pharmacyTelegramId <= 0) {
+            throw new RuntimeException("pharmacyTelegramId is required");
+        }
+        return pharmacyRepository.findByTelegramId(pharmacyTelegramId)
+                .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+    }
+
+    @Override
+    public PharmacyMiniAppInventoryItemDTO addStockFromMiniApp(Long pharmacyTelegramId, String medicineName, Integer quantity, BigDecimal price, Integer lowStockThreshold) {
+        Pharmacy pharmacy = resolvePharmacy(pharmacyTelegramId);
+
+        if (medicineName == null || medicineName.isBlank()) {
+            throw new RuntimeException("medicineName is required");
+        }
+
+        String normalized = medicineName.trim().toLowerCase();
+
+        PharmacyInventory item = inventoryRepository
+                .findByPharmacyIdAndMedicineNameIgnoreCase(pharmacy.getId(), normalized)
+                .orElse(PharmacyInventory.builder()
+                        .pharmacyId(pharmacy.getId())
+                        .medicineName(normalized)
+                        .quantity(0)
+                        .outOfStock(false)
+                        .lowStockAlertSent(false)
+                        .build());
+
+        Integer oldQty = item.getQuantity();
+        if (quantity != null) {
+            item.setQuantity(quantity);
+            item.setOutOfStock(quantity <= 0);
+        }
+        if (price != null) {
+            item.setPrice(price);
+        }
+        if (item.getCurrency() == null || item.getCurrency().isBlank()) {
+            item.setCurrency("ETB");
+        }
+        if (lowStockThreshold != null) {
+            item.setLowStockThreshold(lowStockThreshold);
+        }
+        item.setUpdatedAt(LocalDateTime.now());
+
+        inventoryRepository.save(item);
+        recordHistory(pharmacy.getId(), item.getMedicineName(), oldQty, item.getQuantity(), InventoryEventType.MINIAPP_UPDATED);
+        return toMiniAppDTO(item);
+    }
+
+    private PharmacyInventory resolveOwnedItem(Pharmacy pharmacy, Long itemId) {
+        if (itemId == null) {
+            throw new RuntimeException("itemId is required");
+        }
+        PharmacyInventory item = inventoryRepository.findById(itemId)
+                .orElseThrow(() -> new RuntimeException("Inventory item not found"));
+        if (!item.getPharmacyId().equals(pharmacy.getId())) {
+            throw new RuntimeException("This inventory item does not belong to your pharmacy.");
+        }
+        return item;
+    }
+
+    private void recordHistory(Long pharmacyId, String medicineName, Integer oldQty, Integer newQty, InventoryEventType eventType) {
+        historyRepository.save(
+                InventoryHistory.builder()
+                        .pharmacyId(pharmacyId)
+                        .medicineName(medicineName)
+                        .oldQuantity(oldQty)
+                        .newQuantity(newQty)
+                        .eventType(eventType)
+                        .createdAt(LocalDateTime.now())
+                        .build()
+        );
+    }
+
+    private PharmacyMiniAppInventoryItemDTO toMiniAppDTO(PharmacyInventory item) {
+        int qty = item.getQuantity() == null ? 0 : item.getQuantity();
+        int threshold = item.getLowStockThreshold() == null ? 10 : item.getLowStockThreshold();
+        boolean inStock = !item.isOutOfStock() && qty > 0;
+        boolean lowStock = inStock && qty <= threshold;
+
+        return PharmacyMiniAppInventoryItemDTO.builder()
+                .itemId(item.getId())
+                .medicineId(item.getId())
+                .medicineName(item.getMedicineName())
+                .stockQuantity(qty)
+                .price(item.getPrice())
+                .currency(item.getCurrency())
+                .requiresPrescription(item.isRequiresPrescription())
+                .inStock(inStock)
+                .outOfStock(item.isOutOfStock() || qty <= 0)
+                .lowStock(lowStock)
+                .lowStockThreshold(threshold)
+                .lastUpdatedAt(item.getUpdatedAt())
+                .build();
+    }
 }

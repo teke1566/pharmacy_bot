@@ -3,6 +3,8 @@ package com.tenahub.bot.service;
 
 import com.tenahub.bot.entity.PharmacyRegistration;
 
+import java.time.LocalDate;
+
 public interface RegistrationService {
 
     Long register(String name,
@@ -18,6 +20,8 @@ public interface RegistrationService {
                       String formattedAddress, String plusCode, String landmark);
 
     void saveLocationDetails(Long telegramId, String formattedAddress, String landmark, String plusCode);
+
+    void saveLicenseExpiryDate(Long telegramId, LocalDate expiryDate);
 
     Long saveLicense(Long telegramId, String fileId);
 

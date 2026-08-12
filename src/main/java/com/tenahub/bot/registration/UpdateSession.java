@@ -12,4 +12,6 @@ public class UpdateSession {
     private Integer tempHour;
     private String openTime;
     private String closeTime;
+    private String pendingFileId;
+    private boolean waitingForLicenseExpiryDate;
 }

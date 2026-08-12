@@ -8,7 +8,7 @@ public class UpdateSessionManager {
     private static final Map<Long, UpdateSession> sessions = new ConcurrentHashMap<>();
 
     public static void start(Long chatId, UpdateField field) {
-        sessions.put(chatId, new UpdateSession(field, null, null, null));
+        sessions.put(chatId, new UpdateSession(field, null, null, null, null, false));
     }
 
     public static boolean exists(Long chatId) {
