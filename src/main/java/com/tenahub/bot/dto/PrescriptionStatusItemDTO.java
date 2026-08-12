@@ -17,6 +17,7 @@ public class PrescriptionStatusItemDTO {
     private Long pharmacyId;
     private Long medicineId;
     private String medicineName;
+    private Integer quantity;
     private boolean prescriptionRequired;
     private String reviewStatus;
     private LocalDateTime reviewedAt;

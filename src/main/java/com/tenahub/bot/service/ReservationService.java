@@ -26,6 +26,8 @@ public interface ReservationService {
 
     MedicineReservation approveReservation(Long reservationId);
 
+    MedicineReservation approveReservationAndNotify(Long reservationId);
+
     MedicineReservation rejectReservation(Long reservationId, String reason);
 
     MedicineReservation fulfillReservation(Long reservationId);
@@ -42,6 +44,8 @@ public interface ReservationService {
 
     MedicineReservation cancelReservationByUser(Long userId, Long reservationId);
 
+    MedicineReservation cancelReservationByPharmacy(Long reservationId, Long pharmacyTelegramId);
+
     MedicineReservation autoCancelPendingReservation(Long reservationId, String reason);
 
     String viewActiveReservations(Long chatId);
@@ -56,8 +60,14 @@ public interface ReservationService {
 
     List<MedicineReservation> getUserReservations(Long userId);
 
+    List<MedicineReservation> getPharmacyReservations(Long pharmacyTelegramId);
+
+    void assertPharmacyOwnsReservation(Long reservationId, Long pharmacyTelegramId);
+
     String buildUserReservationStatusLabel(MedicineReservation reservation);
     List<MedicineReservation> getPendingReservations(Long pharmacyTelegramId);
-List<MedicineReservation> getApprovedReservations(Long pharmacyTelegramId);
-List<MedicineReservation> getFulfillableReservations(Long pharmacyTelegramId);
+    List<MedicineReservation> getPrescriptionReservations(Long pharmacyTelegramId);
+    List<MedicineReservation> getApprovedReservations(Long pharmacyTelegramId);
+    List<MedicineReservation> getFulfillableReservations(Long pharmacyTelegramId);
+    void holdInventoryForApprovedPrescription(MedicineReservation reservation);
 }

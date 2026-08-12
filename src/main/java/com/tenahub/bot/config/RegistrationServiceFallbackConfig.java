@@ -110,6 +110,36 @@ public class RegistrationServiceFallbackConfig {
         @Override
         public void initializeInventoryFromMedicines(Long pharmacyId, String medicines) {
         }
+
+        @Override
+        public List<com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO> getPharmacyMiniAppInventory(Long pharmacyTelegramId) {
+            return List.of();
+        }
+
+        @Override
+        public com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO updateStockFromMiniApp(Long pharmacyTelegramId, Long itemId, Integer quantity) {
+            return null;
+        }
+
+        @Override
+        public com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO updatePriceFromMiniApp(Long pharmacyTelegramId, Long itemId, BigDecimal price) {
+            return null;
+        }
+
+        @Override
+        public com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO togglePrescriptionFromMiniApp(Long pharmacyTelegramId, Long itemId, boolean requiresPrescription) {
+            return null;
+        }
+
+        @Override
+        public com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO toggleAvailabilityFromMiniApp(Long pharmacyTelegramId, Long itemId, boolean available) {
+            return null;
+        }
+
+        @Override
+        public com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO addStockFromMiniApp(Long pharmacyTelegramId, String medicineName, Integer quantity, java.math.BigDecimal price, Integer lowStockThreshold) {
+            return null;
+        }
     }
 
     private static class NoOpRegistrationService implements RegistrationService {

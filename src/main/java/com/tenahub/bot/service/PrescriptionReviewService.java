@@ -13,6 +13,7 @@ public interface PrescriptionReviewService {
                                                           Long userId,
                                                           Long pharmacyId,
                                                           Long medicineId,
+                                                          String note,
                                                           List<MultipartFile> files);
 
     PrescriptionStatusResponseDTO getPrescriptionStatus(Long reservationId,

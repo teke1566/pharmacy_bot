@@ -16,4 +16,6 @@ public class MiniAppReservationCreateRequestDTO {
     private Integer quantity;
     private String customerPhone;
     private String customerName;
+    private String telegramInitData;
+    private String initData;
 }

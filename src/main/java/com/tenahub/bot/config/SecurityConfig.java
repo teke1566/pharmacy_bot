@@ -1,5 +1,6 @@
 package com.tenahub.bot.config;
 
+import java.util.Arrays;
 import java.util.List;
 
 import org.springframework.context.annotation.Bean;
@@ -15,15 +16,14 @@ import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 @Configuration
 public class SecurityConfig {
 
-    private static final List<String> MINI_APP_ALLOWED_ORIGINS = List.of(
-            "https://tenahub-miniapp.vercel.app",
-            "http://localhost:5174");
+    private static final List<String> MINI_APP_ALLOWED_ORIGINS =
+            List.copyOf(Arrays.asList(MiniAppCorsConfig.MINI_APP_ALLOWED_ORIGINS));
 
     @Bean
         public SecurityFilterChain securityFilterChain(HttpSecurity http) {
         http
                 .cors(Customizer.withDefaults())
-            .csrf(csrf -> csrf.ignoringRequestMatchers("/api/**", "/proxyapi/api/**", "/telegram/webhook"))
+            .csrf(csrf -> csrf.disable())
                 .authorizeHttpRequests(authorize -> authorize
                         .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
                 .requestMatchers(HttpMethod.POST, "/telegram/webhook").permitAll()
@@ -36,17 +36,16 @@ public class SecurityConfig {
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration configuration = new CorsConfiguration();
         configuration.setAllowedOrigins(MINI_APP_ALLOWED_ORIGINS);
-        configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+        configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
         configuration.setAllowedHeaders(List.of("*"));
         configuration.setExposedHeaders(List.of("*"));
         configuration.setAllowCredentials(true);
         configuration.setMaxAge(3600L);
 
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
-        source.registerCorsConfiguration("/api/miniapp/**", configuration);
-        source.registerCorsConfiguration("/proxyapi/api/miniapp/**", configuration);
-        source.registerCorsConfiguration("/api/pharmacy/**", configuration);
-        source.registerCorsConfiguration("/proxyapi/api/pharmacy/**", configuration);
+        for (String path : MiniAppCorsConfig.MINI_APP_API_PATHS) {
+            source.registerCorsConfiguration(path, configuration);
+        }
         return source;
     }
 }

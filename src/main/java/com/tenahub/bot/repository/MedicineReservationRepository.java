@@ -15,6 +15,8 @@ public interface MedicineReservationRepository extends JpaRepository<MedicineRes
 
     List<MedicineReservation> findByPharmacyIdAndStatus(Long pharmacyId, MedicineReservationStatus status);
 
+    List<MedicineReservation> findByPharmacyIdAndStatusIn(Long pharmacyId, List<MedicineReservationStatus> statuses);
+
     List<MedicineReservation> findByUserId(Long userId);
 
     List<MedicineReservation> findByUserIdOrderByCreatedAtDesc(Long userId);
@@ -41,6 +43,11 @@ public interface MedicineReservationRepository extends JpaRepository<MedicineRes
 
     List<MedicineReservation> findByStatusAndExpiresAtBefore(
             MedicineReservationStatus status,
+            LocalDateTime time
+    );
+
+    List<MedicineReservation> findByStatusInAndExpiresAtBefore(
+            List<MedicineReservationStatus> statuses,
             LocalDateTime time
     );
 

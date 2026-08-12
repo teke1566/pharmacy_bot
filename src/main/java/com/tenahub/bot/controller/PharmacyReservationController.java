@@ -12,6 +12,8 @@ import com.tenahub.bot.entity.Pharmacy;
 import com.tenahub.bot.entity.MedicineReservationStatus;
 import com.tenahub.bot.repository.MedicineReservationRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
+import com.tenahub.bot.service.MiniAppActorResolver;
+import com.tenahub.bot.service.MiniAppAuthException;
 import com.tenahub.bot.service.PrescriptionReviewService;
 import com.tenahub.bot.service.ReservationService;
 import org.springframework.http.MediaType;
@@ -40,15 +42,18 @@ public class PharmacyReservationController {
     private final PharmacyRepository pharmacyRepository;
     private final MedicineReservationRepository medicineReservationRepository;
     private final PrescriptionReviewService prescriptionReviewService;
+    private final MiniAppActorResolver miniAppActorResolver;
 
     public PharmacyReservationController(ReservationService reservationService,
                                          PharmacyRepository pharmacyRepository,
                                          MedicineReservationRepository medicineReservationRepository,
-                                         PrescriptionReviewService prescriptionReviewService) {
+                                         PrescriptionReviewService prescriptionReviewService,
+                                         MiniAppActorResolver miniAppActorResolver) {
         this.reservationService = reservationService;
         this.pharmacyRepository = pharmacyRepository;
         this.medicineReservationRepository = medicineReservationRepository;
         this.prescriptionReviewService = prescriptionReviewService;
+        this.miniAppActorResolver = miniAppActorResolver;
     }
 
     @PostMapping("/reservations/scan")
@@ -107,6 +112,8 @@ public class PharmacyReservationController {
                     .expiresAt(resolveExpiresAt(reservation))
                     .items(List.of(toScanItem(reservation)))
                     .build());
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             return errorResponse(HttpStatus.BAD_REQUEST, e.getMessage());
         } catch (Exception e) {
@@ -130,6 +137,8 @@ public class PharmacyReservationController {
                     .success(true)
                     .status(reservation.getStatus() == null ? null : reservation.getStatus().name())
                     .build());
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             return errorResponse(HttpStatus.BAD_REQUEST, e.getMessage());
         } catch (Exception e) {
@@ -151,6 +160,8 @@ public class PharmacyReservationController {
                     resolvedPharmacyTelegramId,
                     request);
             return ResponseEntity.ok(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             return errorResponse(HttpStatus.BAD_REQUEST, e.getMessage());
         } catch (Exception e) {
@@ -182,6 +193,8 @@ public class PharmacyReservationController {
                     .header(HttpHeaders.CONTENT_DISPOSITION,
                             ContentDisposition.attachment().filename(file.originalFilename()).build().toString())
                     .body(file.fileData());
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             return errorResponse(HttpStatus.BAD_REQUEST, e.getMessage());
         } catch (Exception e) {
@@ -198,11 +211,7 @@ public class PharmacyReservationController {
     }
 
     private Long resolvePharmacyTelegramId(Long headerValue, Long fallbackValue) {
-        Long resolvedValue = headerValue != null ? headerValue : fallbackValue;
-        if (resolvedValue == null || resolvedValue <= 0) {
-            throw new RuntimeException("pharmacyTelegramId is required");
-        }
-        return resolvedValue;
+        return miniAppActorResolver.requirePharmacyTelegramId(headerValue, fallbackValue);
     }
 
     private LocalDateTime resolveExpiresAt(MedicineReservation reservation) {
@@ -255,22 +264,22 @@ public class PharmacyReservationController {
             return com.tenahub.bot.entity.PrescriptionReviewStatus.NOT_REQUIRED.name();
         }
         if (reservations.stream().anyMatch(reservation ->
-                reservation.getPrescriptionReviewStatus() == com.tenahub.bot.entity.PrescriptionReviewStatus.PRESCRIPTION_REJECTED)) {
-            return com.tenahub.bot.entity.PrescriptionReviewStatus.PRESCRIPTION_REJECTED.name();
+                reservation.getPrescriptionReviewStatus() == com.tenahub.bot.entity.PrescriptionReviewStatus.REJECTED)) {
+            return com.tenahub.bot.entity.PrescriptionReviewStatus.REJECTED.name();
         }
         if (reservations.stream()
                 .filter(MedicineReservation::isPrescriptionRequired)
                 .allMatch(reservation -> reservation.getPrescriptionReviewStatus()
-                        == com.tenahub.bot.entity.PrescriptionReviewStatus.PRESCRIPTION_APPROVED)) {
-            return com.tenahub.bot.entity.PrescriptionReviewStatus.PRESCRIPTION_APPROVED.name();
+                        == com.tenahub.bot.entity.PrescriptionReviewStatus.APPROVED)) {
+            return com.tenahub.bot.entity.PrescriptionReviewStatus.APPROVED.name();
         }
         if (reservations.stream()
             .filter(MedicineReservation::isPrescriptionRequired)
             .anyMatch(reservation -> reservation.getPrescriptionReviewStatus()
-                == com.tenahub.bot.entity.PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED)) {
-            return com.tenahub.bot.entity.PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED.name();
+                == com.tenahub.bot.entity.PrescriptionReviewStatus.UPLOAD_REQUIRED)) {
+            return com.tenahub.bot.entity.PrescriptionReviewStatus.UPLOAD_REQUIRED.name();
         }
-        return com.tenahub.bot.entity.PrescriptionReviewStatus.PRESCRIPTION_PENDING.name();
+        return com.tenahub.bot.entity.PrescriptionReviewStatus.PENDING_REVIEW.name();
     }
 
     private String resolveGroupedPrescriptionRejectionReason(List<MedicineReservation> reservations) {
@@ -283,9 +292,10 @@ public class PharmacyReservationController {
 
     private boolean canFulfill(List<MedicineReservation> reservations) {
         return reservations.stream().allMatch(reservation ->
-                reservation.getStatus() == MedicineReservationStatus.APPROVED
+                (reservation.getStatus() == MedicineReservationStatus.APPROVED
+                        || reservation.getStatus() == MedicineReservationStatus.READY_FOR_PICKUP)
                         && (!reservation.isPrescriptionRequired()
-                        || reservation.getPrescriptionReviewStatus() == com.tenahub.bot.entity.PrescriptionReviewStatus.PRESCRIPTION_APPROVED));
+                        || reservation.getPrescriptionReviewStatus() == com.tenahub.bot.entity.PrescriptionReviewStatus.APPROVED));
     }
 
     private MiniAppReservationConfirmItemResponseDTO toScanItem(MedicineReservation reservation) {

@@ -18,5 +18,8 @@ public class MiniAppReservationConfirmRequestDTO {
     private Integer quantity;
     private String phone;
     private String customerName;
+    private String note;
     private List<MiniAppReservationConfirmItemDTO> items;
+    private String telegramInitData;
+    private String initData;
 }

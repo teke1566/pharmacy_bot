@@ -32,6 +32,10 @@ public interface MiniAppService {
     List<MiniAppReservationCardDTO> getActiveReservations(Long telegramUserId);
 
     List<MiniAppReservationCardDTO> getReservationHistory(Long telegramUserId);
+
+    MiniAppOperationResponseDTO hideReservationFromHistory(Long reservationId, Long telegramUserId);
+
+    MiniAppOperationResponseDTO clearReservationHistory(Long telegramUserId);
     
     /**
      * Fetch photos for a specific pharmacy in Mini App format.
@@ -58,6 +62,8 @@ public interface MiniAppService {
     byte[] downloadMedicinePhoto(Long medicineId, Long photoId);
 
     Long resolveMedicineId(Long pharmacyId, String medicineName);
+
+    MiniAppOperationResponseDTO cancelReservation(Long reservationId, Long telegramUserId);
 
     MiniAppReservationPreloadResponseDTO getReservationPreload(Long pharmacyId, List<Long> medicineIds);
 

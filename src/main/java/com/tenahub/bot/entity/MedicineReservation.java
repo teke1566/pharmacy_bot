@@ -88,4 +88,7 @@ public class MedicineReservation {
 
     @Column(name = "reservation_group_id")
     private String reservationGroupId;
+
+    @Column(name = "hidden_from_user_at")
+    private LocalDateTime hiddenFromUserAt;
 }

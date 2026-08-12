@@ -26,6 +26,7 @@ public class SchemaCompatibilityRunner implements CommandLineRunner {
                 "ALTER TABLE medicine_reservations ADD COLUMN IF NOT EXISTS prescription_reviewed_at TIMESTAMP",
                 "ALTER TABLE medicine_reservations ADD COLUMN IF NOT EXISTS prescription_reviewed_by BIGINT",
                 "ALTER TABLE medicine_reservations ADD COLUMN IF NOT EXISTS prescription_rejection_reason VARCHAR(2000)",
+                "ALTER TABLE medicine_reservations ADD COLUMN IF NOT EXISTS hidden_from_user_at TIMESTAMP",
                 "ALTER TABLE pharmacy_inventory ADD COLUMN IF NOT EXISTS requires_prescription BOOLEAN NOT NULL DEFAULT FALSE",
                 "CREATE TABLE IF NOT EXISTS reservation_prescription_files (id BIGSERIAL PRIMARY KEY, reservation_id BIGINT, reservation_group_id VARCHAR(255), user_id BIGINT NOT NULL, pharmacy_id BIGINT NOT NULL, medicine_id BIGINT, original_filename VARCHAR(1024) NOT NULL, content_type VARCHAR(255), file_size BIGINT, file_data BLOB NOT NULL, uploaded_at TIMESTAMP NOT NULL, review_status VARCHAR(64) NOT NULL, reviewed_at TIMESTAMP, reviewed_by BIGINT, rejection_reason VARCHAR(2000))",
                 "ALTER TABLE medicine_availability_alerts ADD COLUMN IF NOT EXISTS radius_km DOUBLE PRECISION NOT NULL DEFAULT 25",

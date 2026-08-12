@@ -1,14 +1,17 @@
 package com.tenahub.bot.scheduler;
 
+import com.tenahub.bot.dto.PrescriptionStatusResponseDTO;
 import com.tenahub.bot.entity.MedicineReservation;
 import com.tenahub.bot.entity.MedicineReservationStatus;
 import com.tenahub.bot.entity.Pharmacy;
 import com.tenahub.bot.entity.PrescriptionReviewStatus;
 import com.tenahub.bot.repository.MedicineReservationRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
+import com.tenahub.bot.service.PrescriptionReviewService;
 import com.tenahub.bot.service.ReservationService;
 import com.tenahub.bot.util.TelegramClient;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -18,12 +21,14 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 @Component
+@Slf4j
 @RequiredArgsConstructor
 public class ReservationScheduler {
 
     private final MedicineReservationRepository reservationRepository;
     private final PharmacyRepository pharmacyRepository;
     private final ReservationService reservationService;
+    private final PrescriptionReviewService prescriptionReviewService;
     private final TelegramClient telegramClient;
 
     @Value("${tenahub.reservation.pending-timeout-minutes:20}")
@@ -45,8 +50,11 @@ public class ReservationScheduler {
     public void expireReservations() {
 
         List<MedicineReservation> expired =
-                reservationRepository.findByStatusAndExpiresAtBefore(
-                        MedicineReservationStatus.APPROVED,
+                reservationRepository.findByStatusInAndExpiresAtBefore(
+                        List.of(
+                                MedicineReservationStatus.APPROVED,
+                                MedicineReservationStatus.READY_FOR_PICKUP
+                        ),
                         LocalDateTime.now()
                 );
 
@@ -72,11 +80,8 @@ public class ReservationScheduler {
         sendPendingSlaReminders(now);
 
         long finalThresholdMinutes = getFinalThresholdMinutes();
-        LocalDateTime cutoff = now.minusMinutes(finalThresholdMinutes);
-
-        List<MedicineReservation> timedOutPending = reservationRepository.findByStatusAndCreatedAtBefore(
-                MedicineReservationStatus.PENDING,
-                cutoff
+        List<MedicineReservation> timedOutPending = reservationRepository.findByStatusOrderByCreatedAtDesc(
+            MedicineReservationStatus.PENDING
         );
 
         for (MedicineReservation reservation : timedOutPending) {
@@ -85,6 +90,10 @@ public class ReservationScheduler {
                     continue;
                 }
                 if (isAwaitingPrescriptionUpload(reservation)) {
+                    continue;
+                }
+
+                if (isAwaitingPrescriptionReview(reservation)) {
                     continue;
                 }
 
@@ -143,10 +152,8 @@ public class ReservationScheduler {
         long secondThresholdMinutes = getSecondThresholdMinutes();
         long finalThresholdMinutes = getFinalThresholdMinutes();
 
-        LocalDateTime firstCutoff = now.minusMinutes(firstThresholdMinutes);
-        List<MedicineReservation> firstReminderCandidates = reservationRepository.findByStatusAndCreatedAtBefore(
-                MedicineReservationStatus.PENDING,
-                firstCutoff
+        List<MedicineReservation> firstReminderCandidates = reservationRepository.findByStatusOrderByCreatedAtDesc(
+            MedicineReservationStatus.PENDING
         );
 
         for (MedicineReservation reservation : firstReminderCandidates) {
@@ -167,15 +174,17 @@ public class ReservationScheduler {
                 continue;
             }
 
-            telegramClient.sendPendingReservationReminder(pharmacy.getTelegramId(), reservation, waitingMinutes);
+            if (isAwaitingPrescriptionReview(reservation)) {
+                sendPrescriptionReviewReminder(reservation, pharmacy.getTelegramId());
+            } else {
+                telegramClient.sendPendingReservationReminder(pharmacy.getTelegramId(), reservation, waitingMinutes);
+            }
             reservation.setFirstReminderSentAt(now);
             reservationRepository.save(reservation);
         }
 
-        LocalDateTime secondCutoff = now.minusMinutes(secondThresholdMinutes);
-        List<MedicineReservation> secondReminderCandidates = reservationRepository.findByStatusAndCreatedAtBefore(
-                MedicineReservationStatus.PENDING,
-                secondCutoff
+        List<MedicineReservation> secondReminderCandidates = reservationRepository.findByStatusOrderByCreatedAtDesc(
+            MedicineReservationStatus.PENDING
         );
 
         for (MedicineReservation reservation : secondReminderCandidates) {
@@ -196,12 +205,30 @@ public class ReservationScheduler {
                 continue;
             }
 
-            telegramClient.sendPendingReservationEscalation(pharmacy.getTelegramId(), reservation, waitingMinutes);
+            if (isAwaitingPrescriptionReview(reservation)) {
+                sendPrescriptionReviewReminder(reservation, pharmacy.getTelegramId());
+            } else {
+                telegramClient.sendPendingReservationEscalation(pharmacy.getTelegramId(), reservation, waitingMinutes);
+            }
             if (reservation.getFirstReminderSentAt() == null) {
                 reservation.setFirstReminderSentAt(now);
             }
             reservation.setSecondReminderSentAt(now);
             reservationRepository.save(reservation);
+        }
+    }
+
+    private void sendPrescriptionReviewReminder(MedicineReservation reservation, Long pharmacyTelegramId) {
+        try {
+            PrescriptionStatusResponseDTO status = prescriptionReviewService.getPrescriptionStatus(
+                    reservation.getId(),
+                    reservation.getReservationGroupId(),
+                    null
+            );
+            telegramClient.sendPharmacyPrescriptionReviewCard(pharmacyTelegramId, status);
+        } catch (Exception e) {
+            log.warn("Failed to resend prescription review reminder for reservation {}: {}",
+                    reservation.getId(), e.getMessage());
         }
     }
 
@@ -230,7 +257,13 @@ public class ReservationScheduler {
     private boolean isAwaitingPrescriptionUpload(MedicineReservation reservation) {
         return reservation != null
                 && reservation.isPrescriptionRequired()
-                && reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED;
+                && reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.UPLOAD_REQUIRED;
+    }
+
+    private boolean isAwaitingPrescriptionReview(MedicineReservation reservation) {
+        return reservation != null
+                && reservation.isPrescriptionRequired()
+                && reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PENDING_REVIEW;
     }
 
     private long getFirstThresholdMinutes() {

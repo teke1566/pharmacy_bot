@@ -70,13 +70,13 @@ import com.tenahub.bot.service.PrescriptionReviewService;
 import com.tenahub.bot.service.RatingService;
 import com.tenahub.bot.service.RegistrationService;
 import com.tenahub.bot.service.ReservationService;
-import com.tenahub.bot.service.ReservationWorkflowService;
 import com.tenahub.bot.service.UserLocationService;
 import com.tenahub.bot.util.BotLanguage;
 import com.tenahub.bot.util.EthiopiaLocationCatalog;
 import com.tenahub.bot.util.EthiopiaLocationTranslator;
 import com.tenahub.bot.util.LocalizationService;
 import com.tenahub.bot.util.MedicineSearchNormalizer;
+import com.tenahub.bot.util.ReservationListLimiter;
 import com.tenahub.bot.util.TelegramClient;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
@@ -107,7 +107,6 @@ public class TelegramWebhookFacade {
     private final PharmacyRepository pharmacyRepository;
     private final InventoryService inventoryService;
     private final ReservationService reservationService;
-    private final ReservationWorkflowService reservationWorkflowService;
     private final PrescriptionReviewService prescriptionReviewService;
     private final AdminService adminService;
     private final AdminInboxService adminInboxService;
@@ -386,7 +385,7 @@ private void handleContactMessage(TelegramUpdateDTO update, Long chatId) {
     String phone = update.getMessage().getContact().getPhoneNumber();
 
     try {
-        var reservation = reservationService.createReservation(
+        reservationService.createReservation(
                 chatId,
                 session.getPharmacyId(),
                 session.getMedicineName(),
@@ -395,35 +394,18 @@ private void handleContactMessage(TelegramUpdateDTO update, Long chatId) {
                 session.getCustomerName()
         );
 
-        try {
-            reservationWorkflowService.notifyPharmacyPendingReservation(reservation, pendingTimeoutMinutes);
+        telegramClient.sendMessageRemoveKeyboard(
+                chatId,
+                "✅ Reservation request sent to pharmacy.\n\n"
+                    + MEDICINE_LABEL + displayMedicine(chatId, session.getMedicineName()) + "\n"
+                        + QUANTITY_LABEL + session.getQuantity() + "\n"
+                        + "👤 Name: " + session.getCustomerName() + "\n"
+                        + PHONE_LABEL + phone + "\n"
+                        + "🕒 Waiting for pharmacy approval.\n"
+                        + "⏱ Auto-cancels in " + pendingTimeoutMinutes + " minutes if not approved."
+        );
 
-            telegramClient.sendMessageRemoveKeyboard(
-                    chatId,
-                    "✅ Reservation request sent to pharmacy.\n\n"
-                        + MEDICINE_LABEL + displayMedicine(chatId, session.getMedicineName()) + "\n"
-                            + QUANTITY_LABEL + session.getQuantity() + "\n"
-                            + "👤 Name: " + session.getCustomerName() + "\n"
-                            + PHONE_LABEL + phone + "\n"
-                            + "🕒 Waiting for pharmacy approval.\n"
-                            + "⏱ Auto-cancels in " + pendingTimeoutMinutes + " minutes if not approved."
-            );
-
-            restoreReservationExitKeyboard(chatId);
-
-        } catch (Exception notifyError) {
-            telegramClient.sendMessageRemoveKeyboard(
-                    chatId,
-                    "✅ Reservation saved.\n\n"
-                        + MEDICINE_LABEL + displayMedicine(chatId, session.getMedicineName()) + "\n"
-                            + QUANTITY_LABEL + session.getQuantity() + "\n"
-                            + "👤 Name: " + session.getCustomerName() + "\n"
-                            + PHONE_LABEL + phone + "\n\n"
-                            + "⚠️ Could not notify the pharmacy automatically."
-            );
-
-            restoreReservationExitKeyboard(chatId);
-        }
+        restoreReservationExitKeyboard(chatId);
 
     } catch (Exception createError) {
         telegramClient.sendMessageRemoveKeyboard(
@@ -825,6 +807,7 @@ String area = (session.getArea() == null || session.getArea().isBlank())
     if ("📦 ✅ በስቶክ ያሉ ብቻ".equals(normalizedText)) normalizedText = "📦 ✅ in stock only";
     if ("❌ ማጣሪያዎችን አጥፋ".equals(normalizedText)) normalizedText = "❌ clear filters";
     if ("⏳ በመጠባበቅ ላይ".equals(normalizedText)) normalizedText = "⏳ pending";
+    if ("✅ ዝግጁ".equals(normalizedText) || "✅ ለመውሰድ ዝግጁ".equals(normalizedText)) normalizedText = "✅ ready";
     if ("📦 የተጠናቀቀ".equals(normalizedText)) normalizedText = "📦 fulfilled";
     if ("⌛ ያለፈበት".equals(normalizedText)) normalizedText = "⌛ expired";
     if ("❌ የተሰረዘ".equals(normalizedText)) normalizedText = "❌ cancelled";
@@ -898,6 +881,7 @@ if (normalizedText.equals("/home")
 
         if (chatId.equals(ADMIN_CHAT_ID)) {
             telegramClient.sendAdminDashboard(chatId);
+            telegramClient.sendAdminDashboardMiniAppPrompt(chatId);
             return;
         }
 
@@ -1799,6 +1783,11 @@ if (normalizedText.equals("⏳ pending")) {
     return;
 }
 
+if (normalizedText.equals("✅ ready") || normalizedText.equals("✅ ready for pickup")) {
+    sendUserReadyReservationSection(chatId);
+    return;
+}
+
 if (normalizedText.equals("📦 fulfilled")) {
     sendUserReservationSection(chatId, MedicineReservationStatus.FULFILLED, "fulfilled_section_title");
     return;
@@ -1884,12 +1873,14 @@ if (normalizedText.equals("🔁 reserve again (latest)")) {
     if (normalizedText.equals("📄 license compliance") || normalizedText.equals("📄 license action center")) {
         clearAdminPharmacyManagementState(chatId);
         sendAdminLicenseComplianceSummary(chatId);
+        telegramClient.sendAdminComplianceMiniAppPrompt(chatId);
         return;
     }
 
     if (normalizedText.equals("🧾 audit trail")) {
         clearAdminPharmacyManagementState(chatId);
         sendAdminAuditTrailMenu(chatId);
+        telegramClient.sendAdminAuditMiniAppPrompt(chatId);
         return;
     }
 
@@ -1897,6 +1888,7 @@ if (normalizedText.equals("🔁 reserve again (latest)")) {
         clearAdminPharmacyManagementState(chatId);
         AdminPharmacyManagementSessionManager.save(chatId, new AdminPharmacyManagementSession("MENU", null));
         telegramClient.sendAdminPharmacyManagementMenu(chatId);
+        telegramClient.sendAdminPharmaciesMiniAppPrompt(chatId);
         return;
     }
 
@@ -1934,6 +1926,7 @@ if (normalizedText.equals("🔁 reserve again (latest)")) {
                 chatId,
                 adminService.viewDetailedReservationOversight()
         );
+        telegramClient.sendAdminReservationsMiniAppPrompt(chatId);
         return;
     }
 
@@ -1942,6 +1935,7 @@ if (normalizedText.equals("🔁 reserve again (latest)")) {
         adminInboxPendingAction.remove(chatId);
         adminInboxCurrentItemId.remove(chatId);
         sendAdminInboxSummary(chatId);
+        telegramClient.sendAdminFeedbackMiniAppPrompt(chatId);
         return;
     }
 
@@ -1966,6 +1960,7 @@ if (normalizedText.equals("🔁 reserve again (latest)")) {
                 chatId,
                 adminService.viewDetailedSystemSummary()
         );
+        telegramClient.sendAdminSystemMiniAppPrompt(chatId);
         return;
     }
 
@@ -2047,32 +2042,25 @@ if (normalizedText.equals("🔁 reserve again (latest)")) {
 
     if (normalizedText.equals("⚙️ profile")) {
         telegramClient.sendUpdateMenu(chatId);
+        telegramClient.sendPharmacyProfileMiniAppPrompt(chatId);
         return;
     }
 
     if (normalizedText.equals("📦 inventory")) {
         telegramClient.sendInventoryMenu(chatId);
+        telegramClient.sendPharmacyInventoryMiniAppPrompt(chatId);
         return;
     }
 
     if (normalizedText.equals("📦 reservations") || normalizedText.equals("📦 reservation management")) {
         telegramClient.sendReservationManagementMenu(chatId);
+        telegramClient.sendPharmacyReservationsMiniAppPrompt(chatId);
         return;
     }
 
     if (normalizedText.equals("🧾 prescription reviews")) {
-        List<MedicineReservation> reservations = reservationService.getPendingReservations(chatId).stream()
-                .filter(MedicineReservation::isPrescriptionRequired)
-                .filter(reservation -> reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_PENDING)
-                .toList();
-
-        if (reservations.isEmpty()) {
-            telegramClient.sendMessage(chatId, "🧾 <b>Prescription Reviews</b>\n\nNo prescription reviews are pending.", "HTML");
-            return;
-        }
-
-        telegramClient.sendMessage(chatId, "🧾 <b>Prescription Reviews</b>", "HTML");
-        sendPrescriptionReviewCards(chatId, reservations);
+        telegramClient.sendPharmacyPrescriptionsMiniAppPrompt(chatId);
+        sendPharmacyPrescriptionReviewsPage(chatId, 0, 0, true);
         return;
     }
 
@@ -2086,6 +2074,7 @@ if (normalizedText.equals("🔁 reserve again (latest)")) {
     }
 
     if (normalizedText.equals("📊 performance")) {
+        telegramClient.sendPharmacyPerformanceMiniAppPrompt(chatId);
         try {
             telegramClient.sendPharmacyPerformanceCard(chatId, pharmacyPerformanceService.buildPerformanceCard(chatId));
         } catch (Exception e) {
@@ -2095,99 +2084,47 @@ if (normalizedText.equals("🔁 reserve again (latest)")) {
     }
 
 if (normalizedText.equals("📦 pending reservations")) {
-    List<MedicineReservation> reservations = reservationService.getPendingReservations(chatId);
-
-    if (reservations == null || reservations.isEmpty()) {
-        telegramClient.sendMessage(chatId, "📦 <b>Pending Reservations</b>\n\nNo pending reservations.", "HTML");
-        return;
-    }
-
-    telegramClient.sendMessage(chatId, "📦 <b>Pending Reservations</b>", "HTML");
-
-    java.util.LinkedHashMap<String, java.util.List<MedicineReservation>> pendingGroups = new java.util.LinkedHashMap<>();
-    for (MedicineReservation r : reservations) {
-        String key = r.getReservationGroupId() != null ? r.getReservationGroupId() : "solo_" + r.getId();
-        pendingGroups.computeIfAbsent(key, k -> new java.util.ArrayList<>()).add(r);
-    }
-    for (java.util.Map.Entry<String, java.util.List<MedicineReservation>> entry : pendingGroups.entrySet()) {
-        java.util.List<MedicineReservation> group = entry.getValue();
-        if (group.size() == 1 && group.get(0).getReservationGroupId() == null) {
-            MedicineReservation r = group.get(0);
-            telegramClient.sendPharmacyPendingReservationCard(chatId, r.getId(), r.getUserId(),
-                    r.getMedicineName(), r.getRequestedQuantity(), r.getCustomerPhone(), r.getCustomerName(), r.getQrToken(),
-                    r.isPrescriptionRequired(), r.getPrescriptionReviewStatus() == null ? null : r.getPrescriptionReviewStatus().name());
-        } else {
-            telegramClient.sendPharmacyPendingGroupedReservationCard(chatId, entry.getKey(), group);
-        }
-    }
+    sendPharmacyGroupedReservationsPage(
+            chatId,
+            reservationService.getPendingReservations(chatId),
+            "📦 <b>Pending Reservations</b>",
+            "No pending reservations.",
+            "pending reservations",
+            "PENDING",
+            0,
+            true,
+            PharmacyGroupCardKind.PENDING
+    );
     return;
 }
 
 if (normalizedText.equals("✅ approved reservations")) {
-    List<MedicineReservation> reservations = reservationService.getApprovedReservations(chatId);
-
-    if (reservations == null || reservations.isEmpty()) {
-        telegramClient.sendMessage(chatId, "✅ <b>Approved Reservations</b>\n\nNo approved reservations.", "HTML");
-        return;
-    }
-
-    telegramClient.sendMessage(chatId, "✅ <b>Approved Reservations</b>", "HTML");
-
-    java.time.format.DateTimeFormatter formatter =
-            java.time.format.DateTimeFormatter.ofPattern("MMM d, h:mm a");
-
-    java.util.LinkedHashMap<String, java.util.List<MedicineReservation>> approvedGroups = new java.util.LinkedHashMap<>();
-    for (MedicineReservation r : reservations) {
-        String key = r.getReservationGroupId() != null ? r.getReservationGroupId() : "solo_" + r.getId();
-        approvedGroups.computeIfAbsent(key, k -> new java.util.ArrayList<>()).add(r);
-    }
-    for (java.util.Map.Entry<String, java.util.List<MedicineReservation>> entry : approvedGroups.entrySet()) {
-        java.util.List<MedicineReservation> group = entry.getValue();
-        if (group.size() == 1 && group.get(0).getReservationGroupId() == null) {
-            MedicineReservation r = group.get(0);
-            String holdUntil = r.getExpiresAt() == null ? null : formatter.format(r.getExpiresAt());
-            telegramClient.sendPharmacyApprovedReservationCard(chatId, r.getId(), r.getUserId(),
-                    r.getMedicineName(), r.getRequestedQuantity(), r.getCustomerPhone(), r.getCustomerName(), holdUntil, r.getQrToken());
-        } else {
-            MedicineReservation first = group.get(0);
-            String holdUntil = first.getExpiresAt() == null ? null : formatter.format(first.getExpiresAt());
-            telegramClient.sendPharmacyApprovedGroupedReservationCard(chatId, entry.getKey(), group, holdUntil);
-        }
-    }
+    sendPharmacyGroupedReservationsPage(
+            chatId,
+            reservationService.getApprovedReservations(chatId),
+            "✅ <b>Approved Reservations</b>",
+            "No approved reservations.",
+            "approved reservations",
+            "APPROVED",
+            0,
+            true,
+            PharmacyGroupCardKind.APPROVED
+    );
     return;
 }
 
    if (normalizedText.equals("📦 mark fulfilled")) {
-    List<MedicineReservation> reservations = reservationService.getFulfillableReservations(chatId);
-
-    if (reservations == null || reservations.isEmpty()) {
-        telegramClient.sendMessage(chatId, "📦 <b>Mark Fulfilled</b>\n\nNo fulfillable reservations.", "HTML");
-        return;
-    }
-
-    telegramClient.sendMessage(chatId, "📦 <b>Mark Fulfilled</b>", "HTML");
-
-    java.time.format.DateTimeFormatter formatter =
-            java.time.format.DateTimeFormatter.ofPattern("MMM d, h:mm a");
-
-    java.util.LinkedHashMap<String, java.util.List<MedicineReservation>> fulfillGroups = new java.util.LinkedHashMap<>();
-    for (MedicineReservation r : reservations) {
-        String key = r.getReservationGroupId() != null ? r.getReservationGroupId() : "solo_" + r.getId();
-        fulfillGroups.computeIfAbsent(key, k -> new java.util.ArrayList<>()).add(r);
-    }
-    for (java.util.Map.Entry<String, java.util.List<MedicineReservation>> entry : fulfillGroups.entrySet()) {
-        java.util.List<MedicineReservation> group = entry.getValue();
-        if (group.size() == 1 && group.get(0).getReservationGroupId() == null) {
-            MedicineReservation r = group.get(0);
-            String holdUntil = r.getExpiresAt() == null ? null : formatter.format(r.getExpiresAt());
-            telegramClient.sendPharmacyApprovedReservationCard(chatId, r.getId(), r.getUserId(),
-                    r.getMedicineName(), r.getRequestedQuantity(), r.getCustomerPhone(), r.getCustomerName(), holdUntil, r.getQrToken());
-        } else {
-            MedicineReservation first = group.get(0);
-            String holdUntil = first.getExpiresAt() == null ? null : formatter.format(first.getExpiresAt());
-            telegramClient.sendPharmacyApprovedGroupedReservationCard(chatId, entry.getKey(), group, holdUntil);
-        }
-    }
+    sendPharmacyGroupedReservationsPage(
+            chatId,
+            reservationService.getFulfillableReservations(chatId),
+            "📦 <b>Mark Fulfilled</b>",
+            "No fulfillable reservations.",
+            "fulfillable reservations",
+            "FULFILL",
+            0,
+            true,
+            PharmacyGroupCardKind.APPROVED
+    );
     return;
 }
 
@@ -4070,6 +4007,7 @@ private String buildUserAccountView(Long chatId) {
                     String statusLabel = switch (r.getStatus()) {
                         case PENDING -> localizationService.text(chatId, "res_status_pending");
                         case APPROVED -> localizationService.text(chatId, "res_status_approved");
+                        case READY_FOR_PICKUP -> localizationService.text(chatId, "res_status_approved");
                         case FULFILLED -> localizationService.text(chatId, "res_status_fulfilled");
                         case CANCELLED -> localizationService.text(chatId, "res_status_cancelled");
                         case EXPIRED -> localizationService.text(chatId, "res_status_expired");
@@ -4458,6 +4396,7 @@ private String localizedReservationStatus(Long chatId, MedicineReservationStatus
     return switch (status) {
         case PENDING -> localizationService.text(chatId, "pending_button");
         case APPROVED -> localizationService.text(chatId, "approved_status");
+        case READY_FOR_PICKUP -> localizationService.text(chatId, "approved_status");
         case FULFILLED -> localizationService.text(chatId, "fulfilled_button");
         case CANCELLED -> localizationService.text(chatId, "cancelled_button");
         case EXPIRED -> localizationService.text(chatId, "expired_button");
@@ -4477,29 +4416,125 @@ private void sendUserReservationSection(Long chatId,
     sendReservationSection(chatId, reservations, status, localizationService.text(chatId, titleKey));
 }
 
+private void sendUserReadyReservationSection(Long chatId) {
+    sendUserReadyReservationSectionPage(chatId, 0);
+}
+
+private void sendUserReadyReservationSectionPage(Long chatId, int offset) {
+    List<MedicineReservation> reservations = reservationService.getUserReservations(chatId);
+    if (reservations == null || reservations.isEmpty()) {
+        if (offset == 0) {
+            telegramClient.sendMessage(chatId, localizationService.text(chatId, "no_reservations_found"), "HTML");
+        } else {
+            telegramClient.sendMessage(chatId, "📭 No more ready reservations.");
+        }
+        return;
+    }
+
+    List<MedicineReservation> ready = reservations.stream()
+            .filter(r -> r.getStatus() == MedicineReservationStatus.READY_FOR_PICKUP
+                    || r.getStatus() == MedicineReservationStatus.APPROVED)
+            .toList();
+
+    String title = localizationService.text(chatId, "ready_section_title");
+    if (ready.isEmpty()) {
+        if (offset == 0) {
+            telegramClient.sendMyReservationsSectionMenu(chatId, title);
+            telegramClient.sendMessage(
+                    chatId,
+                    "📭 No ready-for-pickup reservations yet.\n\n" +
+                            "Open another section. When reservation cards appear, they include 🔁 Reserve Again."
+            );
+        } else {
+            telegramClient.sendMessage(chatId, "📭 No more ready reservations.");
+        }
+        return;
+    }
+
+    if (offset == 0) {
+        telegramClient.sendMyReservationsSectionMenu(chatId, title);
+    }
+
+    List<MedicineReservation> toSend = ReservationListLimiter.page(ready, offset);
+    if (toSend.isEmpty()) {
+        telegramClient.sendMessage(chatId, "📭 No more ready reservations.");
+        return;
+    }
+    for (MedicineReservation r : toSend) {
+        sendUserReservationCard(chatId, r);
+    }
+    sendTelegramListOverflow(
+            chatId,
+            ready.size(),
+            offset,
+            toSend.size(),
+            "ready reservations",
+            "user",
+            "READY",
+            telegramClient.buildMiniAppSearchUrl("active"),
+            "Open Mini App"
+    );
+}
+
 private void sendReservationSection(Long chatId,
                                     List<MedicineReservation> reservations,
                                     MedicineReservationStatus status,
                                     String title) {
+    sendReservationSectionPage(chatId, reservations, status, title, 0, true);
+}
+
+private void sendReservationSectionPage(Long chatId,
+                                        List<MedicineReservation> reservations,
+                                        MedicineReservationStatus status,
+                                        String title,
+                                        int offset,
+                                        boolean sendTitleMenu) {
     List<MedicineReservation> filtered = reservations.stream()
             .filter(r -> r.getStatus() == status)
             .toList();
 
     if (filtered.isEmpty()) {
-    telegramClient.sendMyReservationsSectionMenu(chatId, title);
-    telegramClient.sendMessage(
-        chatId,
-        "📭 No reservations found in this section yet.\n\n" +
-            "Open another section. When reservation cards appear, they include 🔁 Reserve Again."
-    );
+        if (sendTitleMenu) {
+            telegramClient.sendMyReservationsSectionMenu(chatId, title);
+            telegramClient.sendMessage(
+                    chatId,
+                    "📭 No reservations found in this section yet.\n\n" +
+                            "Open another section. When reservation cards appear, they include 🔁 Reserve Again."
+            );
+        }
         return;
     }
 
-    telegramClient.sendMyReservationsSectionMenu(chatId, title);
+    if (sendTitleMenu) {
+        telegramClient.sendMyReservationsSectionMenu(chatId, title);
+    }
 
-for (MedicineReservation r : filtered) {
-        Pharmacy pharmacy = pharmacyRepository.findById(r.getPharmacyId()).orElse(null);
-        PharmacyInventory inventory = inventoryRepository
+    List<MedicineReservation> toSend = ReservationListLimiter.page(filtered, offset);
+    if (toSend.isEmpty()) {
+        telegramClient.sendMessage(chatId, "📭 No more reservations in this section.");
+        return;
+    }
+
+    for (MedicineReservation r : toSend) {
+        sendUserReservationCard(chatId, r);
+    }
+
+    sendTelegramListOverflow(
+            chatId,
+            filtered.size(),
+            offset,
+            toSend.size(),
+            statusNoun(status),
+            "user",
+            status.name(),
+            telegramClient.buildMiniAppSearchUrl(miniAppSectionForUserStatus(status)),
+            "Open Mini App"
+    );
+}
+
+private void sendUserReservationCard(Long chatId, MedicineReservation r) {
+    Pharmacy pharmacy = pharmacyRepository.findById(r.getPharmacyId()).orElse(null);
+    PharmacyInventory inventory = inventoryRepository
             .findByPharmacyIdAndMedicineNameIgnoreCase(r.getPharmacyId(), r.getMedicineName())
             .orElse(null);
 
@@ -4511,7 +4546,8 @@ for (MedicineReservation r : filtered) {
 
     boolean canCancel =
             r.getStatus() == MedicineReservationStatus.PENDING
-                    || r.getStatus() == MedicineReservationStatus.APPROVED;
+                    || r.getStatus() == MedicineReservationStatus.APPROVED
+                    || r.getStatus() == MedicineReservationStatus.READY_FOR_PICKUP;
 
     String holdUntil = null;
     if (r.getStatus() == MedicineReservationStatus.APPROVED && r.getExpiresAt() != null) {
@@ -4524,21 +4560,21 @@ for (MedicineReservation r : filtered) {
         telegramClient.sendUserReservationItemWithCancel(
                 chatId,
                 r.getId(),
-            r.getPharmacyId(),
-            inventory == null ? null : inventory.getId(),
+                r.getPharmacyId(),
+                inventory == null ? null : inventory.getId(),
                 pharmacyName,
                 pharmacyAddress,
                 r.getMedicineName(),
                 r.getRequestedQuantity(),
-            localizedReservationStatus(chatId, r.getStatus()),
+                localizedReservationStatus(chatId, r.getStatus()),
                 holdUntil
         );
     } else {
         telegramClient.sendUserReservationItemReadOnly(
                 chatId,
                 r.getId(),
-            r.getPharmacyId(),
-            inventory == null ? null : inventory.getId(),
+                r.getPharmacyId(),
+                inventory == null ? null : inventory.getId(),
                 pharmacyName,
                 pharmacyAddress,
                 r.getMedicineName(),
@@ -4548,6 +4584,329 @@ for (MedicineReservation r : filtered) {
         );
     }
 }
+
+private String statusNoun(MedicineReservationStatus status) {
+    if (status == null) {
+        return "reservations";
+    }
+    return switch (status) {
+        case PENDING -> "pending reservations";
+        case APPROVED, READY_FOR_PICKUP -> "approved reservations";
+        case FULFILLED -> "fulfilled reservations";
+        case EXPIRED -> "expired reservations";
+        case CANCELLED -> "cancelled reservations";
+        case REJECTED -> "rejected reservations";
+    };
+}
+
+private String miniAppSectionForUserStatus(MedicineReservationStatus status) {
+    if (status == MedicineReservationStatus.PENDING
+            || status == MedicineReservationStatus.APPROVED
+            || status == MedicineReservationStatus.READY_FOR_PICKUP) {
+        return "active";
+    }
+    return "history";
+}
+
+private void sendTelegramListOverflow(Long chatId,
+                                      int totalCount,
+                                      int offset,
+                                      int sentCount,
+                                      String noun,
+                                      String scope,
+                                      String kind,
+                                      String miniAppUrl,
+                                      String miniAppButtonLabel) {
+    int hidden = ReservationListLimiter.hiddenCount(
+            totalCount, offset, ReservationListLimiter.TELEGRAM_RESERVATION_CARD_LIMIT);
+    if (hidden <= 0 && (miniAppUrl == null || miniAppUrl.isBlank())) {
+        return;
+    }
+    // When the last page is partial, still compute remaining after what we actually sent.
+    if (sentCount > 0) {
+        hidden = Math.max(0, totalCount - (offset + sentCount));
+    }
+
+    String text = ReservationListLimiter.overflowText(hidden, noun);
+    if (text == null) {
+        text = "Open Mini App to browse all reservations.";
+    }
+
+    String moreCallback = null;
+    if (hidden > 0) {
+        moreCallback = ReservationListLimiter.moreCallback(scope, kind, offset + sentCount);
+    }
+
+    telegramClient.sendReservationListOverflow(
+            chatId,
+            text,
+            moreCallback,
+            miniAppUrl,
+            miniAppButtonLabel
+    );
+}
+
+private enum PharmacyGroupCardKind {
+    PENDING,
+    APPROVED
+}
+
+private void sendPharmacyGroupedReservationsPage(Long chatId,
+                                                 List<MedicineReservation> reservations,
+                                                 String titleHtml,
+                                                 String emptySuffix,
+                                                 String noun,
+                                                 String kind,
+                                                 int offset,
+                                                 boolean sendTitle,
+                                                 PharmacyGroupCardKind cardKind) {
+    if (reservations == null || reservations.isEmpty()) {
+        if (sendTitle) {
+            telegramClient.sendMessage(chatId, titleHtml + "\n\n" + emptySuffix, "HTML");
+        }
+        return;
+    }
+
+    if (sendTitle) {
+        telegramClient.sendMessage(chatId, titleHtml, "HTML");
+    }
+
+    java.util.LinkedHashMap<String, java.util.List<MedicineReservation>> groups = new java.util.LinkedHashMap<>();
+    for (MedicineReservation r : reservations) {
+        String key = r.getReservationGroupId() != null ? r.getReservationGroupId() : "solo_" + r.getId();
+        groups.computeIfAbsent(key, k -> new java.util.ArrayList<>()).add(r);
+    }
+
+    java.util.List<java.util.Map.Entry<String, java.util.List<MedicineReservation>>> page =
+            ReservationListLimiter.pageEntries(groups, offset);
+    if (page.isEmpty()) {
+        telegramClient.sendMessage(chatId, "📭 No more reservations in this section.");
+        return;
+    }
+
+    java.time.format.DateTimeFormatter formatter =
+            java.time.format.DateTimeFormatter.ofPattern("MMM d, h:mm a");
+
+    for (java.util.Map.Entry<String, java.util.List<MedicineReservation>> entry : page) {
+        java.util.List<MedicineReservation> group = entry.getValue();
+        if (cardKind == PharmacyGroupCardKind.PENDING) {
+            if (group.size() == 1 && group.get(0).getReservationGroupId() == null) {
+                MedicineReservation r = group.get(0);
+                telegramClient.sendPharmacyPendingReservationCard(chatId, r.getId(), r.getUserId(),
+                        r.getMedicineName(), r.getRequestedQuantity(), r.getCustomerPhone(), r.getCustomerName(), r.getQrToken(),
+                        r.isPrescriptionRequired(), r.getPrescriptionReviewStatus() == null ? null : r.getPrescriptionReviewStatus().name());
+            } else {
+                telegramClient.sendPharmacyPendingGroupedReservationCard(chatId, entry.getKey(), group);
+            }
+        } else if (group.size() == 1 && group.get(0).getReservationGroupId() == null) {
+            MedicineReservation r = group.get(0);
+            String holdUntil = r.getExpiresAt() == null ? null : formatter.format(r.getExpiresAt());
+            telegramClient.sendPharmacyApprovedReservationCard(chatId, r.getId(), r.getUserId(),
+                    r.getMedicineName(), r.getRequestedQuantity(), r.getCustomerPhone(), r.getCustomerName(), holdUntil, r.getQrToken());
+        } else {
+            MedicineReservation first = group.get(0);
+            String holdUntil = first.getExpiresAt() == null ? null : formatter.format(first.getExpiresAt());
+            telegramClient.sendPharmacyApprovedGroupedReservationCard(chatId, entry.getKey(), group, holdUntil);
+        }
+    }
+
+    sendTelegramListOverflow(
+            chatId,
+            groups.size(),
+            offset,
+            page.size(),
+            noun,
+            "pharm",
+            kind,
+            telegramClient.buildMiniAppPharmacyReservationsUrl(chatId),
+            "Open Reservations App"
+    );
+}
+
+private void sendPharmacyPrescriptionReviewsPage(Long chatId,
+                                                 int awaitingOffset,
+                                                 int reviewOffset,
+                                                 boolean sendTitle) {
+    List<MedicineReservation> allPrescriptions = reservationService.getPrescriptionReservations(chatId);
+    if (allPrescriptions == null || allPrescriptions.isEmpty()) {
+        if (sendTitle) {
+            telegramClient.sendMessage(chatId, "🧾 <b>Prescription Reviews</b>\n\nNo prescription reservations pending.", "HTML");
+        }
+        return;
+    }
+
+    if (sendTitle) {
+        telegramClient.sendMessage(chatId, "🧾 <b>Prescription Reviews</b>", "HTML");
+    }
+
+    List<MedicineReservation> awaitingUpload = allPrescriptions.stream()
+            .filter(r -> r.getPrescriptionReviewStatus() == PrescriptionReviewStatus.UPLOAD_REQUIRED)
+            .toList();
+    List<MedicineReservation> readyForReview = allPrescriptions.stream()
+            .filter(r -> r.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PENDING_REVIEW)
+            .toList();
+
+    String miniAppUrl = telegramClient.buildMiniAppPharmacyPrescriptionsUrl(chatId);
+
+    if (!awaitingUpload.isEmpty()) {
+        List<MedicineReservation> awaitingPage = ReservationListLimiter.page(awaitingUpload, awaitingOffset);
+        if (!awaitingPage.isEmpty()) {
+            for (MedicineReservation r : awaitingPage) {
+                telegramClient.sendPharmacyPendingReservationCard(chatId, r.getId(), r.getUserId(),
+                        r.getMedicineName(), r.getRequestedQuantity(), r.getCustomerPhone(), r.getCustomerName(), r.getQrToken(),
+                        r.isPrescriptionRequired(), r.getPrescriptionReviewStatus() == null ? null : r.getPrescriptionReviewStatus().name());
+            }
+            sendTelegramListOverflow(
+                    chatId,
+                    awaitingUpload.size(),
+                    awaitingOffset,
+                    awaitingPage.size(),
+                    "awaiting-upload prescriptions",
+                    "pharm",
+                    "RX_UPLOAD",
+                    miniAppUrl,
+                    "Open Prescriptions App"
+            );
+        }
+    }
+
+    if (!readyForReview.isEmpty()) {
+        List<MedicineReservation> readyPage = ReservationListLimiter.page(readyForReview, reviewOffset);
+        if (!readyPage.isEmpty()) {
+            sendPrescriptionReviewCards(chatId, readyPage);
+            sendTelegramListOverflow(
+                    chatId,
+                    readyForReview.size(),
+                    reviewOffset,
+                    readyPage.size(),
+                    "prescriptions ready for review",
+                    "pharm",
+                    "RX_REVIEW",
+                    miniAppUrl,
+                    "Open Prescriptions App"
+            );
+        }
+    }
+}
+
+private void sendPharmacyPrescriptionAwaitingPage(Long chatId, int offset) {
+    List<MedicineReservation> allPrescriptions = reservationService.getPrescriptionReservations(chatId);
+    List<MedicineReservation> awaitingUpload = allPrescriptions == null ? List.of() : allPrescriptions.stream()
+            .filter(r -> r.getPrescriptionReviewStatus() == PrescriptionReviewStatus.UPLOAD_REQUIRED)
+            .toList();
+    List<MedicineReservation> page = ReservationListLimiter.page(awaitingUpload, offset);
+    if (page.isEmpty()) {
+        telegramClient.sendMessage(chatId, "📭 No more awaiting-upload prescriptions.");
+        return;
+    }
+    for (MedicineReservation r : page) {
+        telegramClient.sendPharmacyPendingReservationCard(chatId, r.getId(), r.getUserId(),
+                r.getMedicineName(), r.getRequestedQuantity(), r.getCustomerPhone(), r.getCustomerName(), r.getQrToken(),
+                r.isPrescriptionRequired(), r.getPrescriptionReviewStatus() == null ? null : r.getPrescriptionReviewStatus().name());
+    }
+    sendTelegramListOverflow(
+            chatId,
+            awaitingUpload.size(),
+            offset,
+            page.size(),
+            "awaiting-upload prescriptions",
+            "pharm",
+            "RX_UPLOAD",
+            telegramClient.buildMiniAppPharmacyPrescriptionsUrl(chatId),
+            "Open Prescriptions App"
+    );
+}
+
+private void sendPharmacyPrescriptionReviewPage(Long chatId, int offset) {
+    List<MedicineReservation> allPrescriptions = reservationService.getPrescriptionReservations(chatId);
+    List<MedicineReservation> readyForReview = allPrescriptions == null ? List.of() : allPrescriptions.stream()
+            .filter(r -> r.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PENDING_REVIEW)
+            .toList();
+    List<MedicineReservation> page = ReservationListLimiter.page(readyForReview, offset);
+    if (page.isEmpty()) {
+        telegramClient.sendMessage(chatId, "📭 No more prescriptions ready for review.");
+        return;
+    }
+    sendPrescriptionReviewCards(chatId, page);
+    sendTelegramListOverflow(
+            chatId,
+            readyForReview.size(),
+            offset,
+            page.size(),
+            "prescriptions ready for review",
+            "pharm",
+            "RX_REVIEW",
+            telegramClient.buildMiniAppPharmacyPrescriptionsUrl(chatId),
+            "Open Prescriptions App"
+    );
+}
+
+private boolean handleReservationListMoreCallback(Long chatId, String callbackId, String data) {
+    ReservationListLimiter.MoreCallback more = ReservationListLimiter.parseMoreCallback(data);
+    if (more == null) {
+        return false;
+    }
+    telegramClient.answerCallback(callbackId);
+
+    try {
+        if ("user".equals(more.scope())) {
+            if ("READY".equals(more.kind())) {
+                sendUserReadyReservationSectionPage(chatId, more.offset());
+                return true;
+            }
+            MedicineReservationStatus status = MedicineReservationStatus.valueOf(more.kind());
+            List<MedicineReservation> reservations = reservationService.getUserReservations(chatId);
+            sendReservationSectionPage(chatId, reservations, status, null, more.offset(), false);
+            return true;
+        }
+
+        if ("pharm".equals(more.scope())) {
+            switch (more.kind()) {
+                case "PENDING" -> sendPharmacyGroupedReservationsPage(
+                        chatId,
+                        reservationService.getPendingReservations(chatId),
+                        "📦 <b>Pending Reservations</b>",
+                        "No pending reservations.",
+                        "pending reservations",
+                        "PENDING",
+                        more.offset(),
+                        false,
+                        PharmacyGroupCardKind.PENDING
+                );
+                case "APPROVED" -> sendPharmacyGroupedReservationsPage(
+                        chatId,
+                        reservationService.getApprovedReservations(chatId),
+                        "✅ <b>Approved Reservations</b>",
+                        "No approved reservations.",
+                        "approved reservations",
+                        "APPROVED",
+                        more.offset(),
+                        false,
+                        PharmacyGroupCardKind.APPROVED
+                );
+                case "FULFILL" -> sendPharmacyGroupedReservationsPage(
+                        chatId,
+                        reservationService.getFulfillableReservations(chatId),
+                        "📦 <b>Mark Fulfilled</b>",
+                        "No fulfillable reservations.",
+                        "fulfillable reservations",
+                        "FULFILL",
+                        more.offset(),
+                        false,
+                        PharmacyGroupCardKind.APPROVED
+                );
+                case "RX_UPLOAD" -> sendPharmacyPrescriptionAwaitingPage(chatId, more.offset());
+                case "RX_REVIEW" -> sendPharmacyPrescriptionReviewPage(chatId, more.offset());
+                default -> telegramClient.sendMessage(chatId, "⚠️ Unknown reservation list page.");
+            }
+            return true;
+        }
+
+        telegramClient.sendMessage(chatId, "⚠️ Unknown reservation list page.");
+    } catch (Exception e) {
+        telegramClient.sendMessage(chatId, WARN_PREFIX + e.getMessage());
+    }
+    return true;
 }
 
 private void sendNoResultWithTypoSuggestion(Long chatId, String medicine) {
@@ -5508,6 +5867,9 @@ if (data.startsWith("cancel_res_")) {
 
     return true;
 }
+if (ReservationListLimiter.isMoreCallback(data)) {
+    return handleReservationListMoreCallback(chatId, callbackId, data);
+}
 if (data.startsWith("user_cancel_res_")) {
     telegramClient.answerCallback(callbackId);
 
@@ -5539,6 +5901,109 @@ if (data.startsWith("user_cancel_res_")) {
             );
         }
 
+        return true;
+
+    } catch (Exception e) {
+        telegramClient.sendMessage(chatId, WARN_PREFIX + e.getMessage());
+        return true;
+    }
+}
+if (data.startsWith("fulfill_res_")) {
+    telegramClient.answerCallback(callbackId);
+
+    Long reservationId = Long.parseLong(data.substring("fulfill_res_".length()));
+
+    try {
+        var fulfilled = reservationService.fulfillReservationAndNotify(reservationId, chatId);
+
+        telegramClient.sendMessage(chatId,
+                "✅ Reservation fulfilled.\n\n"
+                        + "🆔 ID: " + fulfilled.getId() + "\n"
+                        + MEDICINE_LABEL + displayMedicine(chatId, fulfilled.getMedicineName()) + "\n"
+                        + QUANTITY_LABEL + fulfilled.getRequestedQuantity()
+        );
+
+        telegramClient.editMessageRemoveButtons(chatId, messageId);
+        return true;
+
+    } catch (Exception e) {
+        telegramClient.sendMessage(chatId, WARN_PREFIX + e.getMessage());
+        return true;
+    }
+}
+if (data.startsWith("fulfill_group_")) {
+    telegramClient.answerCallback(callbackId);
+
+    String groupId = data.substring("fulfill_group_".length());
+
+    try {
+        List<MedicineReservation> reservations = reservationRepository.findByReservationGroupId(groupId);
+        if (reservations.isEmpty()) {
+            telegramClient.sendMessage(chatId, "⚠️ No reservations found for this group.");
+            return true;
+        }
+
+        for (MedicineReservation r : reservations) {
+            if (r.getStatus() == MedicineReservationStatus.APPROVED
+                    || r.getStatus() == MedicineReservationStatus.READY_FOR_PICKUP) {
+                reservationService.fulfillReservationAndNotify(r.getId(), chatId);
+            }
+        }
+
+        telegramClient.sendMessage(chatId, "✅ All reservations in the group have been fulfilled.");
+        telegramClient.editMessageRemoveButtons(chatId, messageId);
+        return true;
+
+    } catch (Exception e) {
+        telegramClient.sendMessage(chatId, WARN_PREFIX + e.getMessage());
+        return true;
+    }
+}
+if (data.startsWith("pharmacy_cancel_res_")) {
+    telegramClient.answerCallback(callbackId);
+
+    Long reservationId = Long.parseLong(data.substring("pharmacy_cancel_res_".length()));
+
+    try {
+        var cancelled = reservationService.cancelReservationByPharmacy(reservationId, chatId);
+
+        telegramClient.sendMessage(chatId,
+                "✅ Reservation cancelled.\n\n"
+                        + "🆔 ID: " + cancelled.getId() + "\n"
+                        + MEDICINE_LABEL + displayMedicine(chatId, cancelled.getMedicineName()) + "\n"
+                        + QUANTITY_LABEL + cancelled.getRequestedQuantity()
+        );
+
+        telegramClient.editMessageRemoveButtons(chatId, messageId);
+        return true;
+
+    } catch (Exception e) {
+        telegramClient.sendMessage(chatId, WARN_PREFIX + e.getMessage());
+        return true;
+    }
+}
+if (data.startsWith("pharmacy_cancel_group_")) {
+    telegramClient.answerCallback(callbackId);
+
+    String groupId = data.substring("pharmacy_cancel_group_".length());
+
+    try {
+        List<MedicineReservation> reservations = reservationRepository.findByReservationGroupId(groupId);
+        if (reservations.isEmpty()) {
+            telegramClient.sendMessage(chatId, "⚠️ No reservations found for this group.");
+            return true;
+        }
+
+        for (MedicineReservation r : reservations) {
+            if (r.getStatus() != MedicineReservationStatus.FULFILLED
+                    && r.getStatus() != MedicineReservationStatus.CANCELLED
+                    && r.getStatus() != MedicineReservationStatus.EXPIRED) {
+                reservationService.cancelReservationByPharmacy(r.getId(), chatId);
+            }
+        }
+
+        telegramClient.sendMessage(chatId, "✅ All reservations in the group have been cancelled.");
+        telegramClient.editMessageRemoveButtons(chatId, messageId);
         return true;
 
     } catch (Exception e) {
@@ -5997,13 +6462,6 @@ if (data.equals("multi_res_submit")) {
 
                 telegramClient.sendMultiReserveGroupedConfirmation(chatId, groupId, groupedReservations);
 
-                Pharmacy pharmacy = pharmacyRepository.findById(session.getPharmacyId())
-                        .orElse(null);
-
-                if (pharmacy != null && pharmacy.getTelegramId() != null) {
-                    telegramClient.sendPharmacyGroupedReservationCard(pharmacy.getTelegramId(), groupId, groupedReservations);
-                }
-
                 MultiReservationSessionManager.remove(chatId);
                 if (MultiMedicineSearchSessionManager.exists(chatId)) {
                     MultiMedicineSearchSessionManager.remove(chatId);
@@ -6027,7 +6485,7 @@ if (data.startsWith("approve_group_")) {
 
             for (MedicineReservation res : reservations) {
                 try {
-                    reservationService.approveReservation(res.getId());
+                    reservationService.approveReservationAndNotify(res.getId());
                 } catch (Exception e) {
                     System.out.println("Error approving reservation " + res.getId() + ": " + e.getMessage());
                 }
@@ -6590,7 +7048,7 @@ if (data.startsWith("confirm_reservation_")) {
     var session = ReservationSessionManager.get(chatId);
     
     try {
-        var reservation = reservationService.createReservation(
+        reservationService.createReservation(
                 chatId,
                 session.getPharmacyId(),
                 session.getMedicineName(),
@@ -6599,31 +7057,16 @@ if (data.startsWith("confirm_reservation_")) {
                 session.getCustomerName()
         );
 
-        try {
-            reservationWorkflowService.notifyPharmacyPendingReservation(reservation, pendingTimeoutMinutes);
-
-            telegramClient.sendMessage(
-                    chatId,
-                    "✅ Reservation request sent to pharmacy.\n\n"
-                            + MEDICINE_LABEL + session.getMedicineName() + "\n"
-                            + QUANTITY_LABEL + session.getQuantity() + "\n"
-                            + "👤 Name: " + session.getCustomerName() + "\n"
-                            + PHONE_LABEL + session.getCustomerPhone() + "\n"
-                            + "🕒 Waiting for pharmacy approval.\n"
-                            + "⏱ Auto-cancels in " + pendingTimeoutMinutes + " minutes if not approved."
-            );
-
-        } catch (Exception notifyError) {
-            telegramClient.sendMessage(
-                    chatId,
-                    "✅ Reservation saved.\n\n"
-                            + MEDICINE_LABEL + session.getMedicineName() + "\n"
-                            + QUANTITY_LABEL + session.getQuantity() + "\n"
-                            + "👤 Name: " + session.getCustomerName() + "\n"
-                            + PHONE_LABEL + session.getCustomerPhone() + "\n\n"
-                            + "⚠️ Could not notify the pharmacy automatically."
-            );
-        }
+        telegramClient.sendMessage(
+                chatId,
+                "✅ Reservation request sent to pharmacy.\n\n"
+                        + MEDICINE_LABEL + session.getMedicineName() + "\n"
+                        + QUANTITY_LABEL + session.getQuantity() + "\n"
+                        + "👤 Name: " + session.getCustomerName() + "\n"
+                        + PHONE_LABEL + session.getCustomerPhone() + "\n"
+                        + "🕒 Waiting for pharmacy approval.\n"
+                        + "⏱ Auto-cancels in " + pendingTimeoutMinutes + " minutes if not approved."
+        );
 
     } catch (Exception e) {
         telegramClient.sendMessage(chatId, WARN_PREFIX + e.getMessage());
@@ -8180,23 +8623,19 @@ if (data.startsWith("approve_res_")) {
             Long reservationId = Long.parseLong(data.substring("approve_res_".length()));
 
             try {
-                var reservation = reservationService.approveReservation(reservationId);
+                var reservation = reservationService.approveReservationAndNotify(reservationId);
                 DateTimeFormatter formatter = DateTimeFormatter.ofPattern("MMM d, yyyy h:mm a");
 
                 String holdUntil = reservation.getExpiresAt() == null
                         ? "N/A"
                         : reservation.getExpiresAt().format(formatter);
 
-                telegramClient.sendMessage(
-                        reservation.getUserId(),
-                        "✅ Your reservation was approved.\n\n"
+                telegramClient.editReservationToFulfilledOnly(chatId, messageId, reservationId);
+                telegramClient.sendMessage(chatId,
+                        "✅ Reservation approved.\n\n"
                                 + MEDICINE_LABEL + reservation.getMedicineName() + "\n"
                                 + QUANTITY_LABEL + reservation.getRequestedQuantity() + "\n"
-                                + "⏳ Hold until: " + holdUntil + "\n\n"
-                                + "Please arrive before the deadline."
-                );
-
-                telegramClient.editReservationToFulfilledOnly(chatId, messageId, reservationId);
+                                + "⏳ Hold until: " + holdUntil);
                 return true;
 
             } catch (Exception e) {
@@ -9710,18 +10149,17 @@ if (data.startsWith("time_")) {
     }
 
     private void sendPrescriptionReviewCards(Long chatId, List<MedicineReservation> reservations) {
-        java.util.LinkedHashMap<String, java.util.List<MedicineReservation>> reviewGroups = new java.util.LinkedHashMap<>();
+        // Build a review card per individual reservation (not per group) so that UPLOAD_REQUIRED
+        // siblings in the same group do not contaminate the aggregate status of an uploaded reservation.
         for (MedicineReservation reservation : reservations) {
-            String key = reservation.getReservationGroupId() != null ? reservation.getReservationGroupId() : "solo_" + reservation.getId();
-            reviewGroups.computeIfAbsent(key, ignored -> new java.util.ArrayList<>()).add(reservation);
-        }
-
-        for (java.util.Map.Entry<String, java.util.List<MedicineReservation>> entry : reviewGroups.entrySet()) {
-            java.util.List<MedicineReservation> group = entry.getValue();
-            PrescriptionStatusResponseDTO status = group.size() == 1 && group.get(0).getReservationGroupId() == null
-                    ? prescriptionReviewService.getPrescriptionStatus(group.get(0).getId(), null, null)
-                    : prescriptionReviewService.getPrescriptionStatus(null, entry.getKey(), null);
-            telegramClient.sendPharmacyPrescriptionReviewCard(chatId, status);
+            try {
+                PrescriptionStatusResponseDTO status =
+                        prescriptionReviewService.getPrescriptionStatus(reservation.getId(), null, null);
+                telegramClient.sendPharmacyPrescriptionReviewCard(chatId, status);
+            } catch (Exception e) {
+                System.out.println("[PRESC_REVIEW] Failed to send review card for reservationId="
+                        + reservation.getId() + ": " + e.getMessage());
+            }
         }
     }
 
@@ -9736,7 +10174,7 @@ if (data.startsWith("time_")) {
             PrescriptionReviewService.PrescriptionFileContent file = prescriptionReviewService.downloadPrescriptionFile(fileMeta.getPrescriptionId(), chatId);
             String caption = "🧾 Prescription file " + index + " of " + status.getFiles().size()
                     + "\nFile: " + (fileMeta.getOriginalFilename() == null ? "prescription" : fileMeta.getOriginalFilename())
-                    + "\nStatus: " + (fileMeta.getReviewStatus() == null ? "PRESCRIPTION_PENDING" : fileMeta.getReviewStatus());
+                    + "\nStatus: " + (fileMeta.getReviewStatus() == null ? "PENDING_REVIEW" : fileMeta.getReviewStatus());
             telegramClient.sendDocumentBytes(
                     chatId,
                     file.fileData(),

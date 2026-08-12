@@ -17,6 +17,8 @@ public class PrescriptionStatusResponseDTO {
     private String reservationGroupId;
     private Long userId;
     private Long pharmacyId;
+    private String customerPhone;
+    private String note;
     private boolean prescriptionRequired;
     private String reviewStatus;
     private LocalDateTime reviewedAt;
@@ -24,4 +26,13 @@ public class PrescriptionStatusResponseDTO {
     private String rejectionReason;
     private List<PrescriptionStatusItemDTO> items;
     private List<PrescriptionFileMetadataDTO> files;
+
+    // Additional fields for complete status refresh
+    private String reservationStatus;
+    private String pharmacyName;
+    private String medicineName;
+    private Integer quantity;
+    private LocalDateTime expiresAt;
+    private boolean canShowQr;
+    private String userFacingStage;
 }

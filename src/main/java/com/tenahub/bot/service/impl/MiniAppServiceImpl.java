@@ -57,11 +57,12 @@ import com.tenahub.bot.repository.PharmacyRepository;
 import com.tenahub.bot.repository.PharmacyPhotoRepository;
 import com.tenahub.bot.repository.MedicinePhotoRepository;
 import com.tenahub.bot.service.MedicinePhotoService;
+import com.tenahub.bot.service.MiniAppAuthException;
 import com.tenahub.bot.service.MiniAppService;
 import com.tenahub.bot.service.PharmacyPhotoService;
+import com.tenahub.bot.service.TelegramWebAppAuthService;
 import com.tenahub.bot.service.PharmacyService;
 import com.tenahub.bot.service.ReservationService;
-import com.tenahub.bot.service.ReservationWorkflowService;
 import com.tenahub.bot.service.SmsService;
 import com.tenahub.bot.util.LocalizationService;
 import com.tenahub.bot.util.MedicineSearchNormalizer;
@@ -90,7 +91,12 @@ public class MiniAppServiceImpl implements MiniAppService {
         OPEN_NOW
     }
 
-    private record SearchPreferences(SearchOption sortOption, boolean openNowOnly, boolean explicitSelection) {
+    private record SearchPreferences(SearchOption sortOption,
+                                     boolean openNowOnly,
+                                     boolean verifiedOnly,
+                                     boolean prescriptionRequiredOnly,
+                                     boolean noPrescriptionOnly,
+                                     boolean explicitSelection) {
     }
     
     @Autowired
@@ -118,9 +124,6 @@ public class MiniAppServiceImpl implements MiniAppService {
     private ReservationService reservationService;
 
     @Autowired
-    private ReservationWorkflowService reservationWorkflowService;
-
-    @Autowired
     private MedicineReservationRepository medicineReservationRepository;
 
     @Autowired
@@ -128,6 +131,9 @@ public class MiniAppServiceImpl implements MiniAppService {
 
     @Autowired
     private SmsService smsService;
+
+    @Autowired
+    private TelegramWebAppAuthService telegramWebAppAuthService;
 
     @Autowired
     private TelegramClient telegramClient;
@@ -229,7 +235,11 @@ public class MiniAppServiceImpl implements MiniAppService {
         String normalizedCustomerName = request.getCustomerName() == null || request.getCustomerName().isBlank()
             ? null
             : request.getCustomerName().trim();
-        Long reservationOwnerTelegramId = resolveReservationOwnerTelegramUserId(request.getTelegramUserId());
+        Long reservationOwnerTelegramId = resolveAuthenticatedUserId(
+                request.getTelegramInitData(),
+                request.getInitData(),
+                request.getTelegramUserId(),
+                true);
 
         if (isGroupedConfirmRequest(request)) {
             return confirmGroupedReservation(
@@ -268,7 +278,15 @@ public class MiniAppServiceImpl implements MiniAppService {
 
         reservation.setPendingExpiresAt(resolvePendingExpiryForNewReservation(reservation));
         reservation.setQrToken(generateQrToken());
+        if (request.getNote() != null && !request.getNote().isBlank()) {
+            reservation.setNote(request.getNote().trim());
+        }
         medicineReservationRepository.save(reservation);
+        System.out.println("[CONFIRM] reservationId=" + reservation.getId()
+                + ", status=" + (reservation.getStatus() != null ? reservation.getStatus().name() : "null")
+                + ", prescriptionRequired=" + reservation.isPrescriptionRequired()
+                + ", queue=" + (reservation.isPrescriptionRequired() ? "prescription_review" : "pending_reservations")
+                + ", note=" + reservation.getNote());
         clearMiniAppReservationSessions(reservationOwnerTelegramId);
         notifyReservationCreatedAfterCommit(reservation, normalizedPhone, normalizedCustomerName);
 
@@ -291,13 +309,57 @@ public class MiniAppServiceImpl implements MiniAppService {
 
     @Override
     public List<MiniAppReservationCardDTO> getActiveReservations(Long telegramUserId) {
-        Long resolvedTelegramUserId = requireTelegramUserId(telegramUserId);
+        Long resolvedTelegramUserId = null;
+        try {
+            resolvedTelegramUserId = requireTelegramUserId(telegramUserId);
+        } catch (Exception e) {
+            log.warn("[Service] getActiveReservations: Invalid or missing telegramUserId: {}", telegramUserId, e);
+            throw e;
+        }
+        List<MedicineReservationStatus> activeStatuses = List.of(MedicineReservationStatus.PENDING, MedicineReservationStatus.APPROVED, MedicineReservationStatus.READY_FOR_PICKUP);
+        List<MedicineReservation> reservations = List.of();
+        try {
+            reservations = medicineReservationRepository.findByUserIdAndStatusInOrderByCreatedAtDesc(
+                resolvedTelegramUserId, activeStatuses);
+        } catch (Exception e) {
+            log.error("[Service] getActiveReservations: Error fetching reservations for user {}: {}", resolvedTelegramUserId, e.getMessage(), e);
+            throw new RuntimeException("Failed to fetch active reservations");
+        }
+        if (reservations == null) {
+            reservations = List.of();
+        }
 
-        return medicineReservationRepository.findByUserIdAndStatusInOrderByCreatedAtDesc(
-                resolvedTelegramUserId,
-                List.of(MedicineReservationStatus.PENDING, MedicineReservationStatus.APPROVED))
-            .stream()
-            .collect(Collectors.collectingAndThen(Collectors.toList(), this::toMiniAppReservationCards));
+        // Expire past-deadline reservations before building cards
+        LocalDateTime now = LocalDateTime.now();
+        List<MedicineReservation> stillActive = new java.util.ArrayList<>();
+        for (MedicineReservation r : reservations) {
+            if (r.getExpiresAt() != null && !r.getExpiresAt().isAfter(now)) {
+                try {
+                    if (r.getStatus() == MedicineReservationStatus.PENDING) {
+                        reservationService.autoCancelPendingReservation(r.getId(), "AUTO_CANCELLED_PENDING_TIMEOUT");
+                        log.info("[Service] getActiveReservations: Auto-cancelled pending reservation id={}", r.getId());
+                    } else {
+                        reservationService.expireReservation(r.getId());
+                        log.info("[Service] getActiveReservations: Auto-expired reservation id={}", r.getId());
+                    }
+                } catch (Exception ex) {
+                    log.warn("[Service] getActiveReservations: Failed to expire/cancel reservation id={}: {}", r.getId(), ex.getMessage());
+                }
+            } else {
+                stillActive.add(r);
+            }
+        }
+        reservations = stillActive;
+        List<MiniAppReservationCardDTO> cards = toMiniAppReservationCards(reservations);
+        log.info("[Service] getActiveReservations: userId={}, dbRows={}, cards={}", resolvedTelegramUserId, reservations.size(), cards.size());
+        for (MiniAppReservationCardDTO card : cards) {
+            log.info("[Service] ActiveCard: id={}, groupId={}, reservationStatus={}, prescriptionStatus={}, canShowQr={}, userFacingStage={}, rxRequired={}, expiresAt={}, pharmacyName={}, medicineName={}, qty={}",
+                card.getReservationId(), card.getReservationGroupId(), card.getReservationStatus(),
+                card.getPrescriptionStatus(), card.isCanShowQr(), card.getUserFacingStage(),
+                card.isPrescriptionRequired(),
+                card.getExpiresAt(), card.getPharmacyName(), card.getMedicineName(), card.getQuantity());
+        }
+        return cards;
     }
 
     @Override
@@ -312,7 +374,86 @@ public class MiniAppServiceImpl implements MiniAppService {
                     MedicineReservationStatus.REJECTED,
                     MedicineReservationStatus.CANCELLED))
             .stream()
+            .filter(reservation -> reservation.getHiddenFromUserAt() == null)
             .collect(Collectors.collectingAndThen(Collectors.toList(), this::toMiniAppReservationCards));
+    }
+
+    @Override
+    public MiniAppOperationResponseDTO hideReservationFromHistory(Long reservationId, Long telegramUserId) {
+        if (reservationId == null) {
+            throw new RuntimeException("reservationId is required");
+        }
+        Long userId = requireTelegramUserId(telegramUserId);
+        MedicineReservation reservation = medicineReservationRepository.findById(reservationId)
+                .orElseThrow(() -> new RuntimeException("Reservation not found"));
+
+        if (reservation.getUserId() == null || !reservation.getUserId().equals(userId)) {
+            throw new RuntimeException("Reservation does not belong to this user");
+        }
+        if (!isUserHistoryStatus(reservation.getStatus())) {
+            throw new RuntimeException("Only completed reservations can be removed from history");
+        }
+
+        LocalDateTime hiddenAt = LocalDateTime.now();
+        List<MedicineReservation> toHide = resolveHistoryHideTargets(reservation, userId);
+        for (MedicineReservation item : toHide) {
+            if (item.getHiddenFromUserAt() == null) {
+                item.setHiddenFromUserAt(hiddenAt);
+            }
+        }
+        medicineReservationRepository.saveAll(toHide);
+
+        return MiniAppOperationResponseDTO.builder()
+                .success(true)
+                .message("Reservation removed from history.")
+                .build();
+    }
+
+    @Override
+    public MiniAppOperationResponseDTO clearReservationHistory(Long telegramUserId) {
+        Long userId = requireTelegramUserId(telegramUserId);
+        List<MedicineReservation> history = medicineReservationRepository.findByUserIdAndStatusIn(
+                userId,
+                List.of(
+                        MedicineReservationStatus.FULFILLED,
+                        MedicineReservationStatus.EXPIRED,
+                        MedicineReservationStatus.REJECTED,
+                        MedicineReservationStatus.CANCELLED));
+
+        LocalDateTime hiddenAt = LocalDateTime.now();
+        List<MedicineReservation> toHide = history.stream()
+                .filter(reservation -> reservation.getHiddenFromUserAt() == null)
+                .toList();
+        for (MedicineReservation item : toHide) {
+            item.setHiddenFromUserAt(hiddenAt);
+        }
+        if (!toHide.isEmpty()) {
+            medicineReservationRepository.saveAll(toHide);
+        }
+
+        return MiniAppOperationResponseDTO.builder()
+                .success(true)
+                .message("Reservation history cleared.")
+                .build();
+    }
+
+    private List<MedicineReservation> resolveHistoryHideTargets(MedicineReservation reservation, Long userId) {
+        String groupId = reservation.getReservationGroupId();
+        if (groupId == null || groupId.isBlank()) {
+            return List.of(reservation);
+        }
+
+        return medicineReservationRepository.findByReservationGroupId(groupId).stream()
+                .filter(item -> userId.equals(item.getUserId()))
+                .filter(item -> isUserHistoryStatus(item.getStatus()))
+                .toList();
+    }
+
+    private boolean isUserHistoryStatus(MedicineReservationStatus status) {
+        return status == MedicineReservationStatus.FULFILLED
+                || status == MedicineReservationStatus.EXPIRED
+                || status == MedicineReservationStatus.REJECTED
+                || status == MedicineReservationStatus.CANCELLED;
     }
     
     @Override
@@ -451,6 +592,20 @@ public class MiniAppServiceImpl implements MiniAppService {
         return medicine.getId();
     }
 
+    @Override
+    public MiniAppOperationResponseDTO cancelReservation(Long reservationId, Long telegramUserId) {
+        if (reservationId == null) {
+            throw new RuntimeException("reservationId is required");
+        }
+        Long userId = requireTelegramUserId(telegramUserId);
+        log.info("[Service] cancelReservation: reservationId={}, userId={}", reservationId, userId);
+        reservationService.cancelReservationByUser(userId, reservationId);
+        return MiniAppOperationResponseDTO.builder()
+                .success(true)
+                .message("Reservation cancelled successfully.")
+                .build();
+    }
+
         @Override
         public MiniAppReservationPreloadResponseDTO getReservationPreload(Long pharmacyId, List<Long> medicineIds) {
         if (pharmacyId == null) {
@@ -569,9 +724,12 @@ public class MiniAppServiceImpl implements MiniAppService {
         if (request == null) {
             throw new RuntimeException("request body is required");
         }
-        if (request.getUserId() == null) {
-            throw new RuntimeException("userId is required");
-        }
+        Long userId = resolveAuthenticatedUserId(
+                request.getTelegramInitData(),
+                request.getInitData(),
+                request.getUserId(),
+                true);
+        request.setUserId(userId);
         if (request.getPharmacyId() == null) {
             throw new RuntimeException("pharmacyId is required");
         }
@@ -642,8 +800,32 @@ public class MiniAppServiceImpl implements MiniAppService {
         return normalized;
     }
 
+    private Long resolveAuthenticatedUserId(String telegramInitData,
+                                            String initData,
+                                            Long claimedUserId,
+                                            boolean required) {
+        String resolvedInitData = firstNonBlank(telegramInitData, initData);
+        if (resolvedInitData != null) {
+            return telegramWebAppAuthService.parseUserId(resolvedInitData);
+        }
+        if (required) {
+            throw new MiniAppAuthException("Telegram initData is required");
+        }
+        return resolveReservationOwnerTelegramUserId(claimedUserId);
+    }
+
+    private String firstNonBlank(String first, String second) {
+        if (first != null && !first.isBlank()) {
+            return first;
+        }
+        if (second != null && !second.isBlank()) {
+            return second;
+        }
+        return null;
+    }
+
     private Long resolveReservationOwnerTelegramUserId(Long telegramUserId) {
-        if (telegramUserId != null) {
+        if (telegramUserId != null && telegramUserId > 0) {
             return telegramUserId;
         }
 
@@ -651,9 +833,9 @@ public class MiniAppServiceImpl implements MiniAppService {
             return devTelegramUserId;
         }
 
-        throw new RuntimeException(
-            "telegramUserId is required. For local development only, enable tenahub.mini-app.confirm.allow-missing-telegram-user-id=true and set tenahub.mini-app.confirm.dev-telegram-user-id to a valid test Telegram user id."
-        );
+        // No valid Telegram user ID available (e.g. mini app opened outside Telegram).
+        // Allow the reservation to proceed; Telegram bot notifications will be skipped.
+        return null;
     }
 
     private String normalizeVerificationToken(String verificationToken) {
@@ -727,14 +909,18 @@ public class MiniAppServiceImpl implements MiniAppService {
 
         LocalDateTime pendingExpiresAt = resolvePendingExpiryForNewReservation(groupedReservations);
         String groupQrToken = generateQrToken();
+        String normalizedNote = (request.getNote() != null && !request.getNote().isBlank()) ? request.getNote().trim() : null;
         for (MedicineReservation reservation : groupedReservations) {
             reservation.setPendingExpiresAt(pendingExpiresAt);
             reservation.setQrToken(groupQrToken);
+            if (normalizedNote != null) {
+                reservation.setNote(normalizedNote);
+            }
             medicineReservationRepository.save(reservation);
         }
 
         clearMiniAppReservationSessions(reservationOwnerTelegramId);
-        notifyGroupedReservationCreatedAfterCommit(groupedReservations, pharmacy.getTelegramId());
+        notifyGroupedReservationCreatedAfterCommit(groupedReservations);
 
         List<MiniAppReservationConfirmItemResponseDTO> responseItems = groupedReservations.stream()
                 .map(reservation -> buildConfirmItemResponse(
@@ -790,15 +976,42 @@ public class MiniAppServiceImpl implements MiniAppService {
             return;
         }
 
+        // Pharmacy Telegram alert is sent from ReservationServiceImpl after save.
+        // Prescription-required: Mini App handles upload; skip the user Telegram prompt.
+        if (requiresPrescriptionUploadBeforePharmacyNotification(reservation)) {
+            return;
+        }
+
+        Runnable notifier = () -> {
+            try {
+                if (reservation.getUserId() != null && reservation.getUserId() > 0) {
+                    telegramClient.sendMessage(
+                        reservation.getUserId(),
+                        localizationService.text(
+                            reservation.getUserId(),
+                            "reservation_contact_sent",
+                            reservation.getMedicineName(),
+                            reservation.getRequestedQuantity(),
+                            customerName,
+                            customerPhone
+                        ) + "\n\u23F1 Auto-cancels in " + pendingReservationTimeoutMinutes + " minutes if not approved."
+                    );
+                }
+            } catch (Exception notificationError) {
+                log.warn("Mini app user reservation confirmation failed for reservation {}: {}",
+                        reservation.getId(), notificationError.getMessage());
+            }
+        };
+
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            notifyReservationCreated(reservation, customerPhone, customerName);
+            notifier.run();
             return;
         }
 
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                notifyReservationCreated(reservation, customerPhone, customerName);
+                notifier.run();
             }
         });
     }
@@ -806,73 +1019,37 @@ public class MiniAppServiceImpl implements MiniAppService {
     private void notifyReservationCreated(MedicineReservation reservation,
                                           String customerPhone,
                                           String customerName) {
-        if (reservation == null) {
-            return;
-        }
-
-        try {
-            if (requiresPrescriptionUploadBeforePharmacyNotification(reservation)) {
-                telegramClient.sendMessage(
-                    reservation.getUserId(),
-                    "🧾 Your reservation is saved, but it has not been sent to the pharmacy yet. Upload at least one prescription file in the mini app to continue."
-                );
-                return;
-            }
-
-            reservationWorkflowService.notifyPharmacyPendingReservation(reservation, pendingReservationTimeoutMinutes);
-
-            telegramClient.sendMessage(
-                reservation.getUserId(),
-                localizationService.text(
-                    reservation.getUserId(),
-                    "reservation_contact_sent",
-                    reservation.getMedicineName(),
-                    reservation.getRequestedQuantity(),
-                    customerName,
-                    customerPhone
-                ) + "\n⏱ Auto-cancels in " + pendingReservationTimeoutMinutes + " minutes if not approved."
-            );
-        } catch (Exception notificationError) {
-            log.warn("Mini app reservation notification failed for reservation {}: {}",
-                reservation.getId(), notificationError.getMessage());
-        }
+        // Kept for potential direct (non-transactional) callers; delegates to the main flow.
+        notifyReservationCreatedAfterCommit(reservation, customerPhone, customerName);
     }
 
-    private void notifyGroupedReservationCreatedAfterCommit(List<MedicineReservation> reservations,
-                                                            Long pharmacyTelegramId) {
+    private void notifyGroupedReservationCreatedAfterCommit(List<MedicineReservation> reservations) {
         if (reservations == null || reservations.isEmpty()) {
             return;
         }
 
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            notifyGroupedReservationCreated(reservations, pharmacyTelegramId);
+            notifyGroupedReservationCreated(reservations);
             return;
         }
 
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                notifyGroupedReservationCreated(reservations, pharmacyTelegramId);
+                notifyGroupedReservationCreated(reservations);
             }
         });
     }
 
-    private void notifyGroupedReservationCreated(List<MedicineReservation> reservations,
-                                                 Long pharmacyTelegramId) {
+    private void notifyGroupedReservationCreated(List<MedicineReservation> reservations) {
         try {
             String groupId = reservations.get(0).getReservationGroupId();
-            if (!requiresPrescriptionUploadBeforePharmacyNotification(reservations)
-                    && pharmacyTelegramId != null && pharmacyTelegramId > 0
-                    && groupId != null && !groupId.isBlank()) {
-                telegramClient.sendPharmacyGroupedReservationCard(pharmacyTelegramId, groupId, reservations);
-            }
-
             Long userId = reservations.get(0).getUserId();
-            if (userId != null && groupId != null && !groupId.isBlank()) {
+            if (userId != null && userId > 0 && groupId != null && !groupId.isBlank()) {
                 telegramClient.sendMultiReserveGroupedConfirmation(userId, groupId, reservations);
             }
         } catch (Exception notificationError) {
-            log.warn("Mini app grouped reservation notification failed for group {}: {}",
+            log.warn("Mini app grouped reservation user confirmation failed for group {}: {}",
                     reservations.get(0).getReservationGroupId(), notificationError.getMessage());
         }
     }
@@ -900,16 +1077,47 @@ public class MiniAppServiceImpl implements MiniAppService {
             .grouped(false)
             .groupedStatus(reservation.getStatus() == null ? null : reservation.getStatus().name())
             .prescriptionRequired(reservation.isPrescriptionRequired())
+            .prescriptionStatus(reservation.getPrescriptionReviewStatus() == null ? null : reservation.getPrescriptionReviewStatus().name())
             .prescriptionReviewStatus(reservation.getPrescriptionReviewStatus() == null ? null : reservation.getPrescriptionReviewStatus().name())
+            .prescriptionStatusLabel(buildPrescriptionStatusLabel(
+                reservation.isPrescriptionRequired(),
+                reservation.getPrescriptionReviewStatus()))
             .prescriptionRejectionReason(reservation.getPrescriptionRejectionReason())
             .pharmacyId(reservation.getPharmacyId())
             .pharmacyName(pharmacy == null ? null : pharmacy.getName())
             .medicineId(inventory == null ? null : inventory.getId())
             .medicineName(reservation.getMedicineName())
             .quantity(reservation.getRequestedQuantity())
+                .reservationStatus(reservation.getStatus() == null ? null : reservation.getStatus().name())
             .status(reservation.getStatus() == null ? null : reservation.getStatus().name())
+            .reservationStatusLabel(buildReservationStatusLabel(
+                reservation.getStatus(),
+                reservation.isPrescriptionRequired(),
+                reservation.getPrescriptionReviewStatus()))
+            .readyForPickup(isReadyForPickup(
+                reservation.getStatus(),
+                reservation.isPrescriptionRequired(),
+                reservation.getPrescriptionReviewStatus()))
+                .canShowQr(canShowQr(
+                    reservation.getStatus(),
+                    reservation.isPrescriptionRequired(),
+                    reservation.getPrescriptionReviewStatus()))
+            .showQrCode(shouldShowQrCode(
+                reservation.getStatus(),
+                reservation.isPrescriptionRequired(),
+                reservation.getPrescriptionReviewStatus(),
+                reservation.getQrToken()))
+            .userFacingStage(deriveUserFacingStage(
+                reservation.getStatus(),
+                reservation.isPrescriptionRequired(),
+                reservation.getPrescriptionReviewStatus()))
+                .holdUntil(resolveReservationExpiresAt(reservation))
             .expiresAt(resolveReservationExpiresAt(reservation))
-            .qrToken(reservation.getQrToken())
+            .qrToken(resolveQrToken(
+                reservation.getStatus(),
+                reservation.isPrescriptionRequired(),
+                reservation.getPrescriptionReviewStatus(),
+                reservation.getQrToken()))
             .createdAt(reservation.getCreatedAt())
             .phone(reservation.getCustomerPhone())
             .items(List.of(buildConfirmItemResponse(reservation, inventory == null ? null : inventory.getId())))
@@ -958,21 +1166,203 @@ public class MiniAppServiceImpl implements MiniAppService {
                             .grouped(true)
                             .groupedStatus(resolveGroupedStatus(group))
                             .prescriptionRequired(group.stream().anyMatch(MedicineReservation::isPrescriptionRequired))
+                            .prescriptionStatus(resolveGroupedPrescriptionStatus(group))
                             .prescriptionReviewStatus(resolveGroupedPrescriptionStatus(group))
+                            .prescriptionStatusLabel(buildPrescriptionStatusLabel(
+                                    group.stream().anyMatch(MedicineReservation::isPrescriptionRequired),
+                                    parsePrescriptionStatus(resolveGroupedPrescriptionStatus(group))))
                             .prescriptionRejectionReason(resolveGroupedPrescriptionRejectionReason(group))
                             .pharmacyId(first.getPharmacyId())
                             .pharmacyName(pharmacy == null ? null : pharmacy.getName())
                             .medicineName(group.size() + " medicines")
                             .quantity(totalQuantity)
+                                .reservationStatus(resolveGroupedStatus(group))
                             .status(resolveGroupedStatus(group))
+                            .reservationStatusLabel(buildReservationStatusLabel(
+                                    parseReservationStatus(resolveGroupedStatus(group)),
+                                    group.stream().anyMatch(MedicineReservation::isPrescriptionRequired),
+                                    parsePrescriptionStatus(resolveGroupedPrescriptionStatus(group))))
+                            .readyForPickup(isReadyForPickup(
+                                    parseReservationStatus(resolveGroupedStatus(group)),
+                                    group.stream().anyMatch(MedicineReservation::isPrescriptionRequired),
+                                    parsePrescriptionStatus(resolveGroupedPrescriptionStatus(group))))
+                                .canShowQr(canShowQr(
+                                    parseReservationStatus(resolveGroupedStatus(group)),
+                                    group.stream().anyMatch(MedicineReservation::isPrescriptionRequired),
+                                    parsePrescriptionStatus(resolveGroupedPrescriptionStatus(group))))
+                            .showQrCode(shouldShowQrCode(
+                                    parseReservationStatus(resolveGroupedStatus(group)),
+                                    group.stream().anyMatch(MedicineReservation::isPrescriptionRequired),
+                                    parsePrescriptionStatus(resolveGroupedPrescriptionStatus(group)),
+                                    first.getQrToken()))
+                            .userFacingStage(deriveUserFacingStage(
+                                    parseReservationStatus(resolveGroupedStatus(group)),
+                                    group.stream().anyMatch(MedicineReservation::isPrescriptionRequired),
+                                    parsePrescriptionStatus(resolveGroupedPrescriptionStatus(group))))
+                                .holdUntil(resolveGroupedExpiresAt(group))
                             .expiresAt(resolveGroupedExpiresAt(group))
-                            .qrToken(first.getQrToken())
+                            .qrToken(resolveQrToken(
+                                    parseReservationStatus(resolveGroupedStatus(group)),
+                                    group.stream().anyMatch(MedicineReservation::isPrescriptionRequired),
+                                    parsePrescriptionStatus(resolveGroupedPrescriptionStatus(group)),
+                                    first.getQrToken()))
                             .createdAt(group.stream().map(MedicineReservation::getCreatedAt).filter(value -> value != null).min(LocalDateTime::compareTo).orElse(first.getCreatedAt()))
                             .phone(first.getCustomerPhone())
                             .items(items)
                             .build();
                 })
                 .toList();
+    }
+
+    private String resolveQrToken(MedicineReservationStatus reservationStatus,
+                                  boolean prescriptionRequired,
+                                  PrescriptionReviewStatus prescriptionStatus,
+                                  String qrToken) {
+        return shouldShowQrCode(reservationStatus, prescriptionRequired, prescriptionStatus, qrToken) ? qrToken : null;
+    }
+
+    private boolean shouldShowQrCode(MedicineReservationStatus reservationStatus,
+                                     boolean prescriptionRequired,
+                                     PrescriptionReviewStatus prescriptionStatus,
+                                     String qrToken) {
+        return canShowQr(reservationStatus, prescriptionRequired, prescriptionStatus)
+                && qrToken != null && !qrToken.isBlank();
+    }
+
+    private boolean canShowQr(MedicineReservationStatus reservationStatus,
+                              boolean prescriptionRequired,
+                              PrescriptionReviewStatus prescriptionStatus) {
+        boolean rxOk = !prescriptionRequired || prescriptionStatus == PrescriptionReviewStatus.APPROVED;
+        boolean resOk = reservationStatus == MedicineReservationStatus.APPROVED
+                || reservationStatus == MedicineReservationStatus.READY_FOR_PICKUP;
+        return rxOk && resOk;
+    }
+
+    private boolean isReadyForPickup(MedicineReservationStatus reservationStatus,
+                                     boolean prescriptionRequired,
+                                     PrescriptionReviewStatus prescriptionStatus) {
+        return canShowQr(reservationStatus, prescriptionRequired, prescriptionStatus);
+    }
+
+    private String buildPrescriptionStatusLabel(boolean prescriptionRequired,
+                                                PrescriptionReviewStatus prescriptionStatus) {
+        if (!prescriptionRequired) {
+            return "Not required";
+        }
+
+        PrescriptionReviewStatus resolvedStatus = prescriptionStatus == null
+                ? PrescriptionReviewStatus.UPLOAD_REQUIRED
+                : prescriptionStatus;
+
+        return switch (resolvedStatus) {
+            case UPLOAD_REQUIRED -> "Prescription required - upload needed";
+            case PENDING_REVIEW -> "Prescription under review";
+            case APPROVED -> "Prescription approved";
+            case REJECTED -> "Prescription rejected";
+            case NOT_REQUIRED -> "Not required";
+        };
+    }
+
+    private String buildReservationStatusLabel(MedicineReservationStatus reservationStatus,
+                                               boolean prescriptionRequired,
+                                               PrescriptionReviewStatus prescriptionStatus) {
+        if (prescriptionRequired && prescriptionStatus == PrescriptionReviewStatus.REJECTED) {
+            return "Closed - prescription rejected";
+        }
+        if (reservationStatus == null) {
+            return null;
+        }
+        if (reservationStatus == MedicineReservationStatus.REJECTED) {
+            return "Rejected";
+        }
+        if (reservationStatus == MedicineReservationStatus.CANCELLED) {
+            return "Cancelled";
+        }
+        if (reservationStatus == MedicineReservationStatus.EXPIRED) {
+            return "Expired";
+        }
+        if (reservationStatus == MedicineReservationStatus.FULFILLED) {
+            return "Fulfilled";
+        }
+        if (reservationStatus == MedicineReservationStatus.READY_FOR_PICKUP) {
+            return "Ready for pickup";
+        }
+        if (isReadyForPickup(reservationStatus, prescriptionRequired, prescriptionStatus)) {
+            return "Ready for pickup";
+        }
+        if (reservationStatus == MedicineReservationStatus.APPROVED) {
+            return "Approved";
+        }
+        if (prescriptionRequired) {
+            if (prescriptionStatus == PrescriptionReviewStatus.APPROVED) {
+                return "Waiting for pharmacy reservation approval";
+            }
+            if (prescriptionStatus == PrescriptionReviewStatus.PENDING_REVIEW) {
+                return "Waiting for prescription review";
+            }
+            if (prescriptionStatus == PrescriptionReviewStatus.UPLOAD_REQUIRED || prescriptionStatus == null) {
+                return "Waiting for prescription upload";
+            }
+        }
+        return reservationStatus == MedicineReservationStatus.PENDING ? "Waiting for pharmacy reservation approval" : reservationStatus.name();
+    }
+
+    private MedicineReservationStatus parseReservationStatus(String status) {
+        if (status == null || status.isBlank()) {
+            return null;
+        }
+        try {
+            return MedicineReservationStatus.valueOf(status);
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
+    }
+
+    private PrescriptionReviewStatus parsePrescriptionStatus(String status) {
+        if (status == null || status.isBlank()) {
+            return null;
+        }
+        try {
+            return PrescriptionReviewStatus.valueOf(status);
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
+    }
+
+    private String deriveUserFacingStage(MedicineReservationStatus reservationStatus,
+                                         boolean prescriptionRequired,
+                                         PrescriptionReviewStatus prescriptionStatus) {
+        if (reservationStatus == MedicineReservationStatus.FULFILLED) {
+            return "COMPLETE";
+        }
+        if (reservationStatus == MedicineReservationStatus.CANCELLED) {
+            return "CANCELLED";
+        }
+        if (reservationStatus == MedicineReservationStatus.EXPIRED) {
+            return "EXPIRED";
+        }
+        if (reservationStatus == MedicineReservationStatus.REJECTED
+                || (prescriptionRequired && prescriptionStatus == PrescriptionReviewStatus.REJECTED)) {
+            return "REJECTED";
+        }
+        boolean rxApproved = !prescriptionRequired || prescriptionStatus == PrescriptionReviewStatus.APPROVED;
+        if (rxApproved
+                && (reservationStatus == MedicineReservationStatus.APPROVED
+                    || reservationStatus == MedicineReservationStatus.READY_FOR_PICKUP)) {
+            return "READY_FOR_PICKUP";
+        }
+        if (prescriptionRequired && prescriptionStatus == PrescriptionReviewStatus.APPROVED
+                && reservationStatus == MedicineReservationStatus.PENDING) {
+            return "WAITING_RESERVATION_APPROVAL";
+        }
+        if (prescriptionRequired && prescriptionStatus == PrescriptionReviewStatus.PENDING_REVIEW) {
+            return "PRESCRIPTION_REVIEW";
+        }
+        if (prescriptionRequired
+                && (prescriptionStatus == PrescriptionReviewStatus.UPLOAD_REQUIRED || prescriptionStatus == null)) {
+            return "UPLOAD_PRESCRIPTION";
+        }
+        return "RESERVED";
     }
 
     private LocalDateTime resolveGroupedExpiresAt(List<MedicineReservation> reservations) {
@@ -1010,18 +1400,18 @@ public class MiniAppServiceImpl implements MiniAppService {
             return PrescriptionReviewStatus.NOT_REQUIRED.name();
         }
         if (requiredReservations.stream().anyMatch(reservation ->
-                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_REJECTED)) {
-            return PrescriptionReviewStatus.PRESCRIPTION_REJECTED.name();
+                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.REJECTED)) {
+            return PrescriptionReviewStatus.REJECTED.name();
         }
         if (requiredReservations.stream().allMatch(reservation ->
-                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_APPROVED)) {
-            return PrescriptionReviewStatus.PRESCRIPTION_APPROVED.name();
+                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.APPROVED)) {
+            return PrescriptionReviewStatus.APPROVED.name();
         }
         if (requiredReservations.stream().anyMatch(reservation ->
-                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED)) {
-            return PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED.name();
+                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.UPLOAD_REQUIRED)) {
+            return PrescriptionReviewStatus.UPLOAD_REQUIRED.name();
         }
-        return PrescriptionReviewStatus.PRESCRIPTION_PENDING.name();
+        return PrescriptionReviewStatus.PENDING_REVIEW.name();
     }
 
     private String resolveGroupedPrescriptionRejectionReason(List<MedicineReservation> reservations) {
@@ -1058,7 +1448,7 @@ public class MiniAppServiceImpl implements MiniAppService {
     private boolean requiresPrescriptionUploadBeforePharmacyNotification(MedicineReservation reservation) {
         return reservation != null
                 && reservation.isPrescriptionRequired()
-                && reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED;
+                && reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.UPLOAD_REQUIRED;
     }
 
     private boolean requiresPrescriptionUploadBeforePharmacyNotification(List<MedicineReservation> reservations) {
@@ -1101,6 +1491,14 @@ public class MiniAppServiceImpl implements MiniAppService {
         if (preferences.openNowOnly()) {
             stream = stream.filter(PharmacyResponseDTO::isOpenNow);
         }
+        if (preferences.verifiedOnly()) {
+            stream = stream.filter(PharmacyResponseDTO::isVerified);
+        }
+        if (preferences.prescriptionRequiredOnly() && !preferences.noPrescriptionOnly()) {
+            stream = stream.filter(PharmacyResponseDTO::isRequiresPrescription);
+        } else if (preferences.noPrescriptionOnly() && !preferences.prescriptionRequiredOnly()) {
+            stream = stream.filter(item -> !item.isRequiresPrescription());
+        }
 
         Comparator<PharmacyResponseDTO> comparator = buildComparator(preferences.sortOption(), hasLocation);
         if (comparator == null) {
@@ -1113,8 +1511,17 @@ public class MiniAppServiceImpl implements MiniAppService {
     private SearchPreferences resolveSearchPreferences(String sort, String filter) {
         SearchOption sortOption = normalizeSearchOption(sort);
         SearchOption filterOption = normalizeSearchOption(filter);
+        String mergedRawFilters = mergeRawFilters(sort, filter);
 
-        boolean explicitSelection = sortOption != SearchOption.NONE || filterOption != SearchOption.NONE;
+        boolean verifiedOnly = hasVerifiedOnlyFilter(mergedRawFilters);
+        boolean prescriptionRequiredOnly = hasPrescriptionRequiredFilter(mergedRawFilters);
+        boolean noPrescriptionOnly = hasNoPrescriptionFilter(mergedRawFilters);
+
+        boolean explicitSelection = sortOption != SearchOption.NONE
+            || filterOption != SearchOption.NONE
+            || verifiedOnly
+            || prescriptionRequiredOnly
+            || noPrescriptionOnly;
         boolean openNowOnly = sortOption == SearchOption.OPEN_NOW || filterOption == SearchOption.OPEN_NOW;
 
         if (sortOption == SearchOption.OPEN_NOW) {
@@ -1130,7 +1537,40 @@ public class MiniAppServiceImpl implements MiniAppService {
             sortOption = SearchOption.NEAREST;
         }
 
-        return new SearchPreferences(sortOption, openNowOnly, explicitSelection);
+        return new SearchPreferences(
+                sortOption,
+                openNowOnly,
+                verifiedOnly,
+                prescriptionRequiredOnly,
+                noPrescriptionOnly,
+                explicitSelection);
+    }
+
+    private String mergeRawFilters(String sort, String filter) {
+        String first = sort == null ? "" : sort;
+        String second = filter == null ? "" : filter;
+        return (first + " " + second).toLowerCase(Locale.ROOT);
+    }
+
+    private boolean hasVerifiedOnlyFilter(String mergedRawFilters) {
+        String normalizedLettersOnly = mergedRawFilters.replaceAll("[^a-z]", "");
+        return normalizedLettersOnly.contains("verified")
+                || normalizedLettersOnly.contains("verifiedonly");
+    }
+
+    private boolean hasPrescriptionRequiredFilter(String mergedRawFilters) {
+        String normalizedLettersOnly = mergedRawFilters.replaceAll("[^a-z]", "");
+        return normalizedLettersOnly.contains("prescriptionrequired")
+                || normalizedLettersOnly.contains("requiresprescription")
+                || normalizedLettersOnly.contains("rxrequired");
+    }
+
+    private boolean hasNoPrescriptionFilter(String mergedRawFilters) {
+        String normalizedLettersOnly = mergedRawFilters.replaceAll("[^a-z]", "");
+        return normalizedLettersOnly.contains("noprescription")
+                || normalizedLettersOnly.contains("withoutprescription")
+                || normalizedLettersOnly.contains("nonprescription")
+                || normalizedLettersOnly.contains("prescriptionnotrequired");
     }
 
     private SearchOption normalizeSearchOption(String rawValue) {

@@ -8,10 +8,12 @@ import com.tenahub.bot.repository.MedicineReservationRepository;
 import com.tenahub.bot.repository.PharmacyInventoryRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
 import com.tenahub.bot.service.ReservationService;
+import com.tenahub.bot.service.ReservationWorkflowService;
 import com.tenahub.bot.util.LocalizationService;
 import com.tenahub.bot.util.MedicineSearchNormalizer;
 import com.tenahub.bot.util.TelegramClient;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
@@ -28,6 +30,10 @@ public class ReservationServiceImpl implements ReservationService {
     private final PharmacyInventoryRepository inventoryRepository;
     private final LocalizationService localizationService;
     private final TelegramClient telegramClient;
+    private final ReservationWorkflowService reservationWorkflowService;
+
+    @Value("${tenahub.reservation.pending-timeout-minutes:20}")
+    private long pendingTimeoutMinutes;
 
     private static final int APPROVED_HOLD_MINUTES = 60;
 
@@ -122,7 +128,7 @@ public MedicineReservation createReservation(Long userId,
             .status(MedicineReservationStatus.PENDING)
             .prescriptionRequired(inventory.isRequiresPrescription())
             .prescriptionReviewStatus(inventory.isRequiresPrescription()
-                ? PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED
+                ? PrescriptionReviewStatus.UPLOAD_REQUIRED
                     : PrescriptionReviewStatus.NOT_REQUIRED)
             .createdAt(LocalDateTime.now())
             .customerPhone(customerPhone)
@@ -130,9 +136,18 @@ public MedicineReservation createReservation(Long userId,
                 .inventoryHeld(false)
             .build();
 
+        if (!reservation.isPrescriptionRequired()) {
+            System.out.println("[STOCK] Holding stock at creation: reservationId=pending, medicine="
+                    + normalizedMedicine + ", qty=" + requestedQuantity);
             holdInventoryOrThrow(reservation);
+        } else {
+            System.out.println("[STOCK] Deferring stock hold (prescription required): medicine="
+                    + normalizedMedicine + ", qty=" + requestedQuantity);
+        }
 
-    return reservationRepository.save(reservation);
+    MedicineReservation saved = reservationRepository.save(reservation);
+    reservationWorkflowService.notifyPharmacyPendingReservation(saved, pendingTimeoutMinutes);
+    return saved;
 }
 
     @Override
@@ -184,7 +199,7 @@ public MedicineReservation createReservation(Long userId,
                     .status(MedicineReservationStatus.PENDING)
                     .prescriptionRequired(inventory.isRequiresPrescription())
                     .prescriptionReviewStatus(inventory.isRequiresPrescription()
-                        ? PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED
+                        ? PrescriptionReviewStatus.UPLOAD_REQUIRED
                         : PrescriptionReviewStatus.NOT_REQUIRED)
                     .createdAt(java.time.LocalDateTime.now())
                     .customerPhone(customerPhone)
@@ -193,11 +208,19 @@ public MedicineReservation createReservation(Long userId,
                     .reservationGroupId(groupId)
                     .build();
 
-            holdInventoryOrThrow(reservation);
+            if (!reservation.isPrescriptionRequired()) {
+                System.out.println("[STOCK] Holding stock at creation (group): medicine="
+                        + normalizedMedicine + ", qty=" + requestedQuantity);
+                holdInventoryOrThrow(reservation);
+            } else {
+                System.out.println("[STOCK] Deferring stock hold (prescription required, group): medicine="
+                        + normalizedMedicine + ", qty=" + requestedQuantity);
+            }
 
             reservations.add(reservationRepository.save(reservation));
         }
 
+        reservationWorkflowService.notifyPharmacyPendingReservations(reservations, pendingTimeoutMinutes);
         return reservations;
     }
 
@@ -211,13 +234,13 @@ public MedicineReservation createReservation(Long userId,
         }
 
         if (reservation.isPrescriptionRequired()) {
-            if (reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED) {
+            if (reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.UPLOAD_REQUIRED) {
                 throw new RuntimeException("Prescription upload is required before pharmacy review can begin.");
             }
-            if (reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_REJECTED) {
+            if (reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.REJECTED) {
                 throw new RuntimeException("Prescription was rejected for this reservation.");
             }
-            if (reservation.getPrescriptionReviewStatus() != PrescriptionReviewStatus.PRESCRIPTION_APPROVED) {
+            if (reservation.getPrescriptionReviewStatus() != PrescriptionReviewStatus.APPROVED) {
                 throw new RuntimeException("Prescription review is still pending for this reservation.");
             }
         }
@@ -228,11 +251,49 @@ public MedicineReservation createReservation(Long userId,
             holdInventoryOrThrow(reservation);
         }
 
-        reservation.setStatus(MedicineReservationStatus.APPROVED);
+        reservation.setStatus(MedicineReservationStatus.READY_FOR_PICKUP);
         reservation.setApprovedAt(LocalDateTime.now());
+        reservation.setPendingExpiresAt(null);
+        reservation.setFirstReminderSentAt(null);
+        reservation.setSecondReminderSentAt(null);
+        reservation.setSlaEscalatedAt(null);
         reservation.setExpiresAt(LocalDateTime.now().plusMinutes(APPROVED_HOLD_MINUTES));
 
         return reservationRepository.save(reservation);
+    }
+
+    @Override
+    public MedicineReservation approveReservationAndNotify(Long reservationId) {
+        MedicineReservation approved = approveReservation(reservationId);
+        notifyCustomerReservationApproved(approved);
+        return approved;
+    }
+
+    private void notifyCustomerReservationApproved(MedicineReservation reservation) {
+        if (reservation == null || reservation.getUserId() == null) {
+            return;
+        }
+
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("MMM d, yyyy h:mm a");
+        String holdUntil = reservation.getExpiresAt() == null
+                ? "N/A"
+                : reservation.getExpiresAt().format(formatter);
+
+        String medicineName = MedicineSearchNormalizer.toDisplayName(
+                reservation.getMedicineName(),
+                localizationService.getLanguage(reservation.getUserId())
+        );
+
+        telegramClient.sendMessage(
+                reservation.getUserId(),
+                localizationService.text(
+                        reservation.getUserId(),
+                        "reservation_approved_user",
+                        medicineName,
+                        reservation.getRequestedQuantity(),
+                        holdUntil
+                )
+        );
     }
 
     @Override
@@ -285,7 +346,8 @@ public MedicineReservation createReservation(Long userId,
             throw new RuntimeException("Reservation not found");
         }
 
-        if (reservation.getStatus() != MedicineReservationStatus.APPROVED) {
+        if (reservation.getStatus() != MedicineReservationStatus.APPROVED
+                && reservation.getStatus() != MedicineReservationStatus.READY_FOR_PICKUP) {
             throw new RuntimeException("Only approved reservations can be fulfilled.");
         }
 
@@ -357,7 +419,8 @@ public MedicineReservation createReservation(Long userId,
         MedicineReservation reservation = reservationRepository.findById(reservationId)
                 .orElseThrow(() -> new RuntimeException("Reservation not found"));
 
-        if (reservation.getStatus() != MedicineReservationStatus.APPROVED) {
+        if (reservation.getStatus() != MedicineReservationStatus.APPROVED
+                && reservation.getStatus() != MedicineReservationStatus.READY_FOR_PICKUP) {
             throw new RuntimeException("Only approved reservations can expire.");
         }
 
@@ -375,14 +438,65 @@ public MedicineReservation createReservation(Long userId,
             throw new RuntimeException("You are not allowed to cancel this reservation.");
         }
 
-        if (reservation.getStatus() != MedicineReservationStatus.PENDING
-                && reservation.getStatus() != MedicineReservationStatus.APPROVED) {
-            throw new RuntimeException("Only pending or approved reservations can be cancelled.");
+        MedicineReservationStatus status = reservation.getStatus();
+        if (status == MedicineReservationStatus.FULFILLED
+                || status == MedicineReservationStatus.REJECTED
+                || status == MedicineReservationStatus.EXPIRED
+                || status == MedicineReservationStatus.CANCELLED) {
+            throw new RuntimeException("This reservation cannot be cancelled (status: " + status.name() + ").");
+        }
+
+        if (status != MedicineReservationStatus.PENDING
+                && status != MedicineReservationStatus.APPROVED
+                && status != MedicineReservationStatus.READY_FOR_PICKUP) {
+            throw new RuntimeException("This reservation cannot be cancelled (status: " + status.name() + ").");
         }
 
         releaseHeldInventory(reservation);
         reservation.setStatus(MedicineReservationStatus.CANCELLED);
         return reservationRepository.save(reservation);
+    }
+
+    @Override
+    public MedicineReservation cancelReservationByPharmacy(Long reservationId, Long pharmacyTelegramId) {
+        MedicineReservation reservation = reservationRepository.findById(reservationId)
+                .orElseThrow(() -> new RuntimeException("Reservation not found"));
+
+        Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
+                .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+
+        if (!reservation.getPharmacyId().equals(pharmacy.getId())) {
+            throw new RuntimeException("This reservation does not belong to your pharmacy.");
+        }
+
+        MedicineReservationStatus status = reservation.getStatus();
+        if (status == MedicineReservationStatus.FULFILLED
+                || status == MedicineReservationStatus.CANCELLED
+                || status == MedicineReservationStatus.EXPIRED) {
+            throw new RuntimeException("This reservation cannot be cancelled (status: " + status.name() + ").");
+        }
+
+        releaseHeldInventory(reservation);
+        reservation.setStatus(MedicineReservationStatus.CANCELLED);
+        reservation.setQrToken(null);
+        MedicineReservation saved = reservationRepository.save(reservation);
+
+        // Notify user
+        if (saved.getUserId() != null && saved.getUserId() > 0) {
+            String medicineName = MedicineSearchNormalizer.toDisplayName(
+                    saved.getMedicineName(),
+                    localizationService.getLanguage(saved.getUserId()));
+            telegramClient.sendMessage(
+                    saved.getUserId(),
+                    "❌ Your reservation has been cancelled by the pharmacy.\n\n"
+                            + "🆔 ID: " + saved.getId() + "\n"
+                            + "💊 Medicine: " + medicineName + "\n"
+                            + "🔢 Qty: " + saved.getRequestedQuantity() + "\n"
+                            + "🏥 Pharmacy: " + pharmacy.getName()
+            );
+        }
+
+        return saved;
     }
 
     @Override
@@ -407,6 +521,24 @@ public List<MedicineReservation> getUserReservations(Long userId) {
 }
 
     @Override
+    public List<MedicineReservation> getPharmacyReservations(Long pharmacyTelegramId) {
+        Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
+                .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+        return reservationRepository.findByPharmacyIdOrderByCreatedAtDesc(pharmacy.getId());
+    }
+
+    @Override
+    public void assertPharmacyOwnsReservation(Long reservationId, Long pharmacyTelegramId) {
+        Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
+                .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+        MedicineReservation reservation = reservationRepository.findById(reservationId)
+                .orElseThrow(() -> new RuntimeException("Reservation not found"));
+        if (!pharmacy.getId().equals(reservation.getPharmacyId())) {
+            throw new RuntimeException("Reservation does not belong to this pharmacy");
+        }
+    }
+
+    @Override
     public String viewPendingReservations(Long pharmacyTelegramId) {
         Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
                 .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
@@ -426,9 +558,9 @@ public List<MedicineReservation> getUserReservations(Long userId) {
                 .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
 
         List<MedicineReservation> reservations =
-                reservationRepository.findByPharmacyIdAndStatus(
+                reservationRepository.findByPharmacyIdAndStatusIn(
                         pharmacy.getId(),
-                        MedicineReservationStatus.APPROVED
+                        List.of(MedicineReservationStatus.APPROVED, MedicineReservationStatus.READY_FOR_PICKUP)
                 );
 
         return buildPharmacyReservationList("✅ Approved Reservations", reservations);
@@ -440,9 +572,9 @@ public List<MedicineReservation> getUserReservations(Long userId) {
                 .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
 
         List<MedicineReservation> reservations =
-                reservationRepository.findByPharmacyIdAndStatus(
+                reservationRepository.findByPharmacyIdAndStatusIn(
                         pharmacy.getId(),
-                        MedicineReservationStatus.APPROVED
+                        List.of(MedicineReservationStatus.APPROVED, MedicineReservationStatus.READY_FOR_PICKUP)
                 );
 
         return buildPharmacyReservationList("📦 Ready to Fulfill", reservations);
@@ -473,19 +605,26 @@ public String viewReservationHistory(Long userId) {
     public String buildUserReservationStatusLabel(MedicineReservation reservation) {
         if (reservation.isPrescriptionRequired()
                 && reservation.getStatus() == MedicineReservationStatus.PENDING
-                && reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED) {
-            return "PENDING • PRESCRIPTION_UPLOAD_REQUIRED";
+                && reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.UPLOAD_REQUIRED) {
+            return "PENDING • UPLOAD_REQUIRED";
         }
 
         if (reservation.isPrescriptionRequired()
                 && reservation.getStatus() == MedicineReservationStatus.PENDING
-                && reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_PENDING) {
-            return "PENDING • PRESCRIPTION_PENDING";
+                && reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PENDING_REVIEW) {
+            return "PENDING • PENDING_REVIEW";
         }
 
         if (reservation.isPrescriptionRequired()
-                && reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_REJECTED) {
+                && reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.REJECTED) {
             return "REJECTED • PRESCRIPTION_REJECTED";
+        }
+
+        if (reservation.getStatus() == MedicineReservationStatus.READY_FOR_PICKUP) {
+            if (reservation.getExpiresAt() != null) {
+                return "READY_FOR_PICKUP • " + buildExpiryCountdown(reservation.getExpiresAt());
+            }
+            return "READY_FOR_PICKUP";
         }
 
         if (reservation.getStatus() == MedicineReservationStatus.APPROVED && reservation.getExpiresAt() != null) {
@@ -568,7 +707,8 @@ public String viewActiveReservations(Long chatId) {
             chatId,
             List.of(
                     MedicineReservationStatus.PENDING,
-                    MedicineReservationStatus.APPROVED
+                    MedicineReservationStatus.APPROVED,
+                    MedicineReservationStatus.READY_FOR_PICKUP
             )
     );
 
@@ -580,6 +720,7 @@ public String viewActiveReservations(Long chatId) {
 
     appendReservationSection(sb, chatId, "res_hist_section_pending", reservations, MedicineReservationStatus.PENDING);
     appendReservationSection(sb, chatId, "res_hist_section_approved", reservations, MedicineReservationStatus.APPROVED);
+    appendReservationSection(sb, chatId, "res_hist_section_approved", reservations, MedicineReservationStatus.READY_FOR_PICKUP);
 
     return sb.toString().trim();
 }
@@ -587,7 +728,8 @@ private void refreshExpiredReservationsForUser(Long userId) {
     List<MedicineReservation> reservations = reservationRepository.findByUserIdOrderByCreatedAtDesc(userId);
 
     for (MedicineReservation reservation : reservations) {
-        if (reservation.getStatus() == MedicineReservationStatus.APPROVED
+        if ((reservation.getStatus() == MedicineReservationStatus.APPROVED
+                || reservation.getStatus() == MedicineReservationStatus.READY_FOR_PICKUP)
                 && reservation.getExpiresAt() != null
                 && !reservation.getExpiresAt().isAfter(LocalDateTime.now())) {
             try {
@@ -639,13 +781,16 @@ private String localizedStatusLabel(Long userId, MedicineReservation r) {
     String statusKey = switch (r.getStatus()) {
         case PENDING -> "res_status_pending";
         case APPROVED -> "res_status_approved";
+        case READY_FOR_PICKUP -> "res_status_approved";
         case FULFILLED -> "res_status_fulfilled";
         case CANCELLED -> "res_status_cancelled";
         case EXPIRED -> "res_status_expired";
         case REJECTED -> "res_status_rejected";
     };
     String base = localizationService.text(userId, statusKey);
-    if (r.getStatus() == MedicineReservationStatus.APPROVED && r.getExpiresAt() != null) {
+    if ((r.getStatus() == MedicineReservationStatus.APPROVED
+            || r.getStatus() == MedicineReservationStatus.READY_FOR_PICKUP)
+            && r.getExpiresAt() != null) {
         return base + " • " + buildExpiryCountdown(r.getExpiresAt());
     }
     if (r.getStatus() == MedicineReservationStatus.EXPIRED && r.getExpiresAt() != null) {
@@ -667,11 +812,25 @@ public List<MedicineReservation> getPendingReservations(Long pharmacyTelegramId)
 }
 
 @Override
+public List<MedicineReservation> getPrescriptionReservations(Long pharmacyTelegramId) {
+    Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
+            .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+
+    return reservationRepository.findByPharmacyIdAndStatus(pharmacy.getId(), MedicineReservationStatus.PENDING)
+            .stream()
+            .filter(MedicineReservation::isPrescriptionRequired)
+            .sorted((a, b) -> b.getCreatedAt().compareTo(a.getCreatedAt()))
+            .toList();
+}
+
+@Override
 public List<MedicineReservation> getApprovedReservations(Long pharmacyTelegramId) {
     Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
             .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
 
-    return reservationRepository.findByPharmacyIdAndStatus(pharmacy.getId(), MedicineReservationStatus.APPROVED)
+    return reservationRepository.findByPharmacyIdAndStatusIn(
+                    pharmacy.getId(),
+                    List.of(MedicineReservationStatus.APPROVED, MedicineReservationStatus.READY_FOR_PICKUP))
             .stream()
             .filter(r -> r.getExpiresAt() == null || r.getExpiresAt().isAfter(LocalDateTime.now()))
             .sorted((a, b) -> b.getCreatedAt().compareTo(a.getCreatedAt()))
@@ -717,19 +876,21 @@ private MedicineReservation validateReservationForPharmacyFulfillment(MedicineRe
     }
 
     if (reservation.isPrescriptionRequired()
-            && reservation.getPrescriptionReviewStatus() != PrescriptionReviewStatus.PRESCRIPTION_APPROVED
+            && reservation.getPrescriptionReviewStatus() != PrescriptionReviewStatus.APPROVED
             && reservation.getStatus() == MedicineReservationStatus.PENDING) {
         return reservation;
     }
 
-    if (reservation.getStatus() == MedicineReservationStatus.APPROVED
+    if ((reservation.getStatus() == MedicineReservationStatus.APPROVED
+            || reservation.getStatus() == MedicineReservationStatus.READY_FOR_PICKUP)
             && reservation.getExpiresAt() != null
             && !reservation.getExpiresAt().isAfter(now)) {
         expireReservation(reservation.getId());
         throw new RuntimeException("Reservation is expired.");
     }
 
-    if (reservation.getStatus() != MedicineReservationStatus.APPROVED) {
+    if (reservation.getStatus() != MedicineReservationStatus.APPROVED
+            && reservation.getStatus() != MedicineReservationStatus.READY_FOR_PICKUP) {
         throw new RuntimeException("Only approved reservations can be fulfilled.");
     }
 
@@ -737,9 +898,31 @@ private MedicineReservation validateReservationForPharmacyFulfillment(MedicineRe
 }
 
 private boolean isVisibleInPharmacyPendingQueue(MedicineReservation reservation) {
-    return reservation == null
-            || !reservation.isPrescriptionRequired()
-            || reservation.getPrescriptionReviewStatus() != PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED;
+    // Prescription-required reservations stay in the prescription review queue until the
+    // prescription itself is approved. After that they should appear in Pending Reservations
+    // so the pharmacy can approve/reject the reservation normally.
+    if (reservation.isPrescriptionRequired()) {
+    boolean visibleInPending = reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.APPROVED;
+    System.out.println("[QUEUE] reservationId=" + reservation.getId()
+        + ", prescriptionRequired=true, prescriptionReviewStatus=" + reservation.getPrescriptionReviewStatus()
+        + ", queue=" + (visibleInPending ? "pending_reservations" : "prescription_review"));
+    return visibleInPending;
+    }
+    System.out.println("[QUEUE] reservationId=" + reservation.getId()
+            + ", prescriptionRequired=false, queue=pending_reservations");
+    return true;
 }
+
+    @Override
+    public void holdInventoryForApprovedPrescription(MedicineReservation reservation) {
+        if (reservation == null) {
+            return;
+        }
+        System.out.println("[STOCK] Holding stock on prescription approval: reservationId="
+                + reservation.getId() + ", medicine=" + reservation.getMedicineName()
+                + ", qty=" + reservation.getRequestedQuantity());
+        holdInventoryOrThrow(reservation);
+        reservationRepository.save(reservation);
+    }
 
 }

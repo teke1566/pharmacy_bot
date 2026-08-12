@@ -1,5 +1,6 @@
 package com.tenahub.bot.service.impl;
 
+import com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO;
 import com.tenahub.bot.entity.*;
 import com.tenahub.bot.repository.*;
 import com.tenahub.bot.service.InventoryService;
@@ -787,4 +788,176 @@ public void initializeInventoryFromMedicines(Long pharmacyId, String medicines) 
         }
     }
 }
+
+    // ── Pharmacy Mini App Inventory ──────────────────────────────────────
+
+    @Override
+    public List<PharmacyMiniAppInventoryItemDTO> getPharmacyMiniAppInventory(Long pharmacyTelegramId) {
+        Pharmacy pharmacy = resolvePharmacy(pharmacyTelegramId);
+        List<PharmacyInventory> items = inventoryRepository.findByPharmacyId(pharmacy.getId());
+        items.sort(Comparator.comparing(PharmacyInventory::getMedicineName, String.CASE_INSENSITIVE_ORDER));
+        return items.stream().map(this::toMiniAppDTO).toList();
+    }
+
+    @Override
+    public PharmacyMiniAppInventoryItemDTO updateStockFromMiniApp(Long pharmacyTelegramId, Long itemId, Integer quantity) {
+        Pharmacy pharmacy = resolvePharmacy(pharmacyTelegramId);
+        PharmacyInventory item = resolveOwnedItem(pharmacy, itemId);
+
+        Integer oldQty = item.getQuantity();
+        item.setQuantity(quantity);
+        item.setOutOfStock(quantity == null || quantity <= 0);
+        item.setUpdatedAt(LocalDateTime.now());
+
+        inventoryRepository.save(item);
+        recordHistory(pharmacy.getId(), item.getMedicineName(), oldQty, quantity, InventoryEventType.MINIAPP_UPDATED);
+        return toMiniAppDTO(item);
+    }
+
+    @Override
+    public PharmacyMiniAppInventoryItemDTO updatePriceFromMiniApp(Long pharmacyTelegramId, Long itemId, BigDecimal price) {
+        Pharmacy pharmacy = resolvePharmacy(pharmacyTelegramId);
+        PharmacyInventory item = resolveOwnedItem(pharmacy, itemId);
+
+        item.setPrice(price);
+        if (item.getCurrency() == null || item.getCurrency().isBlank()) {
+            item.setCurrency("ETB");
+        }
+        item.setUpdatedAt(LocalDateTime.now());
+
+        inventoryRepository.save(item);
+        recordHistory(pharmacy.getId(), item.getMedicineName(), item.getQuantity(), item.getQuantity(), InventoryEventType.MINIAPP_UPDATED);
+        return toMiniAppDTO(item);
+    }
+
+    @Override
+    public PharmacyMiniAppInventoryItemDTO togglePrescriptionFromMiniApp(Long pharmacyTelegramId, Long itemId, boolean requiresPrescription) {
+        Pharmacy pharmacy = resolvePharmacy(pharmacyTelegramId);
+        PharmacyInventory item = resolveOwnedItem(pharmacy, itemId);
+
+        item.setRequiresPrescription(requiresPrescription);
+        item.setUpdatedAt(LocalDateTime.now());
+
+        inventoryRepository.save(item);
+        return toMiniAppDTO(item);
+    }
+
+    @Override
+    public PharmacyMiniAppInventoryItemDTO toggleAvailabilityFromMiniApp(Long pharmacyTelegramId, Long itemId, boolean available) {
+        Pharmacy pharmacy = resolvePharmacy(pharmacyTelegramId);
+        PharmacyInventory item = resolveOwnedItem(pharmacy, itemId);
+
+        Integer oldQty = item.getQuantity();
+        if (!available) {
+            item.setOutOfStock(true);
+            item.setQuantity(0);
+        } else {
+            item.setOutOfStock(false);
+            if (item.getQuantity() == null || item.getQuantity() <= 0) {
+                item.setQuantity(1);
+            }
+        }
+        item.setUpdatedAt(LocalDateTime.now());
+
+        inventoryRepository.save(item);
+        recordHistory(pharmacy.getId(), item.getMedicineName(), oldQty, item.getQuantity(),
+                available ? InventoryEventType.STOCK_UPDATED : InventoryEventType.MARKED_OUT);
+        return toMiniAppDTO(item);
+    }
+
+    private Pharmacy resolvePharmacy(Long pharmacyTelegramId) {
+        if (pharmacyTelegramId == null || pharmacyTelegramId <= 0) {
+            throw new RuntimeException("pharmacyTelegramId is required");
+        }
+        return pharmacyRepository.findByTelegramId(pharmacyTelegramId)
+                .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+    }
+
+    @Override
+    public PharmacyMiniAppInventoryItemDTO addStockFromMiniApp(Long pharmacyTelegramId, String medicineName, Integer quantity, BigDecimal price, Integer lowStockThreshold) {
+        Pharmacy pharmacy = resolvePharmacy(pharmacyTelegramId);
+
+        if (medicineName == null || medicineName.isBlank()) {
+            throw new RuntimeException("medicineName is required");
+        }
+
+        String normalized = medicineName.trim().toLowerCase();
+
+        PharmacyInventory item = inventoryRepository
+                .findByPharmacyIdAndMedicineNameIgnoreCase(pharmacy.getId(), normalized)
+                .orElse(PharmacyInventory.builder()
+                        .pharmacyId(pharmacy.getId())
+                        .medicineName(normalized)
+                        .quantity(0)
+                        .outOfStock(false)
+                        .lowStockAlertSent(false)
+                        .build());
+
+        Integer oldQty = item.getQuantity();
+        if (quantity != null) {
+            item.setQuantity(quantity);
+            item.setOutOfStock(quantity <= 0);
+        }
+        if (price != null) {
+            item.setPrice(price);
+        }
+        if (item.getCurrency() == null || item.getCurrency().isBlank()) {
+            item.setCurrency("ETB");
+        }
+        if (lowStockThreshold != null) {
+            item.setLowStockThreshold(lowStockThreshold);
+        }
+        item.setUpdatedAt(LocalDateTime.now());
+
+        inventoryRepository.save(item);
+        recordHistory(pharmacy.getId(), item.getMedicineName(), oldQty, item.getQuantity(), InventoryEventType.MINIAPP_UPDATED);
+        return toMiniAppDTO(item);
+    }
+
+    private PharmacyInventory resolveOwnedItem(Pharmacy pharmacy, Long itemId) {
+        if (itemId == null) {
+            throw new RuntimeException("itemId is required");
+        }
+        PharmacyInventory item = inventoryRepository.findById(itemId)
+                .orElseThrow(() -> new RuntimeException("Inventory item not found"));
+        if (!item.getPharmacyId().equals(pharmacy.getId())) {
+            throw new RuntimeException("This inventory item does not belong to your pharmacy.");
+        }
+        return item;
+    }
+
+    private void recordHistory(Long pharmacyId, String medicineName, Integer oldQty, Integer newQty, InventoryEventType eventType) {
+        historyRepository.save(
+                InventoryHistory.builder()
+                        .pharmacyId(pharmacyId)
+                        .medicineName(medicineName)
+                        .oldQuantity(oldQty)
+                        .newQuantity(newQty)
+                        .eventType(eventType)
+                        .createdAt(LocalDateTime.now())
+                        .build()
+        );
+    }
+
+    private PharmacyMiniAppInventoryItemDTO toMiniAppDTO(PharmacyInventory item) {
+        int qty = item.getQuantity() == null ? 0 : item.getQuantity();
+        int threshold = item.getLowStockThreshold() == null ? 10 : item.getLowStockThreshold();
+        boolean inStock = !item.isOutOfStock() && qty > 0;
+        boolean lowStock = inStock && qty <= threshold;
+
+        return PharmacyMiniAppInventoryItemDTO.builder()
+                .itemId(item.getId())
+                .medicineId(item.getId())
+                .medicineName(item.getMedicineName())
+                .stockQuantity(qty)
+                .price(item.getPrice())
+                .currency(item.getCurrency())
+                .requiresPrescription(item.isRequiresPrescription())
+                .inStock(inStock)
+                .outOfStock(item.isOutOfStock() || qty <= 0)
+                .lowStock(lowStock)
+                .lowStockThreshold(threshold)
+                .lastUpdatedAt(item.getUpdatedAt())
+                .build();
+    }
 }

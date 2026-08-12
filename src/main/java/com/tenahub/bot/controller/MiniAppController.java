@@ -29,8 +29,12 @@ import com.tenahub.bot.dto.MiniAppReservationCreateRequestDTO;
 import com.tenahub.bot.dto.MiniAppReservationResponseDTO;
 import com.tenahub.bot.dto.PrescriptionStatusResponseDTO;
 import com.tenahub.bot.dto.PharmacyResponseDTO;
+import com.tenahub.bot.service.MiniAppActorResolver;
+import com.tenahub.bot.service.MiniAppAuthException;
 import com.tenahub.bot.service.MiniAppService;
 import com.tenahub.bot.service.PrescriptionReviewService;
+import com.tenahub.bot.service.TelegramWebAppAuthService;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
@@ -54,6 +58,20 @@ public class MiniAppController {
     @Autowired
     private PrescriptionReviewService prescriptionReviewService;
 
+    @Autowired
+    private TelegramWebAppAuthService telegramWebAppAuthService;
+
+    @Autowired
+    private MiniAppActorResolver miniAppActorResolver;
+
+    private Long requireVerifiedTelegramUserId(String... initDataCandidates) {
+        return telegramWebAppAuthService.requireUserId(
+                Stream.concat(
+                                Stream.of(initDataCandidates),
+                                Stream.of(miniAppActorResolver.currentInitData()))
+                        .toArray(String[]::new));
+    }
+
     @GetMapping("/ping")
     public ResponseEntity<String> ping() {
         return ResponseEntity.ok("pong");
@@ -64,6 +82,8 @@ public class MiniAppController {
         try {
             MiniAppOperationResponseDTO response = miniAppService.sendVerificationCode(request);
             return ResponseEntity.ok(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body("Error sending verification code: " + e.getMessage());
@@ -78,6 +98,8 @@ public class MiniAppController {
         try {
             MiniAppAuthVerifyCodeResponseDTO response = miniAppService.verifyCode(request);
             return ResponseEntity.ok(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body("Error verifying code: " + e.getMessage());
@@ -107,6 +129,8 @@ public class MiniAppController {
                     firstNonBlank(sort, sortBy),
                     firstNonBlank(filter, filterBy));
             return ResponseEntity.ok(result);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body("Error searching pharmacies: " + e.getMessage());
@@ -121,6 +145,8 @@ public class MiniAppController {
         try {
             MiniAppPharmacyDetailDTO result = miniAppService.getPharmacyDetails(pharmacyId);
             return ResponseEntity.ok(result);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             if (e.getMessage() != null && e.getMessage().contains("not found")) {
                 return ResponseEntity.notFound().build();
@@ -134,8 +160,10 @@ public class MiniAppController {
     }
 
     @PostMapping("/reservations")
-    public ResponseEntity<?> createReservation(@RequestBody MiniAppReservationCreateRequestDTO request) {
+    public ResponseEntity<?> createReservation(@RequestBody MiniAppReservationCreateRequestDTO request,
+                                               @RequestHeader(value = MiniAppActorResolver.INIT_DATA_HEADER, required = false) String initDataHeader) {
         try {
+            applyInitData(request, initDataHeader);
             log.info("MiniApp reservation request body: {}", request);
             log.info("MiniApp reservation request received: pharmacyId={}, userId={}, medicineName={}",
                     request == null ? null : request.getPharmacyId(),
@@ -143,6 +171,8 @@ public class MiniAppController {
                     request == null ? null : request.getMedicineName());
             MiniAppReservationResponseDTO created = miniAppService.createReservation(request);
             return ResponseEntity.status(HttpStatus.CREATED).body(created);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body("Error creating reservation: " + e.getMessage());
@@ -153,10 +183,14 @@ public class MiniAppController {
     }
 
     @PostMapping("/reservations/confirm")
-    public ResponseEntity<?> confirmReservation(@RequestBody MiniAppReservationConfirmRequestDTO request) {
+    public ResponseEntity<?> confirmReservation(@RequestBody MiniAppReservationConfirmRequestDTO request,
+                                                @RequestHeader(value = MiniAppActorResolver.INIT_DATA_HEADER, required = false) String initDataHeader) {
         try {
+            applyInitData(request, initDataHeader);
             MiniAppReservationConfirmResponseDTO response = miniAppService.confirmReservation(request);
             return ResponseEntity.ok(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body("Error confirming reservation: " + e.getMessage());
@@ -179,6 +213,8 @@ public class MiniAppController {
 
             MiniAppReservationPreloadResponseDTO response = miniAppService.getReservationPreload(pharmacyId, requestedMedicineIds);
             return ResponseEntity.ok(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body("Error resolving reservation preload: " + e.getMessage());
@@ -189,24 +225,74 @@ public class MiniAppController {
     }
 
     @GetMapping("/reservations/active")
-    public ResponseEntity<?> getActiveReservations(@RequestParam(required = false) Long telegramUserId) {
+    public ResponseEntity<?> getActiveReservations(@RequestParam(required = false) Long telegramUserId,
+                                                   @RequestParam(required = false) String telegramInitData,
+                                                   @RequestParam(required = false) String initData,
+                                                   @RequestHeader(value = MiniAppActorResolver.INIT_DATA_HEADER, required = false) String initDataHeader) {
         try {
-            List<MiniAppReservationCardDTO> response = miniAppService.getActiveReservations(telegramUserId);
+            Long resolvedUserId = requireVerifiedTelegramUserId(initDataHeader, telegramInitData, initData);
+            log.info("[API] /reservations/active called, telegramUserId={}", resolvedUserId);
+            List<MiniAppReservationCardDTO> response = miniAppService.getActiveReservations(resolvedUserId);
+            log.info("[API] /reservations/active result count={}", response != null ? response.size() : 0);
+            if (response != null) {
+                for (MiniAppReservationCardDTO card : response) {
+                    log.info("[API] ActiveReservation: reservationId={}, groupId={}, reservationStatus={}, prescriptionStatus={}, canShowQr={}, userFacingStage={}, expiresAt={}, readyForPickup={}, showQrCode={}",
+                        card.getReservationId(), card.getReservationGroupId(), card.getReservationStatus(), card.getPrescriptionStatus(), card.isCanShowQr(), card.getUserFacingStage(), card.getExpiresAt(), card.isReadyForPickup(), card.isShowQrCode());
+                }
+            }
             return ResponseEntity.ok(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
+            log.warn("[API] /reservations/active RuntimeException: {}", e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body("Error fetching active reservations: " + e.getMessage());
         } catch (Exception e) {
+            log.error("[API] /reservations/active Unexpected error: {}", e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body("Unexpected error: " + e.getMessage());
         }
     }
 
-    @GetMapping("/reservations/history")
-    public ResponseEntity<?> getReservationHistory(@RequestParam(required = false) Long telegramUserId) {
+    @PostMapping("/reservations/{reservationId}/cancel")
+    public ResponseEntity<?> cancelReservation(@PathVariable Long reservationId,
+                                               @RequestParam(required = false) Long telegramUserId,
+                                               @RequestParam(required = false) String telegramInitData,
+                                               @RequestParam(required = false) String initData,
+                                               @RequestHeader(value = MiniAppActorResolver.INIT_DATA_HEADER, required = false) String initDataHeader) {
         try {
-            List<MiniAppReservationCardDTO> response = miniAppService.getReservationHistory(telegramUserId);
+            Long resolvedUserId = requireVerifiedTelegramUserId(initDataHeader, telegramInitData, initData);
+            if (telegramUserId != null && telegramUserId > 0 && !telegramUserId.equals(resolvedUserId)) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                        .body(MiniAppOperationResponseDTO.builder().success(false).message("Telegram identity does not match telegramUserId").build());
+            }
+            log.info("[API] /reservations/{}/cancel called, telegramUserId={}", reservationId, resolvedUserId);
+            MiniAppOperationResponseDTO response = miniAppService.cancelReservation(reservationId, resolvedUserId);
             return ResponseEntity.ok(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            log.warn("[API] /reservations/{}/cancel rejected: {}", reservationId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(MiniAppOperationResponseDTO.builder().success(false).message(e.getMessage()).build());
+        } catch (Exception e) {
+            log.error("[API] /reservations/{}/cancel error: {}", reservationId, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(MiniAppOperationResponseDTO.builder().success(false).message("Unexpected error").build());
+        }
+    }
+
+    @GetMapping("/reservations/history")
+    public ResponseEntity<?> getReservationHistory(@RequestParam(required = false) Long telegramUserId,
+                                                   @RequestParam(required = false) String telegramInitData,
+                                                   @RequestParam(required = false) String initData,
+                                                   @RequestHeader(value = MiniAppActorResolver.INIT_DATA_HEADER, required = false) String initDataHeader) {
+        try {
+            Long resolvedUserId = requireVerifiedTelegramUserId(initDataHeader, telegramInitData, initData);
+            List<MiniAppReservationCardDTO> response = miniAppService.getReservationHistory(resolvedUserId);
+            return ResponseEntity.ok(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body("Error fetching reservation history: " + e.getMessage());
@@ -216,22 +302,83 @@ public class MiniAppController {
         }
     }
 
+    @PostMapping("/reservations/{reservationId}/hide-history")
+    public ResponseEntity<?> hideReservationFromHistory(@PathVariable Long reservationId,
+                                                        @RequestParam(required = false) Long telegramUserId,
+                                                        @RequestParam(required = false) String telegramInitData,
+                                                        @RequestParam(required = false) String initData,
+                                                        @RequestHeader(value = MiniAppActorResolver.INIT_DATA_HEADER, required = false) String initDataHeader) {
+        try {
+            Long resolvedUserId = requireVerifiedTelegramUserId(initDataHeader, telegramInitData, initData);
+            if (telegramUserId != null && telegramUserId > 0 && !telegramUserId.equals(resolvedUserId)) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                        .body(MiniAppOperationResponseDTO.builder().success(false).message("Telegram identity does not match telegramUserId").build());
+            }
+            MiniAppOperationResponseDTO response = miniAppService.hideReservationFromHistory(reservationId, resolvedUserId);
+            return ResponseEntity.ok(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            log.warn("[API] /reservations/{}/hide-history rejected: {}", reservationId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(MiniAppOperationResponseDTO.builder().success(false).message(e.getMessage()).build());
+        } catch (Exception e) {
+            log.error("[API] /reservations/{}/hide-history error: {}", reservationId, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(MiniAppOperationResponseDTO.builder().success(false).message("Unexpected error").build());
+        }
+    }
+
+    @PostMapping("/reservations/history/clear")
+    public ResponseEntity<?> clearReservationHistory(@RequestParam(required = false) Long telegramUserId,
+                                                     @RequestParam(required = false) String telegramInitData,
+                                                     @RequestParam(required = false) String initData,
+                                                     @RequestHeader(value = MiniAppActorResolver.INIT_DATA_HEADER, required = false) String initDataHeader) {
+        try {
+            Long resolvedUserId = requireVerifiedTelegramUserId(initDataHeader, telegramInitData, initData);
+            if (telegramUserId != null && telegramUserId > 0 && !telegramUserId.equals(resolvedUserId)) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                        .body(MiniAppOperationResponseDTO.builder().success(false).message("Telegram identity does not match telegramUserId").build());
+            }
+            MiniAppOperationResponseDTO response = miniAppService.clearReservationHistory(resolvedUserId);
+            return ResponseEntity.ok(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            log.warn("[API] /reservations/history/clear rejected: {}", e.getMessage());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(MiniAppOperationResponseDTO.builder().success(false).message(e.getMessage()).build());
+        } catch (Exception e) {
+            log.error("[API] /reservations/history/clear error: {}", e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(MiniAppOperationResponseDTO.builder().success(false).message("Unexpected error").build());
+        }
+    }
+
     @PostMapping(value = "/reservations/prescriptions", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<?> uploadPrescriptionFiles(@RequestParam(required = false) Long reservationId,
                                                      @RequestParam(required = false) String reservationGroupId,
                                                      @RequestParam(required = false) Long telegramUserId,
                                                      @RequestParam(required = false) Long pharmacyId,
                                                      @RequestParam(required = false) Long medicineId,
+                                                     @RequestParam(required = false) String note,
+                                                     @RequestParam(required = false) String telegramInitData,
+                                                     @RequestParam(required = false) String initData,
+                                                     @RequestHeader(value = MiniAppActorResolver.INIT_DATA_HEADER, required = false) String initDataHeader,
                                                      @RequestParam("files") List<MultipartFile> files) {
         try {
+            Long resolvedUserId = requireVerifiedTelegramUserId(initDataHeader, telegramInitData, initData);
             PrescriptionStatusResponseDTO response = prescriptionReviewService.uploadPrescriptionFiles(
                     reservationId,
                     reservationGroupId,
-                    telegramUserId,
+                    resolvedUserId,
                     pharmacyId,
                     medicineId,
+                    note,
                     files);
             return ResponseEntity.status(HttpStatus.CREATED).body(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body("Error uploading prescription files: " + e.getMessage());
@@ -244,17 +391,31 @@ public class MiniAppController {
     @GetMapping("/reservations/prescription-status")
     public ResponseEntity<?> getPrescriptionStatus(@RequestParam(required = false) Long reservationId,
                                                    @RequestParam(required = false) String reservationGroupId,
-                                                   @RequestParam(required = false) Long telegramUserId) {
+                                                   @RequestParam(required = false) Long telegramUserId,
+                                                   @RequestHeader(value = MiniAppActorResolver.INIT_DATA_HEADER, required = false) String initDataHeader) {
         try {
+            Long resolvedUserId = requireVerifiedTelegramUserId(initDataHeader);
+            log.info("[API] /reservations/prescription-status called, reservationId={}, groupId={}, telegramUserId={}",
+                    reservationId, reservationGroupId, resolvedUserId);
             PrescriptionStatusResponseDTO response = prescriptionReviewService.getPrescriptionStatus(
                     reservationId,
                     reservationGroupId,
-                    telegramUserId);
+                    resolvedUserId);
+            log.info("[API] /reservations/prescription-status result: reservationId={}, groupId={}, reservationStatus={}, reviewStatus={}, canShowQr={}, userFacingStage={}, pharmacyName={}, medicineName={}, qty={}, expiresAt={}",
+                    response.getReservationId(), response.getReservationGroupId(),
+                    response.getReservationStatus(), response.getReviewStatus(),
+                    response.isCanShowQr(), response.getUserFacingStage(),
+                    response.getPharmacyName(), response.getMedicineName(),
+                    response.getQuantity(), response.getExpiresAt());
             return ResponseEntity.ok(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
+            log.warn("[API] /reservations/prescription-status RuntimeException: {}", e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body("Error fetching prescription status: " + e.getMessage());
         } catch (Exception e) {
+            log.error("[API] /reservations/prescription-status Unexpected error: {}", e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body("Unexpected error: " + e.getMessage());
         }
@@ -276,6 +437,8 @@ public class MiniAppController {
         try {
             MiniAppPharmacyPhotosDTO result = miniAppService.getPharmacyPhotos(pharmacyId);
             return ResponseEntity.ok(result);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             // Assume RuntimeException with "not found" message means 404
             if (e.getMessage() != null && e.getMessage().contains("not found")) {
@@ -310,6 +473,8 @@ public class MiniAppController {
             return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_OCTET_STREAM)
                 .body(imageData);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             String message = e.getMessage() != null ? e.getMessage() : "";
             // Pharmacy or photo not found
@@ -335,6 +500,8 @@ public class MiniAppController {
         try {
             MiniAppMedicinePhotosDTO result = miniAppService.getMedicinePhotos(medicineId);
             return ResponseEntity.ok(result);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             if (e.getMessage() != null && e.getMessage().contains("not found")) {
                 return ResponseEntity.notFound().build();
@@ -354,6 +521,8 @@ public class MiniAppController {
             return ResponseEntity.ok()
                     .contentType(MediaType.APPLICATION_OCTET_STREAM)
                     .body(imageData);
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             String message = e.getMessage() != null ? e.getMessage() : "";
             if (message.contains("not found")) {
@@ -376,6 +545,8 @@ public class MiniAppController {
         try {
             Long medicineId = miniAppService.resolveMedicineId(pharmacyId, medicineName);
             return ResponseEntity.ok(java.util.Map.of("medicineId", medicineId));
+        } catch (MiniAppAuthException e) {
+            throw e;
         } catch (RuntimeException e) {
             if (e.getMessage() != null && e.getMessage().contains("not found")) {
                 return ResponseEntity.notFound().build();
@@ -385,6 +556,28 @@ public class MiniAppController {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body("Unexpected error: " + e.getMessage());
         }
+    }
+
+    private void applyInitData(MiniAppReservationCreateRequestDTO request, String initDataHeader) {
+        if (request == null) {
+            return;
+        }
+        if (isBlank(request.getTelegramInitData()) && isBlank(request.getInitData()) && !isBlank(initDataHeader)) {
+            request.setTelegramInitData(initDataHeader);
+        }
+    }
+
+    private void applyInitData(MiniAppReservationConfirmRequestDTO request, String initDataHeader) {
+        if (request == null) {
+            return;
+        }
+        if (isBlank(request.getTelegramInitData()) && isBlank(request.getInitData()) && !isBlank(initDataHeader)) {
+            request.setTelegramInitData(initDataHeader);
+        }
+    }
+
+    private boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     private List<Long> parseMedicineIds(String medicineIds) {

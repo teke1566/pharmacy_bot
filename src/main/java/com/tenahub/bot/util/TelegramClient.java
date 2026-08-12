@@ -19,6 +19,7 @@ import org.springframework.http.*;
 import org.springframework.stereotype.Component;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.HttpStatusCodeException;
 import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
@@ -68,6 +69,42 @@ public class TelegramClient {
 
     @Value("${tenahub.mini-app.pharmacy-pickup-page-path:/#/pickup-scanner?pharmacyTelegramId={pharmacyTelegramId}}")
     private String miniAppPharmacyPickupPagePath;
+
+    @Value("${tenahub.mini-app.pharmacy-inventory-page-path:/#/pharmacy-inventory?pharmacyTelegramId={pharmacyTelegramId}}")
+    private String miniAppPharmacyInventoryPagePath;
+
+    @Value("${tenahub.mini-app.pharmacy-reservations-page-path:/#/pharmacy-reservations?pharmacyTelegramId={pharmacyTelegramId}}")
+    private String miniAppPharmacyReservationsPagePath;
+
+    @Value("${tenahub.mini-app.pharmacy-prescriptions-page-path:/#/pharmacy-prescriptions?pharmacyTelegramId={pharmacyTelegramId}}")
+    private String miniAppPharmacyPrescriptionsPagePath;
+
+    @Value("${tenahub.mini-app.pharmacy-performance-page-path:/#/pharmacy-performance?pharmacyTelegramId={pharmacyTelegramId}}")
+    private String miniAppPharmacyPerformancePagePath;
+
+    @Value("${tenahub.mini-app.pharmacy-profile-page-path:/#/pharmacy-profile?pharmacyTelegramId={pharmacyTelegramId}}")
+    private String miniAppPharmacyProfilePagePath;
+
+    @Value("${tenahub.mini-app.admin-dashboard-page-path:/#/admin?adminTelegramId={adminTelegramId}}")
+    private String miniAppAdminDashboardPagePath;
+
+    @Value("${tenahub.mini-app.admin-pharmacies-page-path:/#/admin/pharmacies?adminTelegramId={adminTelegramId}}")
+    private String miniAppAdminPharmaciesPagePath;
+
+    @Value("${tenahub.mini-app.admin-reservations-page-path:/#/admin/reservations?adminTelegramId={adminTelegramId}}")
+    private String miniAppAdminReservationsPagePath;
+
+    @Value("${tenahub.mini-app.admin-audit-page-path:/#/admin/audit?adminTelegramId={adminTelegramId}}")
+    private String miniAppAdminAuditPagePath;
+
+    @Value("${tenahub.mini-app.admin-compliance-page-path:/#/admin/compliance?adminTelegramId={adminTelegramId}}")
+    private String miniAppAdminCompliancePagePath;
+
+    @Value("${tenahub.mini-app.admin-feedback-page-path:/#/admin/feedback?adminTelegramId={adminTelegramId}}")
+    private String miniAppAdminFeedbackPagePath;
+
+    @Value("${tenahub.mini-app.admin-system-page-path:/#/admin/system?adminTelegramId={adminTelegramId}}")
+    private String miniAppAdminSystemPagePath;
 
     private String apiUrl;
 
@@ -210,12 +247,19 @@ public class TelegramClient {
     }
 
     public String buildMiniAppSearchUrl() {
+        return buildMiniAppSearchUrl(null);
+    }
+
+    public String buildMiniAppSearchUrl(String section) {
         String normalizedBase = miniAppBaseUrl == null ? "" : miniAppBaseUrl.trim();
         if (normalizedBase.endsWith("/")) {
             normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 1);
         }
 
         String resolvedPath = "/#/search";
+        if (section != null && !section.isBlank()) {
+            resolvedPath = resolvedPath + "?section=" + section.trim();
+        }
 
         if (normalizedBase.contains("t.me/")) {
             String appStatePayload = resolvedPath.startsWith("/") ? resolvedPath.substring(1) : resolvedPath;
@@ -225,6 +269,279 @@ public class TelegramClient {
         }
 
         return normalizedBase + resolvedPath;
+    }
+
+    /**
+     * Overflow after a capped reservation card dump: optional "Show 5 more" + Mini App button.
+     */
+    public void sendReservationListOverflow(Long chatId,
+                                            String text,
+                                            String showMoreCallbackData,
+                                            String miniAppUrl,
+                                            String miniAppButtonLabel) {
+        if (chatId == null || text == null || text.isBlank()) {
+            return;
+        }
+
+        try {
+            String url = apiUrl + "/sendMessage";
+            Map<String, Object> body = new HashMap<>();
+            body.put("chat_id", chatId);
+            body.put("text", text);
+            body.put("parse_mode", "HTML");
+
+            List<Map<String, Object>> row = new ArrayList<>();
+            if (showMoreCallbackData != null && !showMoreCallbackData.isBlank()) {
+                row.add(Map.of(
+                        "text", "Show 5 more",
+                        "callback_data", showMoreCallbackData
+                ));
+            }
+
+            if (miniAppUrl != null && !miniAppUrl.isBlank()) {
+                String label = miniAppButtonLabel == null || miniAppButtonLabel.isBlank()
+                        ? "Open Mini App"
+                        : miniAppButtonLabel;
+                if (canUseWebAppButton(miniAppUrl)) {
+                    row.add(Map.of("text", label, "web_app", Map.of("url", miniAppUrl)));
+                } else if (isValidHttpUrl(miniAppUrl) || miniAppUrl.contains("t.me/")) {
+                    row.add(Map.of("text", label, "url", miniAppUrl));
+                }
+            }
+
+            if (!row.isEmpty()) {
+                body.put("reply_markup", Map.of("inline_keyboard", List.of(row)));
+            }
+
+            restTemplate.postForObject(url, body, String.class);
+        } catch (Exception e) {
+            log.warn("sendReservationListOverflow error: chatId={}, error={}", chatId, e.getMessage());
+        }
+    }
+
+    public String buildMiniAppPharmacyInventoryUrl(Long pharmacyTelegramId) {
+        String normalizedBase = miniAppBaseUrl == null ? "" : miniAppBaseUrl.trim();
+        if (normalizedBase.endsWith("/")) {
+            normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 1);
+        }
+
+        if (pharmacyTelegramId == null) {
+            throw new IllegalArgumentException("pharmacyTelegramId is required for inventory page");
+        }
+
+        String pathTemplate = (miniAppPharmacyInventoryPagePath == null || miniAppPharmacyInventoryPagePath.isBlank())
+            ? "/#/pharmacy-inventory?pharmacyTelegramId={pharmacyTelegramId}"
+                : miniAppPharmacyInventoryPagePath.trim();
+
+        String resolvedPath = pathTemplate
+                .replace("{pharmacyTelegramId}", URLEncoder.encode(String.valueOf(pharmacyTelegramId), StandardCharsets.UTF_8));
+
+        if (resolvedPath.startsWith("http://") || resolvedPath.startsWith("https://")) {
+            return resolvedPath;
+        }
+        if (resolvedPath.startsWith("/")) {
+            return normalizedBase + resolvedPath;
+        }
+        return normalizedBase + "/" + resolvedPath;
+    }
+
+    public void sendPharmacyInventoryMiniAppPrompt(Long chatId) {
+        try {
+            String url = apiUrl + "/sendMessage";
+            String inventoryUrl = buildMiniAppPharmacyInventoryUrl(chatId);
+
+            Map<String, Object> button = canUseWebAppButton(inventoryUrl)
+                    ? Map.of("text", "📱 Open Inventory App", "web_app", Map.of("url", inventoryUrl))
+                    : Map.of("text", "📱 Open Inventory App", "url", inventoryUrl);
+
+            Map<String, Object> body = new HashMap<>();
+            body.put("chat_id", chatId);
+            body.put("text", "📱 Open inventory management in the mini app.");
+            body.put("reply_markup", Map.of("inline_keyboard", List.of(List.of(button))));
+
+            restTemplate.postForObject(url, body, String.class);
+        } catch (Exception e) {
+            log.warn("sendPharmacyInventoryMiniAppPrompt error: {}", e.getMessage());
+        }
+    }
+
+    // -------- Reservations Mini App --------
+
+    public String buildMiniAppPharmacyReservationsUrl(Long pharmacyTelegramId) {
+        return buildPharmacyMiniAppUrl(miniAppPharmacyReservationsPagePath,
+                "/#/pharmacy-reservations?pharmacyTelegramId={pharmacyTelegramId}", pharmacyTelegramId);
+    }
+
+    public void sendPharmacyReservationsMiniAppPrompt(Long chatId) {
+        sendPharmacyMiniAppPrompt(chatId, buildMiniAppPharmacyReservationsUrl(chatId),
+                "📱 Open reservation management in the mini app.", "📱 Open Reservations App",
+                "sendPharmacyReservationsMiniAppPrompt");
+    }
+
+    // -------- Prescriptions Mini App --------
+
+    public String buildMiniAppPharmacyPrescriptionsUrl(Long pharmacyTelegramId) {
+        return buildPharmacyMiniAppUrl(miniAppPharmacyPrescriptionsPagePath,
+                "/#/pharmacy-prescriptions?pharmacyTelegramId={pharmacyTelegramId}", pharmacyTelegramId);
+    }
+
+    public void sendPharmacyPrescriptionsMiniAppPrompt(Long chatId) {
+        sendPharmacyMiniAppPrompt(chatId, buildMiniAppPharmacyPrescriptionsUrl(chatId),
+                "📱 Open prescription reviews in the mini app.", "📱 Open Prescriptions App",
+                "sendPharmacyPrescriptionsMiniAppPrompt");
+    }
+
+    // -------- Performance Mini App --------
+
+    public String buildMiniAppPharmacyPerformanceUrl(Long pharmacyTelegramId) {
+        return buildPharmacyMiniAppUrl(miniAppPharmacyPerformancePagePath,
+                "/#/pharmacy-performance?pharmacyTelegramId={pharmacyTelegramId}", pharmacyTelegramId);
+    }
+
+    public void sendPharmacyPerformanceMiniAppPrompt(Long chatId) {
+        sendPharmacyMiniAppPrompt(chatId, buildMiniAppPharmacyPerformanceUrl(chatId),
+                "📱 Open performance dashboard in the mini app.", "📱 Open Performance App",
+                "sendPharmacyPerformanceMiniAppPrompt");
+    }
+
+    // -------- Profile Mini App --------
+
+    public String buildMiniAppPharmacyProfileUrl(Long pharmacyTelegramId) {
+        return buildPharmacyMiniAppUrl(miniAppPharmacyProfilePagePath,
+                "/#/pharmacy-profile?pharmacyTelegramId={pharmacyTelegramId}", pharmacyTelegramId);
+    }
+
+    public void sendPharmacyProfileMiniAppPrompt(Long chatId) {
+        sendPharmacyMiniAppPrompt(chatId, buildMiniAppPharmacyProfileUrl(chatId),
+                "📱 Open pharmacy profile in the mini app.", "📱 Open Profile App",
+                "sendPharmacyProfileMiniAppPrompt");
+    }
+
+    // -------- Shared helper for pharmacy mini app prompts --------
+
+    private String buildPharmacyMiniAppUrl(String configuredPath, String defaultPath, Long pharmacyTelegramId) {
+        String normalizedBase = miniAppBaseUrl == null ? "" : miniAppBaseUrl.trim();
+        if (normalizedBase.endsWith("/")) {
+            normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 1);
+        }
+        if (pharmacyTelegramId == null) {
+            throw new IllegalArgumentException("pharmacyTelegramId is required");
+        }
+        String pathTemplate = (configuredPath == null || configuredPath.isBlank())
+                ? defaultPath : configuredPath.trim();
+        String resolvedPath = pathTemplate
+                .replace("{pharmacyTelegramId}", URLEncoder.encode(String.valueOf(pharmacyTelegramId), StandardCharsets.UTF_8));
+        if (resolvedPath.startsWith("http://") || resolvedPath.startsWith("https://")) {
+            return resolvedPath;
+        }
+        if (resolvedPath.startsWith("/")) {
+            return normalizedBase + resolvedPath;
+        }
+        return normalizedBase + "/" + resolvedPath;
+    }
+
+    private void sendPharmacyMiniAppPrompt(Long chatId, String miniAppUrl, String text, String buttonLabel, String methodName) {
+        try {
+            String url = apiUrl + "/sendMessage";
+            Map<String, Object> button = canUseWebAppButton(miniAppUrl)
+                    ? Map.of("text", buttonLabel, "web_app", Map.of("url", miniAppUrl))
+                    : Map.of("text", buttonLabel, "url", miniAppUrl);
+            Map<String, Object> body = new HashMap<>();
+            body.put("chat_id", chatId);
+            body.put("text", text);
+            body.put("reply_markup", Map.of("inline_keyboard", List.of(List.of(button))));
+            restTemplate.postForObject(url, body, String.class);
+        } catch (Exception e) {
+            log.warn("{} error: {}", methodName, e.getMessage());
+        }
+    }
+
+    // -------- Admin Mini App URL builders + prompts --------
+
+    private String buildAdminMiniAppUrl(String configuredPath, String defaultPath, Long adminTelegramId) {
+        String normalizedBase = miniAppBaseUrl == null ? "" : miniAppBaseUrl.trim();
+        if (normalizedBase.endsWith("/")) {
+            normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 1);
+        }
+        if (adminTelegramId == null) {
+            throw new IllegalArgumentException("adminTelegramId is required");
+        }
+        String pathTemplate = (configuredPath == null || configuredPath.isBlank())
+                ? defaultPath : configuredPath.trim();
+        String resolvedPath = pathTemplate
+                .replace("{adminTelegramId}", URLEncoder.encode(String.valueOf(adminTelegramId), StandardCharsets.UTF_8));
+        if (resolvedPath.startsWith("http://") || resolvedPath.startsWith("https://")) {
+            return resolvedPath;
+        }
+        if (resolvedPath.startsWith("/")) {
+            return normalizedBase + resolvedPath;
+        }
+        return normalizedBase + "/" + resolvedPath;
+    }
+
+    private void sendAdminMiniAppPrompt(Long chatId, String miniAppUrl, String text, String buttonLabel, String methodName) {
+        try {
+            String url = apiUrl + "/sendMessage";
+            Map<String, Object> button = canUseWebAppButton(miniAppUrl)
+                    ? Map.of("text", buttonLabel, "web_app", Map.of("url", miniAppUrl))
+                    : Map.of("text", buttonLabel, "url", miniAppUrl);
+            Map<String, Object> body = new HashMap<>();
+            body.put("chat_id", chatId);
+            body.put("text", text);
+            body.put("reply_markup", Map.of("inline_keyboard", List.of(List.of(button))));
+            restTemplate.postForObject(url, body, String.class);
+        } catch (Exception e) {
+            log.warn("{} error: {}", methodName, e.getMessage());
+        }
+    }
+
+    public void sendAdminDashboardMiniAppPrompt(Long chatId) {
+        sendAdminMiniAppPrompt(chatId,
+                buildAdminMiniAppUrl(miniAppAdminDashboardPagePath, "/#/admin?adminTelegramId={adminTelegramId}", chatId),
+                "📱 Open admin dashboard in the mini app.", "📱 Open Admin Dashboard",
+                "sendAdminDashboardMiniAppPrompt");
+    }
+
+    public void sendAdminPharmaciesMiniAppPrompt(Long chatId) {
+        sendAdminMiniAppPrompt(chatId,
+                buildAdminMiniAppUrl(miniAppAdminPharmaciesPagePath, "/#/admin/pharmacies?adminTelegramId={adminTelegramId}", chatId),
+                "📱 Open pharmacy management in the mini app.", "📱 Open Pharmacy Management",
+                "sendAdminPharmaciesMiniAppPrompt");
+    }
+
+    public void sendAdminReservationsMiniAppPrompt(Long chatId) {
+        sendAdminMiniAppPrompt(chatId,
+                buildAdminMiniAppUrl(miniAppAdminReservationsPagePath, "/#/admin/reservations?adminTelegramId={adminTelegramId}", chatId),
+                "📱 Open reservation oversight in the mini app.", "📱 Open Reservation Oversight",
+                "sendAdminReservationsMiniAppPrompt");
+    }
+
+    public void sendAdminAuditMiniAppPrompt(Long chatId) {
+        sendAdminMiniAppPrompt(chatId,
+                buildAdminMiniAppUrl(miniAppAdminAuditPagePath, "/#/admin/audit?adminTelegramId={adminTelegramId}", chatId),
+                "📱 Open audit trail in the mini app.", "📱 Open Audit Trail",
+                "sendAdminAuditMiniAppPrompt");
+    }
+
+    public void sendAdminComplianceMiniAppPrompt(Long chatId) {
+        sendAdminMiniAppPrompt(chatId,
+                buildAdminMiniAppUrl(miniAppAdminCompliancePagePath, "/#/admin/compliance?adminTelegramId={adminTelegramId}", chatId),
+                "📱 Open license compliance in the mini app.", "📱 Open License Compliance",
+                "sendAdminComplianceMiniAppPrompt");
+    }
+
+    public void sendAdminFeedbackMiniAppPrompt(Long chatId) {
+        sendAdminMiniAppPrompt(chatId,
+                buildAdminMiniAppUrl(miniAppAdminFeedbackPagePath, "/#/admin/feedback?adminTelegramId={adminTelegramId}", chatId),
+                "📱 Open feedback & issues in the mini app.", "📱 Open Feedback & Issues",
+                "sendAdminFeedbackMiniAppPrompt");
+    }
+
+    public void sendAdminSystemMiniAppPrompt(Long chatId) {
+        sendAdminMiniAppPrompt(chatId,
+                buildAdminMiniAppUrl(miniAppAdminSystemPagePath, "/#/admin/system?adminTelegramId={adminTelegramId}", chatId),
+                "📱 Open system summary in the mini app.", "📱 Open System Summary",
+                "sendAdminSystemMiniAppPrompt");
     }
 
     public String buildMiniAppPharmacyPickupUrl(Long pharmacyTelegramId) {
@@ -738,6 +1055,42 @@ public class TelegramClient {
                 .replace("<", "&lt;")
                 .replace(">", "&gt;")
                 .trim();
+    }
+
+    private void sendMessagePayload(Map<String, Object> body) {
+        String url = apiUrl + "/sendMessage";
+        try {
+            restTemplate.postForObject(url, body, String.class);
+        } catch (Exception first) {
+            logTelegramSendFailure("html", first);
+            if (!body.containsKey("parse_mode")) {
+                throw wrapTelegramSendError(first);
+            }
+            Map<String, Object> fallback = new HashMap<>(body);
+            fallback.remove("parse_mode");
+            try {
+                restTemplate.postForObject(url, fallback, String.class);
+                log.warn("Telegram sendMessage succeeded after retry without parse_mode");
+            } catch (Exception second) {
+                logTelegramSendFailure("plain", second);
+                throw wrapTelegramSendError(second);
+            }
+        }
+    }
+
+    private void logTelegramSendFailure(String mode, Exception e) {
+        String responseBody = "";
+        if (e instanceof HttpStatusCodeException statusEx) {
+            responseBody = statusEx.getResponseBodyAsString();
+        }
+        log.error("Telegram sendMessage failed (mode={}): {} body={}", mode, e.getMessage(), responseBody);
+    }
+
+    private RuntimeException wrapTelegramSendError(Exception e) {
+        if (e instanceof RuntimeException runtimeException) {
+            return runtimeException;
+        }
+        return new RuntimeException(e);
     }
 
     public void sendPhoto(Long chatId, String fileId, String caption) {
@@ -2061,7 +2414,7 @@ public void sendPharmacyPendingReservationCard(Long chatId,
         ? "🔐 <b>QR Token:</b> " + qrToken + "\n"
         : "";
     String resolvedPrescriptionStatus = prescriptionRequired
-        ? (prescriptionReviewStatus == null ? "PRESCRIPTION_UPLOAD_REQUIRED" : prescriptionReviewStatus)
+        ? (prescriptionReviewStatus == null ? "UPLOAD_REQUIRED" : prescriptionReviewStatus)
         : null;
     String prescriptionLine = prescriptionRequired
         ? "🧾 <b>Prescription:</b> Required (" + safeText(resolvedPrescriptionStatus) + ")\n"
@@ -2083,7 +2436,7 @@ public void sendPharmacyPendingReservationCard(Long chatId,
         body.put("parse_mode", "HTML");
 
     List<List<Map<String, Object>>> keyboard = prescriptionRequired
-        ? ("PRESCRIPTION_PENDING".equalsIgnoreCase(resolvedPrescriptionStatus)
+        ? ("PENDING_REVIEW".equalsIgnoreCase(resolvedPrescriptionStatus)
             ? List.of(
                 List.of(
                     Map.of("text", "🧾 Review Prescription", "callback_data", "review_pres_res_" + reservationId)
@@ -2092,11 +2445,18 @@ public void sendPharmacyPendingReservationCard(Long chatId,
                     Map.of("text", "❌ Reject", "callback_data", "reject_res_" + reservationId)
                 )
             )
-            : List.of(
-                List.of(
-                    Map.of("text", "❌ Reject", "callback_data", "reject_res_" + reservationId)
+            : "APPROVED".equalsIgnoreCase(resolvedPrescriptionStatus)
+                ? List.of(
+                    List.of(
+                        Map.of("text", "✅ Approve", "callback_data", "approve_res_" + reservationId),
+                        Map.of("text", "❌ Reject", "callback_data", "reject_res_" + reservationId)
+                    )
                 )
-            ))
+                : List.of(
+                    List.of(
+                        Map.of("text", "❌ Reject", "callback_data", "reject_res_" + reservationId)
+                    )
+                ))
         : List.of(
         List.of(
             Map.of("text", "✅ Approve", "callback_data", "approve_res_" + reservationId),
@@ -2148,7 +2508,8 @@ public void sendPharmacyApprovedReservationCard(Long chatId,
 
         List<List<Map<String, Object>>> keyboard = List.of(
                 List.of(
-                        Map.of("text", "📦 Fulfilled", "callback_data", "fulfill_res_" + reservationId)
+                        Map.of("text", "📦 Fulfilled", "callback_data", "fulfill_res_" + reservationId),
+                        Map.of("text", "❌ Cancel", "callback_data", "pharmacy_cancel_res_" + reservationId)
                 )
         );
 
@@ -2881,51 +3242,79 @@ public void sendReservationRequestToPharmacy(Long pharmacyChatId,
                                              String customerPhone,
                                              String customerName,
                                              long pendingTimeoutMinutes) {
-    try {
-        String url = apiUrl + "/sendMessage";
+    sendReservationRequestToPharmacy(
+            pharmacyChatId,
+            reservationId,
+            userId,
+            medicineName,
+            quantity,
+            customerPhone,
+            customerName,
+            pendingTimeoutMinutes,
+            false
+    );
+}
 
+public void sendReservationRequestToPharmacy(Long pharmacyChatId,
+                                             Long reservationId,
+                                             Long userId,
+                                             String medicineName,
+                                             Integer quantity,
+                                             String customerPhone,
+                                             String customerName,
+                                             long pendingTimeoutMinutes,
+                                             boolean awaitingPrescriptionUpload) {
+    try {
         System.out.println("SEND RESERVATION -> pharmacyChatId=" + pharmacyChatId
                 + ", reservationId=" + reservationId
-                + ", medicine=" + medicineName);
+                + ", medicine=" + medicineName
+                + ", awaitingPrescriptionUpload=" + awaitingPrescriptionUpload);
 
         if (pharmacyChatId == null || pharmacyChatId <= 0) {
             throw new RuntimeException("Invalid pharmacy chat id: " + pharmacyChatId);
         }
 
+        String title = awaitingPrescriptionUpload
+                ? "📦 <b>New reservation — waiting for prescription upload</b>"
+                : "📦 <b>New Reservation Request</b>";
+        String footer = awaitingPrescriptionUpload
+                ? "Please wait for the customer to upload a prescription. You will get a review card after upload."
+                : "⏱ Auto-cancel if not approved in: " + pendingTimeoutMinutes + " min\n\nChoose an action:";
+
         Map<String, Object> body = new HashMap<>();
         body.put("chat_id", pharmacyChatId);
         body.put("text",
-                "📦 <b>New Reservation Request</b>\n\n" +
+                title + "\n\n" +
                 "🆔 Reservation ID: " + reservationId + "\n" +
-                "💊 Medicine: " + displayMedicine(pharmacyChatId, medicineName) + "\n" +
+                "💊 Medicine: " + safeText(displayMedicine(pharmacyChatId, medicineName)) + "\n" +
                 "🔢 Quantity: " + quantity + "\n" +
-                "👤 Full Name: " + customerName + "\n" +
-                "📱 Phone: " + customerPhone + "\n" +
-            "👤 User ID: " + userId + "\n" +
-            "⏱ Auto-cancel if not approved in: " + pendingTimeoutMinutes + " min\n\n" +
-                "Choose an action:"
+                "👤 Full Name: " + safeText(customerName) + "\n" +
+                "📱 Phone: " + safeText(customerPhone) + "\n" +
+                "👤 User ID: " + userId + "\n" +
+                footer
         );
         body.put("parse_mode", "HTML");
 
-        List<List<Map<String, Object>>> keyboard = List.of(
-                List.of(
-                        Map.of("text", "✅ Approve", "callback_data", "approve_res_" + reservationId),
-                        Map.of("text", "❌ Reject", "callback_data", "reject_res_" + reservationId)
-                ),
-                List.of(
-                        Map.of("text", "📦 Fulfilled", "callback_data", "fulfill_res_" + reservationId)
-                )
-        );
+        if (!awaitingPrescriptionUpload) {
+            List<List<Map<String, Object>>> keyboard = List.of(
+                    List.of(
+                            Map.of("text", "✅ Approve", "callback_data", "approve_res_" + reservationId),
+                            Map.of("text", "❌ Reject", "callback_data", "reject_res_" + reservationId)
+                    ),
+                    List.of(
+                            Map.of("text", "📦 Fulfilled", "callback_data", "fulfill_res_" + reservationId)
+                    )
+            );
+            body.put("reply_markup", Map.of("inline_keyboard", keyboard));
+        }
 
-        body.put("reply_markup", Map.of("inline_keyboard", keyboard));
-
-        restTemplate.postForObject(url, body, String.class);
+        sendMessagePayload(body);
 
         System.out.println("SEND RESERVATION SUCCESS -> pharmacyChatId=" + pharmacyChatId);
 
     } catch (Exception e) {
-        System.out.println("sendReservationRequestToPharmacy error: " + e.getMessage());
-        throw e;
+        log.error("sendReservationRequestToPharmacy error: {}", e.getMessage(), e);
+        throw wrapTelegramSendError(e);
     }
 }
 public void sendUserReservationItemReadOnly(Long chatId,
@@ -3045,8 +3434,12 @@ private Map<String, Object> reserveAgainButton(Long chatId,
                     "text", "📦 Fulfilled",
                     "callback_data", "fulfill_res_" + reservationId
             );
+            Map<String, Object> cancelBtn = Map.of(
+                    "text", "❌ Cancel",
+                    "callback_data", "pharmacy_cancel_res_" + reservationId
+            );
 
-            List<List<Map<String, Object>>> keyboard = List.of(List.of(fulfillBtn));
+            List<List<Map<String, Object>>> keyboard = List.of(List.of(fulfillBtn, cancelBtn));
 
             Map<String, Object> body = new HashMap<>();
             body.put("chat_id", chatId);
@@ -3099,14 +3492,15 @@ private Map<String, Object> reserveAgainButton(Long chatId,
             List<List<Map<String, Object>>> keyboard = List.of(
                     List.of(
                             Map.of("text", t(chatId, "pending_button")),
-                            Map.of("text", t(chatId, "fulfilled_button"))
+                            Map.of("text", t(chatId, "ready_button"))
                     ),
                     List.of(
-                            Map.of("text", t(chatId, "expired_button")),
-                            Map.of("text", t(chatId, "cancelled_button"))
+                            Map.of("text", t(chatId, "fulfilled_button")),
+                            Map.of("text", t(chatId, "expired_button"))
                     ),
                     List.of(
-                        Map.of("text", t(chatId, "res_section_reserve_latest_btn"))
+                            Map.of("text", t(chatId, "cancelled_button")),
+                            Map.of("text", t(chatId, "res_section_reserve_latest_btn"))
                     ),
                     List.of(
                             Map.of("text", t(chatId, "btn_home")),
@@ -5747,7 +6141,7 @@ public void deleteMessage(Long chatId, Integer messageId) {
             boolean prescriptionRequired = group.stream().anyMatch(com.tenahub.bot.entity.MedicineReservation::isPrescriptionRequired);
             String prescriptionStatus = group.stream()
                     .filter(com.tenahub.bot.entity.MedicineReservation::isPrescriptionRequired)
-                    .map(r -> r.getPrescriptionReviewStatus() == null ? "PRESCRIPTION_UPLOAD_REQUIRED" : r.getPrescriptionReviewStatus().name())
+                    .map(r -> r.getPrescriptionReviewStatus() == null ? "UPLOAD_REQUIRED" : r.getPrescriptionReviewStatus().name())
                     .filter(value -> value != null && !value.isBlank())
                     .findFirst()
                     .orElse("NOT_REQUIRED");
@@ -5766,7 +6160,7 @@ public void deleteMessage(Long chatId, Integer messageId) {
             body.put("parse_mode", "HTML");
 
                 List<List<Map<String, Object>>> keyboard = prescriptionRequired
-                    ? ("PRESCRIPTION_PENDING".equalsIgnoreCase(prescriptionStatus)
+                    ? ("PENDING_REVIEW".equalsIgnoreCase(prescriptionStatus)
                         ? List.of(
                             List.of(
                                 Map.of("text", "🧾 Review Prescription", "callback_data", "review_pres_group_" + groupId)
@@ -5824,7 +6218,8 @@ public void deleteMessage(Long chatId, Integer messageId) {
 
             List<List<Map<String, Object>>> keyboard = List.of(
                     List.of(
-                            Map.of("text", "📦 Fulfilled All", "callback_data", "fulfill_group_" + groupId)
+                            Map.of("text", "📦 Fulfilled All", "callback_data", "fulfill_group_" + groupId),
+                            Map.of("text", "❌ Cancel All", "callback_data", "pharmacy_cancel_group_" + groupId)
                     )
             );
             body.put("reply_markup", Map.of("inline_keyboard", keyboard));
@@ -5841,37 +6236,51 @@ public void deleteMessage(Long chatId, Integer messageId) {
                 return;
             }
 
-            String url = apiUrl + "/sendMessage";
+            boolean awaitingPrescriptionUpload = reservations.stream().anyMatch(reservation ->
+                    reservation != null
+                            && reservation.isPrescriptionRequired()
+                            && reservation.getPrescriptionReviewStatus()
+                            == com.tenahub.bot.entity.PrescriptionReviewStatus.UPLOAD_REQUIRED);
 
             StringBuilder message = new StringBuilder();
-            message.append("📦 <b>Grouped Reservation Request</b>\n\n");
-            message.append("🧺 <b>Group ID:</b> ").append(groupId.substring(0, 8)).append("...\n\n");
+            if (awaitingPrescriptionUpload) {
+                message.append("📦 <b>New grouped reservation — waiting for prescription upload</b>\n\n");
+            } else {
+                message.append("📦 <b>Grouped Reservation Request</b>\n\n");
+            }
+            message.append("🧺 <b>Group ID:</b> ").append(safeText(groupId.substring(0, Math.min(8, groupId.length())))).append("...\n\n");
 
             for (com.tenahub.bot.entity.MedicineReservation res : reservations) {
-                message.append("💊 ").append(displayMedicine(chatId, res.getMedicineName()))
+                message.append("💊 ").append(safeText(displayMedicine(chatId, res.getMedicineName())))
                         .append(" × ").append(res.getRequestedQuantity())
-                        .append(" → $").append(res.getId()).append("\n");
+                        .append(" → #").append(res.getId()).append("\n");
             }
 
-            message.append("\n👤 <b>Customer:</b> ").append(reservations.get(0).getCustomerName()).append("\n");
-            message.append("📱 <b>Phone:</b> ").append(reservations.get(0).getCustomerPhone()).append("\n");
+            message.append("\n👤 <b>Customer:</b> ").append(safeText(reservations.get(0).getCustomerName())).append("\n");
+            message.append("📱 <b>Phone:</b> ").append(safeText(reservations.get(0).getCustomerPhone())).append("\n");
+            if (awaitingPrescriptionUpload) {
+                message.append("\nPlease wait for the customer to upload a prescription. You will get a review card after upload.");
+            }
 
             Map<String, Object> body = new HashMap<>();
             body.put("chat_id", chatId);
             body.put("text", message.toString());
             body.put("parse_mode", "HTML");
 
-            List<List<Map<String, Object>>> keyboard = List.of(
-                    List.of(
-                            Map.of("text", "✅ Approve All", "callback_data", "approve_group_" + groupId),
-                            Map.of("text", "❌ Reject All", "callback_data", "reject_group_" + groupId)
-                    )
-            );
+            if (!awaitingPrescriptionUpload) {
+                List<List<Map<String, Object>>> keyboard = List.of(
+                        List.of(
+                                Map.of("text", "✅ Approve All", "callback_data", "approve_group_" + groupId),
+                                Map.of("text", "❌ Reject All", "callback_data", "reject_group_" + groupId)
+                        )
+                );
+                body.put("reply_markup", Map.of("inline_keyboard", keyboard));
+            }
 
-            body.put("reply_markup", Map.of("inline_keyboard", keyboard));
-            restTemplate.postForObject(url, body, String.class);
+            sendMessagePayload(body);
         } catch (Exception e) {
-            System.out.println("sendPharmacyGroupedReservationCard error: " + e.getMessage());
+            log.error("sendPharmacyGroupedReservationCard error: {}", e.getMessage(), e);
+            throw wrapTelegramSendError(e);
         }
     }
 
@@ -5901,8 +6310,13 @@ public void deleteMessage(Long chatId, Integer messageId) {
                     .append(safeText(status.getReviewStatus()))
                     .append("\n");
             message.append("👤 <b>Uploader:</b> ")
-                    .append(status.getUserId() == null ? "-" : status.getUserId())
+                    .append(status.getUserId() == null || status.getUserId() == 0 ? "-" : status.getUserId())
                     .append("\n");
+            if (status.getCustomerPhone() != null && !status.getCustomerPhone().isBlank()) {
+                message.append("📱 <b>Phone:</b> ")
+                        .append(safeText(status.getCustomerPhone()))
+                        .append("\n");
+            }
             String lastUploadedAt = status.getFiles() == null || status.getFiles().isEmpty()
                     ? null
                     : status.getFiles().stream()
@@ -5926,13 +6340,21 @@ public void deleteMessage(Long chatId, Integer messageId) {
                         .append(safeText(status.getRejectionReason()))
                         .append("\n");
             }
+            if (status.getNote() != null && !status.getNote().isBlank()) {
+                message.append("💬 <b>Patient note:</b> ")
+                        .append(safeText(status.getNote()))
+                        .append("\n");
+            }
 
             message.append("\n💊 <b>Items</b>\n");
             if (status.getItems() != null && !status.getItems().isEmpty()) {
                 for (PrescriptionStatusItemDTO item : status.getItems()) {
                     message.append("• ")
-                            .append(displayMedicine(chatId, item.getMedicineName()))
-                            .append(" - ")
+                            .append(displayMedicine(chatId, item.getMedicineName()));
+                    if (item.getQuantity() != null) {
+                        message.append(" ×").append(item.getQuantity());
+                    }
+                    message.append(" - ")
                             .append(safeText(item.getReviewStatus()))
                             .append("\n");
                 }
@@ -5963,10 +6385,10 @@ public void deleteMessage(Long chatId, Integer messageId) {
 
             List<List<Map<String, Object>>> keyboard = new ArrayList<>();
             keyboard.add(List.of(
-                    Map.of("text", "📄 View Files", "callback_data", "pres_files_" + callbackSuffix)
+                    Map.of("text", "📄 View Prescription", "callback_data", "pres_files_" + callbackSuffix)
             ));
 
-            if ("PRESCRIPTION_PENDING".equalsIgnoreCase(status.getReviewStatus())) {
+            if ("PENDING_REVIEW".equalsIgnoreCase(status.getReviewStatus())) {
                 keyboard.add(List.of(
                         Map.of("text", "✅ Approve Prescription", "callback_data", "pres_approve_" + callbackSuffix),
                         Map.of("text", "❌ Reject Prescription", "callback_data", "pres_reject_" + callbackSuffix)

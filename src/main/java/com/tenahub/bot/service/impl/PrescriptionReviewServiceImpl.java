@@ -55,6 +55,7 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                                                                  Long userId,
                                                                  Long pharmacyId,
                                                                  Long medicineId,
+                                                                 String note,
                                                                  List<MultipartFile> files) {
         List<MedicineReservation> reservations = resolveReservations(reservationId, reservationGroupId);
         List<MedicineReservation> requiredReservations = filterPrescriptionReservations(reservations, medicineId);
@@ -70,8 +71,11 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
 
         Long resolvedUserId = requiredReservations.get(0).getUserId();
         Long resolvedPharmacyId = requiredReservations.get(0).getPharmacyId();
-        if (userId != null && !Objects.equals(userId, resolvedUserId)) {
-            throw new RuntimeException("userId does not match reservation owner");
+        Long requestedUserId = normalizeOptionalPositiveId(userId);
+        if (requestedUserId != null && resolvedUserId != null && !Objects.equals(requestedUserId, resolvedUserId)) {
+            System.out.println("[RX_UPLOAD] Ignoring mismatched telegramUserId=" + requestedUserId
+                    + " for reservation owner=" + resolvedUserId
+                    + " (reservationId=" + reservationId + ", reservationGroupId=" + reservationGroupId + ")");
         }
         if (pharmacyId != null && !Objects.equals(pharmacyId, resolvedPharmacyId)) {
             throw new RuntimeException("pharmacyId does not match reservation");
@@ -79,9 +83,11 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
 
         Long resolvedMedicineId = resolveMedicineId(medicineId, requiredReservations);
         String resolvedGroupId = resolveGroupId(requiredReservations);
+        String resolvedNote = (note != null && !note.isBlank()) ? note.trim() : null;
         LocalDateTime uploadedAt = LocalDateTime.now();
-        boolean hadPrescriptionFilesBeforeUpload = !collectPrescriptionFiles(reservations).isEmpty();
         int savedFileCount = 0;
+        List<Long> savedFileIds = new ArrayList<>();
+        List<ReservationPrescriptionFile> savedFileEntities = new ArrayList<>();
 
         for (MultipartFile file : files) {
             if (file == null || file.isEmpty()) {
@@ -89,19 +95,25 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
             }
 
             try {
-                prescriptionFileRepository.save(ReservationPrescriptionFile.builder()
+                byte[] fileBytes = file.getBytes();
+                ReservationPrescriptionFile savedFile = prescriptionFileRepository.save(
+                    ReservationPrescriptionFile.builder()
                         .reservationId(requiredReservations.size() == 1 ? requiredReservations.get(0).getId() : null)
                         .reservationGroupId(resolvedGroupId)
-                        .userId(resolvedUserId)
+                        .userId(resolvedUserId != null ? resolvedUserId : 0L)
                         .pharmacyId(resolvedPharmacyId)
                         .medicineId(resolvedMedicineId)
                         .originalFilename(file.getOriginalFilename() == null ? "prescription" : file.getOriginalFilename())
                         .contentType(file.getContentType())
                         .fileSize(file.getSize())
-                        .fileData(file.getBytes())
+                        .fileData(fileBytes)
                         .uploadedAt(uploadedAt)
-                        .reviewStatus(PrescriptionReviewStatus.PRESCRIPTION_PENDING)
+                        .reviewStatus(PrescriptionReviewStatus.PENDING_REVIEW)
                         .build());
+                savedFileIds.add(savedFile.getId());
+                // Retain the byte array in-memory so afterCommit does not need to re-query the DB.
+                savedFile.setFileData(fileBytes);
+                savedFileEntities.add(savedFile);
                 savedFileCount++;
             } catch (IOException e) {
                 throw new RuntimeException("Failed to store prescription file", e);
@@ -116,10 +128,14 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
         for (MedicineReservation reservation : reservations) {
             if (reservation.isPrescriptionRequired()) {
                 reservation.setPrescriptionRequired(true);
-                reservation.setPrescriptionReviewStatus(PrescriptionReviewStatus.PRESCRIPTION_PENDING);
+                reservation.setPrescriptionReviewStatus(PrescriptionReviewStatus.PENDING_REVIEW);
                 reservation.setPrescriptionReviewedAt(null);
                 reservation.setPrescriptionReviewedBy(null);
                 reservation.setPrescriptionRejectionReason(null);
+            }
+            // Update note if provided with this upload
+            if (resolvedNote != null) {
+                reservation.setNote(resolvedNote);
             }
             reservation.setPendingExpiresAt(pendingExpiresAt);
             reservation.setFirstReminderSentAt(null);
@@ -129,11 +145,46 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
         }
 
         PrescriptionStatusResponseDTO statusResponse = buildStatusResponse(reservations);
-    boolean shouldNotifyPharmacy = !hadPrescriptionFilesBeforeUpload
-        && statusResponse.getFiles() != null
-        && !statusResponse.getFiles().isEmpty();
-    if (shouldNotifyPharmacy) {
-            notifyPharmacyPrescriptionReadyAfterCommit(statusResponse);
+        System.out.println("[RX_UPLOAD] reservationId=" + (reservationId != null ? reservationId : "group:" + reservationGroupId)
+                + ", status=PENDING_REVIEW"
+                + ", queue=prescription_review"
+                + ", template=prescription_review_card"
+                + ", savedFileCount=" + savedFileCount
+                + ", savedFileIds=" + savedFileIds
+                + ", pharmacyId=" + statusResponse.getPharmacyId()
+                + ", note=" + resolvedNote
+                + ", notificationTrigger=notifyPharmacyPrescriptionReadyAfterCommit"
+                + ", fileCountInStatus=" + (statusResponse.getFiles() == null ? 0 : statusResponse.getFiles().size()));
+        if (savedFileCount > 0) {
+            notifyPharmacyPrescriptionReadyAfterCommit(statusResponse, savedFileEntities);
+        }
+
+        // Notify the customer that their prescription has been submitted to the pharmacy.
+        Long customerTelegramId = resolvedUserId;
+        if (customerTelegramId != null && customerTelegramId > 0) {
+            Long customerId = customerTelegramId;
+            String medicineName = (statusResponse.getItems() != null && !statusResponse.getItems().isEmpty())
+                    ? statusResponse.getItems().get(0).getMedicineName() : "your medicine";
+            String customerMsg = "\u2705 Your prescription for <b>" + medicineName + "</b> has been submitted."
+                    + "\nThe pharmacy has been notified and will review it shortly.";
+            if (TransactionSynchronizationManager.isSynchronizationActive()) {
+                TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                    @Override
+                    public void afterCommit() {
+                        try {
+                            telegramClient.sendMessage(customerId, customerMsg, "HTML");
+                        } catch (Exception e) {
+                            System.out.println("[RX_UPLOAD] Failed to notify customer: " + e.getMessage());
+                        }
+                    }
+                });
+            } else {
+                try {
+                    telegramClient.sendMessage(customerId, customerMsg, "HTML");
+                } catch (Exception e) {
+                    System.out.println("[RX_UPLOAD] Failed to notify customer: " + e.getMessage());
+                }
+            }
         }
 
         return statusResponse;
@@ -144,13 +195,27 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
     public PrescriptionStatusResponseDTO getPrescriptionStatus(Long reservationId,
                                                                String reservationGroupId,
                                                                Long userId) {
+        System.out.println("[RX_STATUS] getPrescriptionStatus called: reservationId=" + reservationId
+                + ", groupId=" + reservationGroupId + ", userId=" + userId);
         List<MedicineReservation> reservations = resolveReservations(reservationId, reservationGroupId);
         Long resolvedUserId = reservations.get(0).getUserId();
         if (userId != null && !Objects.equals(userId, resolvedUserId)) {
+            System.out.println("[RX_STATUS] userId mismatch: request=" + userId + ", owner=" + resolvedUserId);
             throw new RuntimeException("userId does not match reservation owner");
         }
 
-        return buildStatusResponse(reservations);
+        PrescriptionStatusResponseDTO response = buildStatusResponse(reservations);
+        System.out.println("[RX_STATUS] result: reservationId=" + response.getReservationId()
+                + ", groupId=" + response.getReservationGroupId()
+                + ", reservationStatus=" + response.getReservationStatus()
+                + ", reviewStatus=" + response.getReviewStatus()
+                + ", pharmacyName=" + response.getPharmacyName()
+                + ", medicineName=" + response.getMedicineName()
+                + ", qty=" + response.getQuantity()
+                + ", expiresAt=" + response.getExpiresAt()
+                + ", items=" + (response.getItems() == null ? 0 : response.getItems().size())
+                + ", files=" + (response.getFiles() == null ? 0 : response.getFiles().size()));
+        return response;
     }
 
     @Override
@@ -180,7 +245,7 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
         LocalDateTime reviewedAt = LocalDateTime.now();
         List<ReservationPrescriptionFile> files = collectPrescriptionFiles(reservations);
 
-        if (decision == PrescriptionReviewStatus.PRESCRIPTION_APPROVED) {
+        if (decision == PrescriptionReviewStatus.APPROVED) {
             if (files.isEmpty()) {
                 throw new RuntimeException("No prescription files have been uploaded for this reservation");
             }
@@ -189,15 +254,29 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                 if (reservation.getStatus() != com.tenahub.bot.entity.MedicineReservationStatus.PENDING) {
                     throw new RuntimeException("Only pending reservations can have prescription approved");
                 }
-                reservation.setPrescriptionReviewStatus(PrescriptionReviewStatus.PRESCRIPTION_APPROVED);
+                reservation.setPrescriptionReviewStatus(PrescriptionReviewStatus.APPROVED);
                 reservation.setPrescriptionReviewedAt(reviewedAt);
                 reservation.setPrescriptionReviewedBy(pharmacyTelegramId);
                 reservation.setPrescriptionRejectionReason(null);
+                // Deduct stock now that prescription is approved (was deferred at reservation creation).
+                if (!reservation.isInventoryHeld()) {
+                    System.out.println("[RX_APPROVE] Holding inventory for approved prescription: reservationId="
+                            + reservation.getId() + ", medicine=" + reservation.getMedicineName()
+                            + ", qty=" + reservation.getRequestedQuantity());
+                    try {
+                        reservationService.holdInventoryForApprovedPrescription(reservation);
+                    } catch (Exception e) {
+                        System.out.println("[RX_APPROVE] WARNING: stock hold failed for reservationId="
+                                + reservation.getId() + ": " + e.getMessage());
+                    }
+                } else {
+                    System.out.println("[RX_APPROVE] Stock already held for reservationId=" + reservation.getId());
+                }
                 reservationRepository.save(reservation);
             }
 
             for (ReservationPrescriptionFile file : files) {
-                file.setReviewStatus(PrescriptionReviewStatus.PRESCRIPTION_APPROVED);
+                file.setReviewStatus(PrescriptionReviewStatus.APPROVED);
                 file.setReviewedAt(reviewedAt);
                 file.setReviewedBy(pharmacyTelegramId);
                 file.setRejectionReason(null);
@@ -213,7 +292,7 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                 if (reservation.getStatus() == com.tenahub.bot.entity.MedicineReservationStatus.PENDING) {
                     rejectedReservation = reservationService.rejectReservation(reservation.getId(), resolvedReason);
                 }
-                rejectedReservation.setPrescriptionReviewStatus(PrescriptionReviewStatus.PRESCRIPTION_REJECTED);
+                rejectedReservation.setPrescriptionReviewStatus(PrescriptionReviewStatus.REJECTED);
                 rejectedReservation.setPrescriptionReviewedAt(reviewedAt);
                 rejectedReservation.setPrescriptionReviewedBy(pharmacyTelegramId);
                 rejectedReservation.setPrescriptionRejectionReason(resolvedReason);
@@ -221,7 +300,7 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
             }
 
             for (ReservationPrescriptionFile file : files) {
-                file.setReviewStatus(PrescriptionReviewStatus.PRESCRIPTION_REJECTED);
+                file.setReviewStatus(PrescriptionReviewStatus.REJECTED);
                 file.setReviewedAt(reviewedAt);
                 file.setReviewedBy(pharmacyTelegramId);
                 file.setRejectionReason(resolvedReason);
@@ -283,6 +362,10 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
         }
     }
 
+    private Long normalizeOptionalPositiveId(Long id) {
+        return id != null && id > 0 ? id : null;
+    }
+
     private Long resolveMedicineId(Long requestedMedicineId, List<MedicineReservation> reservations) {
         if (requestedMedicineId != null) {
             PharmacyInventory inventory = pharmacyInventoryRepository.findById(requestedMedicineId)
@@ -327,8 +410,8 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
 
         String normalized = decision.trim().toLowerCase();
         return switch (normalized) {
-            case "approve", "approved", "prescription_approved" -> PrescriptionReviewStatus.PRESCRIPTION_APPROVED;
-            case "reject", "rejected", "prescription_rejected" -> PrescriptionReviewStatus.PRESCRIPTION_REJECTED;
+            case "approve", "approved", "prescription_approved" -> PrescriptionReviewStatus.APPROVED;
+            case "reject", "rejected", "prescription_rejected" -> PrescriptionReviewStatus.REJECTED;
             default -> throw new RuntimeException("decision must be approve or reject");
         };
     }
@@ -375,6 +458,39 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                 .findFirst()
                 .orElse(null);
 
+        // Resolve reservation status
+        String reservationStatus = resolveAggregatedReservationStatus(sortedReservations);
+
+        // Resolve pharmacy name
+        String pharmacyName = null;
+        if (first.getPharmacyId() != null) {
+            pharmacyName = pharmacyRepository.findById(first.getPharmacyId())
+                    .map(Pharmacy::getName)
+                    .orElse(null);
+        }
+
+        // Resolve medicine name and quantity (single reservation or summarized)
+        String medicineName;
+        Integer quantity;
+        if (sortedReservations.size() == 1) {
+            medicineName = first.getMedicineName();
+            quantity = first.getRequestedQuantity();
+        } else {
+            medicineName = sortedReservations.size() + " medicines";
+            quantity = sortedReservations.stream()
+                    .map(MedicineReservation::getRequestedQuantity)
+                    .filter(Objects::nonNull)
+                    .mapToInt(Integer::intValue)
+                    .sum();
+        }
+
+        // Resolve expiry (earliest pending expiry or general expiry)
+        LocalDateTime expiresAt = sortedReservations.stream()
+                .map(r -> r.getPendingExpiresAt() != null ? r.getPendingExpiresAt() : r.getExpiresAt())
+                .filter(Objects::nonNull)
+                .min(LocalDateTime::compareTo)
+                .orElse(null);
+
         List<PrescriptionStatusItemDTO> items = sortedReservations.stream()
                 .map(reservation -> PrescriptionStatusItemDTO.builder()
                         .reservationId(reservation.getId())
@@ -382,8 +498,9 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                         .pharmacyId(reservation.getPharmacyId())
                         .medicineId(resolveReservationMedicineId(reservation))
                         .medicineName(reservation.getMedicineName())
+                        .quantity(reservation.getRequestedQuantity())
                         .prescriptionRequired(reservation.isPrescriptionRequired())
-                        .reviewStatus(reservation.getPrescriptionReviewStatus().name())
+                        .reviewStatus(reservation.getPrescriptionReviewStatus() == null ? null : reservation.getPrescriptionReviewStatus().name())
                         .reviewedAt(reservation.getPrescriptionReviewedAt())
                         .reviewedBy(reservation.getPrescriptionReviewedBy())
                         .rejectionReason(reservation.getPrescriptionRejectionReason())
@@ -402,7 +519,7 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                         .contentType(file.getContentType())
                         .fileSize(file.getFileSize())
                         .uploadedAt(file.getUploadedAt())
-                        .reviewStatus(file.getReviewStatus().name())
+                        .reviewStatus(file.getReviewStatus() == null ? null : file.getReviewStatus().name())
                         .reviewedAt(file.getReviewedAt())
                         .reviewedBy(file.getReviewedBy())
                         .rejectionReason(file.getRejectionReason())
@@ -414,14 +531,62 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                 .reservationGroupId(resolveGroupId(sortedReservations))
                 .userId(first.getUserId())
                 .pharmacyId(first.getPharmacyId())
+                .customerPhone(first.getCustomerPhone())
+                .note(sortedReservations.stream()
+                        .map(MedicineReservation::getNote)
+                        .filter(n -> n != null && !n.isBlank())
+                        .findFirst().orElse(null))
                 .prescriptionRequired(sortedReservations.stream().anyMatch(MedicineReservation::isPrescriptionRequired))
                 .reviewStatus(reviewStatus.name())
                 .reviewedAt(reviewedAt)
                 .reviewedBy(reviewedBy)
                 .rejectionReason(rejectionReason)
+                .reservationStatus(reservationStatus)
+                .pharmacyName(pharmacyName)
+                .medicineName(medicineName)
+                .quantity(quantity)
+                .expiresAt(expiresAt)
+                .canShowQr(reviewStatus == PrescriptionReviewStatus.APPROVED
+                        && ("APPROVED".equals(reservationStatus) || "READY_FOR_PICKUP".equals(reservationStatus)))
+                .userFacingStage(deriveUserFacingStageForPrescription(reviewStatus, reservationStatus))
                 .items(items)
                 .files(fileDTOs)
                 .build();
+    }
+
+    private String deriveUserFacingStageForPrescription(PrescriptionReviewStatus reviewStatus, String reservationStatus) {
+        if ("FULFILLED".equals(reservationStatus)) return "COMPLETE";
+        if ("CANCELLED".equals(reservationStatus)) return "CANCELLED";
+        if ("EXPIRED".equals(reservationStatus)) return "EXPIRED";
+        if ("REJECTED".equals(reservationStatus) || reviewStatus == PrescriptionReviewStatus.REJECTED) return "REJECTED";
+        if (reviewStatus == PrescriptionReviewStatus.APPROVED
+                && ("APPROVED".equals(reservationStatus) || "READY_FOR_PICKUP".equals(reservationStatus))) {
+            return "READY_FOR_PICKUP";
+        }
+        if (reviewStatus == PrescriptionReviewStatus.APPROVED && "PENDING".equals(reservationStatus)) {
+            return "WAITING_RESERVATION_APPROVAL";
+        }
+        if (reviewStatus == PrescriptionReviewStatus.PENDING_REVIEW) return "PRESCRIPTION_REVIEW";
+        if (reviewStatus == PrescriptionReviewStatus.UPLOAD_REQUIRED) return "UPLOAD_PRESCRIPTION";
+        return "RESERVED";
+    }
+
+    private String resolveAggregatedReservationStatus(List<MedicineReservation> reservations) {
+        if (reservations == null || reservations.isEmpty()) {
+            return null;
+        }
+        java.util.Set<String> statuses = reservations.stream()
+                .map(MedicineReservation::getStatus)
+                .filter(Objects::nonNull)
+                .map(Enum::name)
+                .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
+        if (statuses.isEmpty()) {
+            return null;
+        }
+        if (statuses.size() == 1) {
+            return statuses.iterator().next();
+        }
+        return "MIXED";
     }
 
     private PrescriptionReviewStatus aggregateReviewStatus(List<MedicineReservation> reservations) {
@@ -433,46 +598,83 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
             return PrescriptionReviewStatus.NOT_REQUIRED;
         }
         if (requiredReservations.stream().anyMatch(reservation ->
-                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_REJECTED)) {
-            return PrescriptionReviewStatus.PRESCRIPTION_REJECTED;
+                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.REJECTED)) {
+            return PrescriptionReviewStatus.REJECTED;
         }
         if (requiredReservations.stream().allMatch(reservation ->
-                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_APPROVED)) {
-            return PrescriptionReviewStatus.PRESCRIPTION_APPROVED;
+                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.APPROVED)) {
+            return PrescriptionReviewStatus.APPROVED;
         }
+        // PENDING_REVIEW takes priority over UPLOAD_REQUIRED: if any item has been uploaded (PENDING_REVIEW),
+        // the pharmacy should be able to review it even if other items in the group are still UPLOAD_REQUIRED.
         if (requiredReservations.stream().anyMatch(reservation ->
-                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED)) {
-            return PrescriptionReviewStatus.PRESCRIPTION_UPLOAD_REQUIRED;
+                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PENDING_REVIEW)) {
+            return PrescriptionReviewStatus.PENDING_REVIEW;
         }
-        return PrescriptionReviewStatus.PRESCRIPTION_PENDING;
+        return PrescriptionReviewStatus.UPLOAD_REQUIRED;
     }
 
-    private void notifyPharmacyPrescriptionReadyAfterCommit(PrescriptionStatusResponseDTO statusResponse) {
+    private void notifyPharmacyPrescriptionReadyAfterCommit(PrescriptionStatusResponseDTO statusResponse,
+                                                             List<ReservationPrescriptionFile> savedFiles) {
         if (statusResponse == null || statusResponse.getPharmacyId() == null) {
+            System.out.println("[PRESC_NOTIFY] Skipped: statusResponse or pharmacyId is null");
             return;
         }
 
+        // Resolve pharmacyTelegramId HERE, inside the active @Transactional context.
+        Long pharmacyTelegramId = pharmacyRepository.findById(statusResponse.getPharmacyId())
+                .map(Pharmacy::getTelegramId)
+                .orElse(null);
+
+        System.out.println("[PRESC_NOTIFY] reservationId=" + statusResponse.getReservationId()
+                + ", fileCount=" + (savedFiles == null ? 0 : savedFiles.size())
+                + ", pharmacyId=" + statusResponse.getPharmacyId()
+                + ", pharmacyTelegramId=" + pharmacyTelegramId);
+
+        if (pharmacyTelegramId == null || pharmacyTelegramId <= 0) {
+            System.out.println("[PRESC_NOTIFY] Skipped: pharmacy has no Telegram ID registered");
+            return;
+        }
+
+        Long resolvedPharmacyTelegramId = pharmacyTelegramId;
+        // Snapshot file data in-memory now (inside transaction) — avoids any DB lookup after commit.
+        List<ReservationPrescriptionFile> filesToSend = savedFiles == null
+                ? java.util.Collections.emptyList() : new ArrayList<>(savedFiles);
+
         Runnable notifier = () -> {
             try {
-                Long reservationId = statusResponse.getReservationId();
-                int fileCount = statusResponse.getFiles() == null ? 0 : statusResponse.getFiles().size();
-                Long pharmacyTelegramId = pharmacyRepository.findById(statusResponse.getPharmacyId())
-                        .map(Pharmacy::getTelegramId)
-                        .orElse(null);
-                System.out.println("[PRESC_NOTIFY] reservationId=" + reservationId + ", fileCount=" + fileCount + ", pharmacyTelegramId=" + pharmacyTelegramId);
-                if (pharmacyTelegramId != null && pharmacyTelegramId > 0 && fileCount > 0) {
-                    System.out.println("[PRESC_NOTIFY] Calling sendPharmacyPrescriptionReviewCard");
-                    telegramClient.sendPharmacyPrescriptionReviewCard(pharmacyTelegramId, statusResponse);
-                } else {
-                    System.out.println("[PRESC_NOTIFY] Notification skipped: invalid pharmacyTelegramId or fileCount=0");
-                }
+                System.out.println("[PRESC_NOTIFY] Sending prescription review card to pharmacyTelegramId=" + resolvedPharmacyTelegramId);
+                telegramClient.sendPharmacyPrescriptionReviewCard(resolvedPharmacyTelegramId, statusResponse);
+                System.out.println("[PRESC_NOTIFY] Review card sent OK");
             } catch (Exception e) {
-                System.out.println("[PRESC_NOTIFY] Exception: " + e.getMessage());
+                System.out.println("[PRESC_NOTIFY] Exception sending card: " + e.getMessage());
                 e.printStackTrace();
+            }
+            int idx = 1;
+            for (ReservationPrescriptionFile fileEntity : filesToSend) {
+                try {
+                    byte[] data = fileEntity.getFileData();
+                    if (data == null || data.length == 0) {
+                        System.out.println("[PRESC_NOTIFY] File data empty for id=" + fileEntity.getId());
+                        continue;
+                    }
+                    String filename = fileEntity.getOriginalFilename() != null
+                            ? fileEntity.getOriginalFilename() : "prescription";
+                    String caption = "Prescription file " + idx + " of " + filesToSend.size()
+                            + "\n" + filename;
+                    telegramClient.sendDocumentBytes(resolvedPharmacyTelegramId, data, filename, caption);
+                    System.out.println("[PRESC_NOTIFY] Sent file " + idx + "/" + filesToSend.size()
+                            + " (id=" + fileEntity.getId() + ") to pharmacyTelegramId=" + resolvedPharmacyTelegramId);
+                    idx++;
+                } catch (Exception e) {
+                    System.out.println("[PRESC_NOTIFY] Failed to send file id=" + fileEntity.getId() + ": " + e.getMessage());
+                    e.printStackTrace();
+                }
             }
         };
 
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            System.out.println("[PRESC_NOTIFY] No active transaction synchronization — running notifier inline");
             notifier.run();
             return;
         }
@@ -480,8 +682,10 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
+                System.out.println("[PRESC_NOTIFY] afterCommit() fired for pharmacyTelegramId=" + resolvedPharmacyTelegramId);
                 notifier.run();
             }
         });
+        System.out.println("[PRESC_NOTIFY] afterCommit registered for pharmacyTelegramId=" + resolvedPharmacyTelegramId);
     }
 }

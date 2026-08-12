@@ -1,5 +1,6 @@
 package com.tenahub.bot.service;
 
+import com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO;
 import com.tenahub.bot.entity.PharmacyInventory;
 
 import java.math.BigDecimal;
@@ -32,5 +33,13 @@ public interface InventoryService {
     PharmacyInventory setRequiresPrescriptionForPharmacy(Long pharmacyId, Long medicineId, boolean requiresPrescription);
     BulkInventoryUpdateResult bulkUpsertFromText(Long chatId, String bulkText);
     void initializeInventoryFromMedicines(Long pharmacyId, String medicines);
+
+    // Pharmacy mini app inventory methods
+    List<PharmacyMiniAppInventoryItemDTO> getPharmacyMiniAppInventory(Long pharmacyTelegramId);
+    PharmacyMiniAppInventoryItemDTO updateStockFromMiniApp(Long pharmacyTelegramId, Long itemId, Integer quantity);
+    PharmacyMiniAppInventoryItemDTO updatePriceFromMiniApp(Long pharmacyTelegramId, Long itemId, BigDecimal price);
+    PharmacyMiniAppInventoryItemDTO togglePrescriptionFromMiniApp(Long pharmacyTelegramId, Long itemId, boolean requiresPrescription);
+    PharmacyMiniAppInventoryItemDTO toggleAvailabilityFromMiniApp(Long pharmacyTelegramId, Long itemId, boolean available);
+    PharmacyMiniAppInventoryItemDTO addStockFromMiniApp(Long pharmacyTelegramId, String medicineName, Integer quantity, BigDecimal price, Integer lowStockThreshold);
 
 }

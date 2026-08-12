@@ -1,0 +1,6 @@
+{
+  "timestamp" : "2026-08-12T01:23:30.305Z",
+  "status" : 400,
+  "error" : "Bad Request",
+  "path" : "/telegram/webhook"
+}
