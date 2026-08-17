@@ -26,12 +26,27 @@ public class PharmacyMiniAppPerformanceController {
     @GetMapping
     public ResponseEntity<?> getPerformance(
             @RequestHeader(value = "X-Pharmacy-Telegram-Id", required = false) Long headerPharmacyId,
-            @RequestParam(value = "pharmacyTelegramId", required = false) Long paramPharmacyId) {
+            @RequestParam(value = "pharmacyTelegramId", required = false) Long paramPharmacyId,
+            @RequestParam(value = "period", required = false, defaultValue = "weekly") String period) {
         try {
             Long pharmacyTelegramId = resolve(headerPharmacyId, paramPharmacyId);
-            log.info("[PharmacyMiniApp] GET performance, pharmacyTelegramId={}", pharmacyTelegramId);
-            String card = pharmacyPerformanceService.buildPerformanceCard(pharmacyTelegramId);
-            return ResponseEntity.ok(Map.of("performance", card));
+            log.info("[PharmacyMiniApp] GET performance, pharmacyTelegramId={}, period={}", pharmacyTelegramId, period);
+            return ResponseEntity.ok(pharmacyPerformanceService.getPerformanceReport(pharmacyTelegramId, period));
+        } catch (MiniAppAuthException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            return forbidden(e);
+        }
+    }
+
+    @GetMapping("/demand")
+    public ResponseEntity<?> getDemand(
+            @RequestHeader(value = "X-Pharmacy-Telegram-Id", required = false) Long headerPharmacyId,
+            @RequestParam(value = "pharmacyTelegramId", required = false) Long paramPharmacyId,
+            @RequestParam(value = "period", required = false, defaultValue = "weekly") String period) {
+        try {
+            Long pharmacyTelegramId = resolve(headerPharmacyId, paramPharmacyId);
+            return ResponseEntity.ok(pharmacyPerformanceService.listDemandItems(pharmacyTelegramId, period));
         } catch (MiniAppAuthException e) {
             throw e;
         } catch (RuntimeException e) {

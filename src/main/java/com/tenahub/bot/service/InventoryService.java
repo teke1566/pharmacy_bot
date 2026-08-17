@@ -1,9 +1,16 @@
 package com.tenahub.bot.service;
 
+import com.tenahub.bot.dto.InventoryCsvImportResultDTO;
+import com.tenahub.bot.dto.PharmacyMiniAppAddStockRequest;
 import com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO;
+import com.tenahub.bot.dto.PharmacyMiniAppInventoryPatchRequest;
+import com.tenahub.bot.dto.MedicineBatchDTO;
+import com.tenahub.bot.dto.RestockSuggestionDTO;
+import com.tenahub.bot.dto.StockMovementDTO;
 import com.tenahub.bot.entity.PharmacyInventory;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.util.List;
 
 public interface InventoryService {
@@ -22,11 +29,14 @@ public interface InventoryService {
      String buildSummary(Long telegramId, String period);
 
     String buildLowStockAlert(Long telegramId);
+    String buildExpiryAlert(Long telegramId);
       void setLowStockThreshold(Long telegramId, String medicineName, Integer threshold);
 
     String getDemandInsights(Long telegramId);
     String getAdvancedRestockSuggestions(Long telegramId);
-    void importInventoryCsv(Long telegramId, String csvContent);
+    List<RestockSuggestionDTO> listRestockSuggestions(Long telegramId);
+    void ignoreRestockSuggestion(Long telegramId, String medicineName);
+    InventoryCsvImportResultDTO importInventoryCsv(Long telegramId, String csvContent);
     void updatePrice(Long pharmacyChatId, String medicineName, BigDecimal price);
     void upsertStock(Long chatId, String medicineName, Integer quantity, BigDecimal price);
     PharmacyInventory setRequiresPrescription(Long telegramId, Long medicineId, boolean requiresPrescription);
@@ -36,10 +46,28 @@ public interface InventoryService {
 
     // Pharmacy mini app inventory methods
     List<PharmacyMiniAppInventoryItemDTO> getPharmacyMiniAppInventory(Long pharmacyTelegramId);
+
+    List<PharmacyMiniAppInventoryItemDTO> getPharmacyMiniAppInventory(
+            Long pharmacyTelegramId, String search, String stockStatus, String expiryStatus, Boolean includeArchived);
+
     PharmacyMiniAppInventoryItemDTO updateStockFromMiniApp(Long pharmacyTelegramId, Long itemId, Integer quantity);
     PharmacyMiniAppInventoryItemDTO updatePriceFromMiniApp(Long pharmacyTelegramId, Long itemId, BigDecimal price);
     PharmacyMiniAppInventoryItemDTO togglePrescriptionFromMiniApp(Long pharmacyTelegramId, Long itemId, boolean requiresPrescription);
     PharmacyMiniAppInventoryItemDTO toggleAvailabilityFromMiniApp(Long pharmacyTelegramId, Long itemId, boolean available);
-    PharmacyMiniAppInventoryItemDTO addStockFromMiniApp(Long pharmacyTelegramId, String medicineName, Integer quantity, BigDecimal price, Integer lowStockThreshold);
+    PharmacyMiniAppInventoryItemDTO addStockFromMiniApp(Long pharmacyTelegramId, PharmacyMiniAppAddStockRequest request);
+    PharmacyMiniAppInventoryItemDTO patchInventoryFromMiniApp(Long pharmacyTelegramId, Long itemId, PharmacyMiniAppInventoryPatchRequest request);
+    void archiveInventoryItem(Long pharmacyTelegramId, Long itemId);
+
+    List<MedicineBatchDTO> listInventoryBatches(Long pharmacyTelegramId, Long itemId);
+    List<StockMovementDTO> listInventoryMovements(Long pharmacyTelegramId, Long itemId);
+    List<MedicineBatchDTO> listExpiryBatches(Long pharmacyTelegramId, String bucket);
+    PharmacyMiniAppInventoryItemDTO adjustInventoryFromMiniApp(
+            Long pharmacyTelegramId,
+            Long itemId,
+            Integer quantityChange,
+            String reason,
+            String movementType,
+            String batchNumber,
+            LocalDate expiryDate);
 
 }

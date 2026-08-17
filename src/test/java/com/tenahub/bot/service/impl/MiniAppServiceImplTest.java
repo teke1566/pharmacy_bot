@@ -1,6 +1,11 @@
 package com.tenahub.bot.service.impl;
 
+import com.tenahub.bot.dto.MiniAppMedicineSummaryDTO;
 import com.tenahub.bot.dto.PharmacyResponseDTO;
+import com.tenahub.bot.entity.Medicine;
+import com.tenahub.bot.entity.PharmacyInventory;
+import com.tenahub.bot.repository.MedicineRepository;
+import com.tenahub.bot.repository.PharmacyInventoryRepository;
 import com.tenahub.bot.service.PharmacyService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -26,6 +31,10 @@ class MiniAppServiceImplTest {
 
     @Mock
     private PharmacyService pharmacyService;
+    @Mock
+    private PharmacyInventoryRepository pharmacyInventoryRepository;
+    @Mock
+    private MedicineRepository medicineRepository;
 
     private MiniAppServiceImpl miniAppService;
 
@@ -33,6 +42,8 @@ class MiniAppServiceImplTest {
     void setUp() {
         miniAppService = new MiniAppServiceImpl();
         ReflectionTestUtils.setField(miniAppService, "pharmacyService", pharmacyService);
+        ReflectionTestUtils.setField(miniAppService, "pharmacyInventoryRepository", pharmacyInventoryRepository);
+        ReflectionTestUtils.setField(miniAppService, "medicineRepository", medicineRepository);
     }
 
     @Test
@@ -79,6 +90,22 @@ class MiniAppServiceImplTest {
     }
 
     @Test
+    void search_appliesInStockFilter() {
+        PharmacyResponseDTO inStock = dto("In stock", true, false, true, 1.0, 45.0, "10.00", false);
+        inStock.setStockQuantity(8);
+        PharmacyResponseDTO empty = dto("Empty", true, false, true, 1.1, 44.0, "9.00", true);
+        empty.setStockQuantity(0);
+
+        when(pharmacyService.searchMedicine("paracetamol")).thenReturn(List.of(empty, inStock));
+
+        List<PharmacyResponseDTO> result = miniAppService.search("paracetamol", null, null, 12L, null, "inStock");
+
+        assertEquals(1, result.size());
+        assertEquals("In stock", result.get(0).getName());
+        assertFalse(result.get(0).isOutOfStock());
+    }
+
+    @Test
     void search_openNowWithoutSort_defaultsToNearestAndFiltersClosed() {
         PharmacyResponseDTO nearestOpen = dto("Nearest Open", true, false, true, 0.8, 40.0, "10.00", false);
         PharmacyResponseDTO fartherOpen = dto("Farther Open", true, false, true, 2.4, 50.0, "10.00", false);
@@ -104,6 +131,221 @@ class MiniAppServiceImplTest {
 
         assertTrue(result.isEmpty());
         verify(pharmacyService).searchMedicineNearby("azithromycin", 8.98, 38.79, 0L);
+    }
+
+    @Test
+    void searchMultipleMedicines_forwardsToPharmacyServiceWithZeroUserIdFallback() {
+        when(pharmacyService.searchMultipleMedicinesNearby(eq(List.of("insulin", "paracetamol")), eq(9.01), eq(38.75), eq(0L)))
+                .thenReturn(List.of());
+
+        var result = miniAppService.searchMultipleMedicines(List.of("insulin", "paracetamol"), 9.01, 38.75, null);
+
+        assertTrue(result.isEmpty());
+        verify(pharmacyService).searchMultipleMedicinesNearby(List.of("insulin", "paracetamol"), 9.01, 38.75, 0L);
+    }
+
+    @Test
+    void searchMedicineCatalog_groupsByCatalogIdAndOmitsZeroPrice() {
+        Medicine insulin = Medicine.builder()
+                .id(5L)
+                .name("insulin")
+                .canonicalName("insulin")
+                .prescriptionRequired(false)
+                .build();
+        PharmacyInventory rxRow = PharmacyInventory.builder()
+                .id(1L)
+                .pharmacyId(10L)
+                .catalogMedicineId(5L)
+                .quantity(3)
+                .outOfStock(false)
+                .price(new BigDecimal("0"))
+                .requiresPrescription(true)
+                .build();
+        PharmacyInventory priced = PharmacyInventory.builder()
+                .id(2L)
+                .pharmacyId(11L)
+                .catalogMedicineId(5L)
+                .quantity(4)
+                .outOfStock(false)
+                .price(new BigDecimal("120.00"))
+                .requiresPrescription(false)
+                .build();
+        PharmacyInventory nullPrice = PharmacyInventory.builder()
+                .id(3L)
+                .pharmacyId(12L)
+                .catalogMedicineId(5L)
+                .quantity(1)
+                .outOfStock(false)
+                .price(null)
+                .build();
+
+        when(medicineRepository.searchByName("insulin", "insulin")).thenReturn(List.of(insulin));
+        when(pharmacyInventoryRepository.findByCatalogMedicineIdIn(List.of(5L)))
+                .thenReturn(List.of(rxRow, priced, nullPrice));
+
+        List<MiniAppMedicineSummaryDTO> result = miniAppService.searchMedicineCatalog("insulin", null, null);
+
+        assertEquals(1, result.size());
+        assertEquals(5L, result.get(0).getMedicineId());
+        assertEquals(new BigDecimal("120.00"), result.get(0).getPrice());
+        assertEquals(3, result.get(0).getAvailablePharmacies());
+        assertTrue(result.get(0).isPrescriptionRequired());
+        assertFalse(result.get(0).isOutOfStock());
+    }
+
+    @Test
+    void searchAnalogues_returnsOtherCatalogMedicinesSharingIngredient() {
+        Medicine selected = Medicine.builder()
+                .id(11L)
+                .name("Insulin Glargine")
+                .canonicalName("insulin glargine")
+                .activeIngredient("insulin")
+                .prescriptionRequired(true)
+                .build();
+        Medicine analogue = Medicine.builder()
+                .id(22L)
+                .name("Insulin Lispro")
+                .canonicalName("insulin lispro")
+                .activeIngredient("insulin")
+                .prescriptionRequired(true)
+                .build();
+        PharmacyInventory analogueRow = PharmacyInventory.builder()
+                .id(220L)
+                .pharmacyId(2L)
+                .catalogMedicineId(22L)
+                .medicineName("Insulin Lispro")
+                .quantity(6)
+                .outOfStock(false)
+                .price(new BigDecimal("380.00"))
+                .requiresPrescription(true)
+                .build();
+        PharmacyInventory analogueRow2 = PharmacyInventory.builder()
+                .id(221L)
+                .pharmacyId(3L)
+                .catalogMedicineId(22L)
+                .medicineName("Insulin Lispro")
+                .quantity(2)
+                .outOfStock(false)
+                .price(new BigDecimal("395.00"))
+                .requiresPrescription(true)
+                .build();
+
+        when(medicineRepository.findById(11L)).thenReturn(java.util.Optional.of(selected));
+        when(medicineRepository.findByActiveIngredientIgnoreCase("insulin"))
+                .thenReturn(List.of(selected, analogue));
+        when(pharmacyInventoryRepository.findByCatalogMedicineIdIn(List.of(22L)))
+                .thenReturn(List.of(analogueRow, analogueRow2));
+
+        List<MiniAppMedicineSummaryDTO> result = miniAppService.searchAnalogues(
+                "insulin glargine", 11L, null, null, 7L);
+
+        assertEquals(1, result.size());
+        assertEquals("Insulin Lispro", result.get(0).getMedicineName());
+        assertEquals(22L, result.get(0).getMedicineId());
+        assertEquals(2, result.get(0).getAvailablePharmacies());
+        assertEquals(new BigDecimal("380.00"), result.get(0).getPrice());
+        assertTrue(result.get(0).isPrescriptionRequired());
+        assertFalse(result.get(0).isOutOfStock());
+    }
+
+    @Test
+    void searchAnalogues_paracetamolOnly_returnsEmpty() {
+        Medicine selected = Medicine.builder()
+                .id(1L)
+                .name("paracetamol")
+                .canonicalName("paracetamol")
+                .activeIngredient("paracetamol")
+                .build();
+
+        when(medicineRepository.findById(1L)).thenReturn(java.util.Optional.of(selected));
+        when(medicineRepository.findByActiveIngredientIgnoreCase("paracetamol"))
+                .thenReturn(List.of(selected));
+
+        List<MiniAppMedicineSummaryDTO> result = miniAppService.searchAnalogues(
+                "paracetamol", 1L, null, null, 7L);
+
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    void searchAnalogues_excludesOutOfStockSibling() {
+        Medicine selected = Medicine.builder()
+                .id(11L)
+                .name("Insulin Glargine")
+                .canonicalName("insulin glargine")
+                .activeIngredient("insulin")
+                .build();
+        Medicine analogue = Medicine.builder()
+                .id(22L)
+                .name("Insulin Lispro")
+                .canonicalName("insulin lispro")
+                .activeIngredient("insulin")
+                .build();
+        PharmacyInventory outOfStock = PharmacyInventory.builder()
+                .id(220L)
+                .pharmacyId(2L)
+                .catalogMedicineId(22L)
+                .quantity(0)
+                .outOfStock(true)
+                .price(new BigDecimal("380.00"))
+                .build();
+
+        when(medicineRepository.findById(11L)).thenReturn(java.util.Optional.of(selected));
+        when(medicineRepository.findByActiveIngredientIgnoreCase("insulin"))
+                .thenReturn(List.of(selected, analogue));
+        when(pharmacyInventoryRepository.findByCatalogMedicineIdIn(List.of(22L)))
+                .thenReturn(List.of(outOfStock));
+
+        List<MiniAppMedicineSummaryDTO> result = miniAppService.searchAnalogues(
+                "insulin glargine", 11L, null, null, 7L);
+
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    void searchAnalogues_excludesSameDisplayName() {
+        Medicine selected = Medicine.builder()
+                .id(1L)
+                .name("paracetamol")
+                .canonicalName("paracetamol")
+                .activeIngredient("paracetamol")
+                .build();
+        Medicine lookalike = Medicine.builder()
+                .id(2L)
+                .name("Paracetamol")
+                .canonicalName("paracetamol 500mg")
+                .activeIngredient("paracetamol")
+                .strength("500mg")
+                .build();
+
+        when(medicineRepository.findById(1L)).thenReturn(java.util.Optional.of(selected));
+        when(medicineRepository.findByActiveIngredientIgnoreCase("paracetamol"))
+                .thenReturn(List.of(selected, lookalike));
+
+        List<MiniAppMedicineSummaryDTO> result = miniAppService.searchAnalogues(
+                "paracetamol", 1L, null, null, 7L);
+
+        assertTrue(result.isEmpty());
+    }
+
+    private PharmacyResponseDTO offerDto(String pharmacyName,
+                                         Long pharmacyId,
+                                         Long medicineId,
+                                         String medicineName,
+                                         String price) {
+        return PharmacyResponseDTO.builder()
+                .id(pharmacyId)
+                .name(pharmacyName)
+                .medicineId(medicineId)
+                .medicineName(medicineName)
+                .verified(true)
+                .requiresPrescription(true)
+                .openNow(true)
+                .distance(1.0)
+                .rating(40.0)
+                .price(new BigDecimal(price))
+                .outOfStock(false)
+                .build();
     }
 
     private PharmacyResponseDTO dto(String name,

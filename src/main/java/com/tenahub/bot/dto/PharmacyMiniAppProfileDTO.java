@@ -5,6 +5,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 
@@ -32,4 +33,7 @@ public class PharmacyMiniAppProfileDTO {
     private LocalDateTime lastInventoryUpdate;
     private String photoFileId;
     private boolean licenseSuspended;
+    private LocalDate licenseExpiryDate;
+    private String licenseUpdateStatus;
+    private LocalDate pendingLicenseExpiryDate;
 }

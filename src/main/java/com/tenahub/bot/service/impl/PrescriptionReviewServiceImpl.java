@@ -13,8 +13,11 @@ import com.tenahub.bot.repository.MedicineReservationRepository;
 import com.tenahub.bot.repository.PharmacyInventoryRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
 import com.tenahub.bot.repository.ReservationPrescriptionFileRepository;
+import com.tenahub.bot.service.PharmacyNotificationService;
 import com.tenahub.bot.service.PrescriptionReviewService;
 import com.tenahub.bot.service.ReservationService;
+import com.tenahub.bot.service.ReservationStatusHistoryService;
+import com.tenahub.bot.entity.PharmacyNotificationType;
 import com.tenahub.bot.util.TelegramClient;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
@@ -44,6 +47,8 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
     private final PharmacyInventoryRepository pharmacyInventoryRepository;
     private final ReservationService reservationService;
     private final TelegramClient telegramClient;
+    private final PharmacyNotificationService pharmacyNotificationService;
+    private final ReservationStatusHistoryService reservationStatusHistoryService;
 
     @Value("${tenahub.reservation.pending-timeout-minutes:20}")
     private long pendingReservationTimeoutMinutes;
@@ -125,13 +130,28 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
         }
 
         LocalDateTime pendingExpiresAt = uploadedAt.plusMinutes(pendingReservationTimeoutMinutes);
+        boolean clarificationReply = false;
         for (MedicineReservation reservation : reservations) {
             if (reservation.isPrescriptionRequired()) {
+                PrescriptionReviewStatus previousRx = reservation.getPrescriptionReviewStatus();
+                if (previousRx == PrescriptionReviewStatus.NEEDS_CLARIFICATION
+                        || previousRx == PrescriptionReviewStatus.UPLOAD_REQUIRED) {
+                    clarificationReply = clarificationReply
+                            || previousRx == PrescriptionReviewStatus.NEEDS_CLARIFICATION;
+                }
                 reservation.setPrescriptionRequired(true);
                 reservation.setPrescriptionReviewStatus(PrescriptionReviewStatus.PENDING_REVIEW);
                 reservation.setPrescriptionReviewedAt(null);
                 reservation.setPrescriptionReviewedBy(null);
                 reservation.setPrescriptionRejectionReason(null);
+                reservation.setPrescriptionClarificationMessage(null);
+                reservation.setPrescriptionClarificationAt(null);
+                reservationStatusHistoryService.record(
+                        reservation,
+                        reservation.getStatus() == null ? null : reservation.getStatus().name(),
+                        reservation.getStatus() == null ? null : reservation.getStatus().name(),
+                        resolvedUserId,
+                        "rx:" + (previousRx == null ? "UNKNOWN" : previousRx.name()) + "→PENDING_REVIEW");
             }
             // Update note if provided with this upload
             if (resolvedNote != null) {
@@ -157,33 +177,51 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                 + ", fileCountInStatus=" + (statusResponse.getFiles() == null ? 0 : statusResponse.getFiles().size()));
         if (savedFileCount > 0) {
             notifyPharmacyPrescriptionReadyAfterCommit(statusResponse, savedFileEntities);
+            PharmacyNotificationType inboxType = clarificationReply
+                    ? PharmacyNotificationType.PRESCRIPTION_CLARIFICATION_REPLY
+                    : PharmacyNotificationType.PRESCRIPTION_REVIEW;
+            String title = clarificationReply ? "Clarification reply received" : "Prescription ready for review";
+            String medicineName = (statusResponse.getItems() != null && !statusResponse.getItems().isEmpty())
+                    ? statusResponse.getItems().get(0).getMedicineName()
+                    : null;
+            pharmacyNotificationService.create(
+                    resolvedPharmacyId,
+                    inboxType,
+                    title,
+                    title + (medicineName == null ? "" : " for " + medicineName),
+                    statusResponse.getReservationId(),
+                    medicineName);
         }
 
         // Notify the customer that their prescription has been submitted to the pharmacy.
         Long customerTelegramId = resolvedUserId;
         if (customerTelegramId != null && customerTelegramId > 0) {
             Long customerId = customerTelegramId;
+            Long statusReservationId = statusResponse.getReservationId();
+            String statusGroupId = statusResponse.getReservationGroupId();
             String medicineName = (statusResponse.getItems() != null && !statusResponse.getItems().isEmpty())
                     ? statusResponse.getItems().get(0).getMedicineName() : "your medicine";
             String customerMsg = "\u2705 Your prescription for <b>" + medicineName + "</b> has been submitted."
                     + "\nThe pharmacy has been notified and will review it shortly.";
+            String statusUrl = telegramClient.buildMiniAppUserReservationStatusUrl(
+                    "active", statusReservationId, statusGroupId);
+            Runnable notifyCustomer = () -> {
+                try {
+                    telegramClient.sendMessageWithMiniAppButton(
+                            customerId, customerMsg, statusUrl, "📄 View reservation");
+                } catch (Exception e) {
+                    System.out.println("[RX_UPLOAD] Failed to notify customer: " + e.getMessage());
+                }
+            };
             if (TransactionSynchronizationManager.isSynchronizationActive()) {
                 TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                     @Override
                     public void afterCommit() {
-                        try {
-                            telegramClient.sendMessage(customerId, customerMsg, "HTML");
-                        } catch (Exception e) {
-                            System.out.println("[RX_UPLOAD] Failed to notify customer: " + e.getMessage());
-                        }
+                        notifyCustomer.run();
                     }
                 });
             } else {
-                try {
-                    telegramClient.sendMessage(customerId, customerMsg, "HTML");
-                } catch (Exception e) {
-                    System.out.println("[RX_UPLOAD] Failed to notify customer: " + e.getMessage());
-                }
+                notifyCustomer.run();
             }
         }
 
@@ -234,6 +272,7 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
 
         PrescriptionReviewStatus decision = normalizeDecision(request == null ? null : request.getDecision());
         String rejectionReason = request == null ? null : request.getRejectionReason();
+        String clarificationMessage = request == null ? null : request.getClarificationMessage();
         List<MedicineReservation> requiredReservations = reservations.stream()
                 .filter(MedicineReservation::isPrescriptionRequired)
                 .toList();
@@ -245,6 +284,43 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
         LocalDateTime reviewedAt = LocalDateTime.now();
         List<ReservationPrescriptionFile> files = collectPrescriptionFiles(reservations);
 
+        if (decision == PrescriptionReviewStatus.NEEDS_CLARIFICATION) {
+            String resolvedMessage = clarificationMessage == null ? "" : clarificationMessage.trim();
+            if (resolvedMessage.length() < 3) {
+                throw new RuntimeException("clarificationMessage must be at least 3 characters");
+            }
+            for (MedicineReservation reservation : requiredReservations) {
+                if (reservation.getPrescriptionReviewStatus() != PrescriptionReviewStatus.PENDING_REVIEW
+                        && reservation.getPrescriptionReviewStatus() != PrescriptionReviewStatus.NEEDS_CLARIFICATION) {
+                    throw new RuntimeException("Only prescriptions pending review can request clarification");
+                }
+                PrescriptionReviewStatus previousRx = reservation.getPrescriptionReviewStatus();
+                reservation.setPrescriptionReviewStatus(PrescriptionReviewStatus.NEEDS_CLARIFICATION);
+                reservation.setPrescriptionClarificationMessage(resolvedMessage);
+                reservation.setPrescriptionClarificationAt(reviewedAt);
+                reservation.setPrescriptionReviewedAt(reviewedAt);
+                reservation.setPrescriptionReviewedBy(pharmacyTelegramId);
+                reservation.setPrescriptionRejectionReason(null);
+                reservationRepository.save(reservation);
+                reservationStatusHistoryService.record(
+                        reservation,
+                        reservation.getStatus() == null ? null : reservation.getStatus().name(),
+                        reservation.getStatus() == null ? null : reservation.getStatus().name(),
+                        pharmacyTelegramId,
+                        "rx:" + previousRx.name() + "→NEEDS_CLARIFICATION");
+            }
+            for (ReservationPrescriptionFile file : files) {
+                file.setReviewStatus(PrescriptionReviewStatus.NEEDS_CLARIFICATION);
+                file.setReviewedAt(reviewedAt);
+                file.setReviewedBy(pharmacyTelegramId);
+                file.setRejectionReason(null);
+                prescriptionFileRepository.save(file);
+            }
+            PrescriptionStatusResponseDTO response = buildStatusResponse(reservations);
+            notifyCustomerOfPrescriptionClarification(response, resolvedMessage);
+            return response;
+        }
+
         if (decision == PrescriptionReviewStatus.APPROVED) {
             if (files.isEmpty()) {
                 throw new RuntimeException("No prescription files have been uploaded for this reservation");
@@ -254,10 +330,13 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                 if (reservation.getStatus() != com.tenahub.bot.entity.MedicineReservationStatus.PENDING) {
                     throw new RuntimeException("Only pending reservations can have prescription approved");
                 }
+                PrescriptionReviewStatus previousRx = reservation.getPrescriptionReviewStatus();
                 reservation.setPrescriptionReviewStatus(PrescriptionReviewStatus.APPROVED);
                 reservation.setPrescriptionReviewedAt(reviewedAt);
                 reservation.setPrescriptionReviewedBy(pharmacyTelegramId);
                 reservation.setPrescriptionRejectionReason(null);
+                reservation.setPrescriptionClarificationMessage(null);
+                reservation.setPrescriptionClarificationAt(null);
                 // Deduct stock now that prescription is approved (was deferred at reservation creation).
                 if (!reservation.isInventoryHeld()) {
                     System.out.println("[RX_APPROVE] Holding inventory for approved prescription: reservationId="
@@ -273,6 +352,12 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                     System.out.println("[RX_APPROVE] Stock already held for reservationId=" + reservation.getId());
                 }
                 reservationRepository.save(reservation);
+                reservationStatusHistoryService.record(
+                        reservation,
+                        reservation.getStatus() == null ? null : reservation.getStatus().name(),
+                        reservation.getStatus() == null ? null : reservation.getStatus().name(),
+                        pharmacyTelegramId,
+                        "rx:" + (previousRx == null ? "UNKNOWN" : previousRx.name()) + "→APPROVED");
             }
 
             for (ReservationPrescriptionFile file : files) {
@@ -288,15 +373,24 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                     : rejectionReason.trim();
 
             for (MedicineReservation reservation : requiredReservations) {
-                MedicineReservation rejectedReservation = reservation;
-                if (reservation.getStatus() == com.tenahub.bot.entity.MedicineReservationStatus.PENDING) {
-                    rejectedReservation = reservationService.rejectReservation(reservation.getId(), resolvedReason);
-                }
-                rejectedReservation.setPrescriptionReviewStatus(PrescriptionReviewStatus.REJECTED);
-                rejectedReservation.setPrescriptionReviewedAt(reviewedAt);
-                rejectedReservation.setPrescriptionReviewedBy(pharmacyTelegramId);
-                rejectedReservation.setPrescriptionRejectionReason(resolvedReason);
-                reservationRepository.save(rejectedReservation);
+                // Re-open upload instead of cancelling the reservation so the customer can try again.
+                PrescriptionReviewStatus previousRx = reservation.getPrescriptionReviewStatus();
+                reservation.setStatus(com.tenahub.bot.entity.MedicineReservationStatus.PENDING);
+                reservation.setPrescriptionReviewStatus(PrescriptionReviewStatus.UPLOAD_REQUIRED);
+                reservation.setPrescriptionReviewedAt(reviewedAt);
+                reservation.setPrescriptionReviewedBy(pharmacyTelegramId);
+                reservation.setPrescriptionRejectionReason(resolvedReason);
+                reservation.setPrescriptionClarificationMessage(null);
+                reservation.setPrescriptionClarificationAt(null);
+                reservation.setRejectionReason(null);
+                reservation.setPendingExpiresAt(null);
+                reservationRepository.save(reservation);
+                reservationStatusHistoryService.record(
+                        reservation,
+                        "PENDING",
+                        "PENDING",
+                        pharmacyTelegramId,
+                        "rx:" + (previousRx == null ? "UNKNOWN" : previousRx.name()) + "→UPLOAD_REQUIRED");
             }
 
             for (ReservationPrescriptionFile file : files) {
@@ -308,7 +402,61 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
             }
         }
 
-        return buildStatusResponse(reservations);
+        PrescriptionStatusResponseDTO response = buildStatusResponse(reservations);
+        boolean approved = decision == PrescriptionReviewStatus.APPROVED;
+        notifyCustomerOfPrescriptionDecision(response, approved);
+        return response;
+    }
+
+    @Override
+    public void notifyCustomerOfPrescriptionDecision(PrescriptionStatusResponseDTO status, boolean approved) {
+        if (status == null || status.getUserId() == null) {
+            return;
+        }
+
+        StringBuilder message = new StringBuilder();
+        if (approved) {
+            message.append("✅ Your prescription was approved.\n\n");
+            message.append("Your reservation is now ready for pharmacy approval.");
+        } else {
+            message.append("❌ Your prescription was rejected.\n\n");
+            if (status.getRejectionReason() != null && !status.getRejectionReason().isBlank()) {
+                message.append("Reason: ").append(status.getRejectionReason()).append("\n\n");
+            }
+            message.append("Please upload a valid prescription and try again.");
+        }
+
+        if (status.getItems() != null && !status.getItems().isEmpty()) {
+            message.append("\n\nMedicines:\n");
+            for (var item : status.getItems()) {
+                message.append("• ").append(item.getMedicineName()).append("\n");
+            }
+        }
+
+        String statusUrl = telegramClient.buildMiniAppUserReservationStatusUrl(
+                "active", status.getReservationId(), status.getReservationGroupId());
+        telegramClient.sendMessageWithMiniAppButton(
+                status.getUserId(),
+                message.toString(),
+                statusUrl,
+                "📄 View reservation");
+    }
+
+    private void notifyCustomerOfPrescriptionClarification(PrescriptionStatusResponseDTO status, String clarificationMessage) {
+        if (status == null || status.getUserId() == null) {
+            return;
+        }
+        StringBuilder message = new StringBuilder();
+        message.append("❓ The pharmacy needs clarification on your prescription.\n\n");
+        message.append(clarificationMessage == null ? "" : clarificationMessage.trim());
+        message.append("\n\nPlease upload an updated prescription or reply by re-uploading.");
+        String statusUrl = telegramClient.buildMiniAppUserReservationStatusUrl(
+                "active", status.getReservationId(), status.getReservationGroupId());
+        telegramClient.sendMessageWithMiniAppButton(
+                status.getUserId(),
+                message.toString(),
+                statusUrl,
+                "📄 View reservation");
     }
 
     @Override
@@ -356,7 +504,9 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
             switch (reservation.getStatus()) {
                 case PENDING -> {
                 }
-                case APPROVED, FULFILLED, CANCELLED, EXPIRED, REJECTED ->
+                case READY_FOR_PICKUP, APPROVED, FULFILLED, CANCELLED, EXPIRED, REJECTED ->
+                        throw new RuntimeException("Prescription files can only be uploaded for pending reservations");
+                default ->
                         throw new RuntimeException("Prescription files can only be uploaded for pending reservations");
             }
         }
@@ -412,7 +562,9 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
         return switch (normalized) {
             case "approve", "approved", "prescription_approved" -> PrescriptionReviewStatus.APPROVED;
             case "reject", "rejected", "prescription_rejected" -> PrescriptionReviewStatus.REJECTED;
-            default -> throw new RuntimeException("decision must be approve or reject");
+            case "clarify", "clarification", "needs_clarification", "prescription_clarification" ->
+                    PrescriptionReviewStatus.NEEDS_CLARIFICATION;
+            default -> throw new RuntimeException("decision must be approve, reject, or clarify");
         };
     }
 
@@ -454,6 +606,11 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                 .orElse(null);
         String rejectionReason = sortedReservations.stream()
                 .map(MedicineReservation::getPrescriptionRejectionReason)
+                .filter(value -> value != null && !value.isBlank())
+                .findFirst()
+                .orElse(null);
+        String clarificationMessage = sortedReservations.stream()
+                .map(MedicineReservation::getPrescriptionClarificationMessage)
                 .filter(value -> value != null && !value.isBlank())
                 .findFirst()
                 .orElse(null);
@@ -532,6 +689,7 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                 .userId(first.getUserId())
                 .pharmacyId(first.getPharmacyId())
                 .customerPhone(first.getCustomerPhone())
+                .customerName(first.getCustomerName())
                 .note(sortedReservations.stream()
                         .map(MedicineReservation::getNote)
                         .filter(n -> n != null && !n.isBlank())
@@ -541,6 +699,7 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
                 .reviewedAt(reviewedAt)
                 .reviewedBy(reviewedBy)
                 .rejectionReason(rejectionReason)
+                .clarificationMessage(clarificationMessage)
                 .reservationStatus(reservationStatus)
                 .pharmacyName(pharmacyName)
                 .medicineName(medicineName)
@@ -567,6 +726,7 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
             return "WAITING_RESERVATION_APPROVAL";
         }
         if (reviewStatus == PrescriptionReviewStatus.PENDING_REVIEW) return "PRESCRIPTION_REVIEW";
+        if (reviewStatus == PrescriptionReviewStatus.NEEDS_CLARIFICATION) return "PRESCRIPTION_CLARIFICATION";
         if (reviewStatus == PrescriptionReviewStatus.UPLOAD_REQUIRED) return "UPLOAD_PRESCRIPTION";
         return "RESERVED";
     }
@@ -600,6 +760,10 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
         if (requiredReservations.stream().anyMatch(reservation ->
                 reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.REJECTED)) {
             return PrescriptionReviewStatus.REJECTED;
+        }
+        if (requiredReservations.stream().anyMatch(reservation ->
+                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.NEEDS_CLARIFICATION)) {
+            return PrescriptionReviewStatus.NEEDS_CLARIFICATION;
         }
         if (requiredReservations.stream().allMatch(reservation ->
                 reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.APPROVED)) {
@@ -637,40 +801,21 @@ public class PrescriptionReviewServiceImpl implements PrescriptionReviewService 
         }
 
         Long resolvedPharmacyTelegramId = pharmacyTelegramId;
-        // Snapshot file data in-memory now (inside transaction) — avoids any DB lookup after commit.
-        List<ReservationPrescriptionFile> filesToSend = savedFiles == null
-                ? java.util.Collections.emptyList() : new ArrayList<>(savedFiles);
+        // filesToSend kept only for logging context; binaries are viewed in Mini App.
+        int fileCount = savedFiles == null ? 0 : savedFiles.size();
 
         Runnable notifier = () -> {
             try {
-                System.out.println("[PRESC_NOTIFY] Sending prescription review card to pharmacyTelegramId=" + resolvedPharmacyTelegramId);
+                System.out.println("[PRESC_NOTIFY] Sending prescription review card to pharmacyTelegramId="
+                        + resolvedPharmacyTelegramId + " fileCount=" + fileCount);
                 telegramClient.sendPharmacyPrescriptionReviewCard(resolvedPharmacyTelegramId, statusResponse);
                 System.out.println("[PRESC_NOTIFY] Review card sent OK");
             } catch (Exception e) {
                 System.out.println("[PRESC_NOTIFY] Exception sending card: " + e.getMessage());
                 e.printStackTrace();
             }
-            int idx = 1;
-            for (ReservationPrescriptionFile fileEntity : filesToSend) {
-                try {
-                    byte[] data = fileEntity.getFileData();
-                    if (data == null || data.length == 0) {
-                        System.out.println("[PRESC_NOTIFY] File data empty for id=" + fileEntity.getId());
-                        continue;
-                    }
-                    String filename = fileEntity.getOriginalFilename() != null
-                            ? fileEntity.getOriginalFilename() : "prescription";
-                    String caption = "Prescription file " + idx + " of " + filesToSend.size()
-                            + "\n" + filename;
-                    telegramClient.sendDocumentBytes(resolvedPharmacyTelegramId, data, filename, caption);
-                    System.out.println("[PRESC_NOTIFY] Sent file " + idx + "/" + filesToSend.size()
-                            + " (id=" + fileEntity.getId() + ") to pharmacyTelegramId=" + resolvedPharmacyTelegramId);
-                    idx++;
-                } catch (Exception e) {
-                    System.out.println("[PRESC_NOTIFY] Failed to send file id=" + fileEntity.getId() + ": " + e.getMessage());
-                    e.printStackTrace();
-                }
-            }
+            // Do not dump prescription binaries into Telegram chat.
+            // Pharmacists open files via Mini App "View Prescription".
         };
 
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {

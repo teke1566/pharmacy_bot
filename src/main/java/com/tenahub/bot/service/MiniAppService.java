@@ -1,6 +1,7 @@
 package com.tenahub.bot.service;
 
 import com.tenahub.bot.dto.MiniAppMedicinePhotosDTO;
+import com.tenahub.bot.dto.MiniAppMedicineSummaryDTO;
 import com.tenahub.bot.dto.MiniAppAuthSendCodeRequestDTO;
 import com.tenahub.bot.dto.MiniAppAuthVerifyCodeRequestDTO;
 import com.tenahub.bot.dto.MiniAppAuthVerifyCodeResponseDTO;
@@ -34,6 +35,8 @@ public interface MiniAppService {
     List<MiniAppReservationCardDTO> getReservationHistory(Long telegramUserId);
 
     MiniAppOperationResponseDTO hideReservationFromHistory(Long reservationId, Long telegramUserId);
+
+    MiniAppOperationResponseDTO hideReservationsFromHistory(List<Long> reservationIds, Long telegramUserId);
 
     MiniAppOperationResponseDTO clearReservationHistory(Long telegramUserId);
     
@@ -73,6 +76,30 @@ public interface MiniAppService {
                                      Long userId,
                                      String sort,
                                      String filter);
+
+    List<PharmacyResponseDTO> search(String medicine,
+                                     Long catalogMedicineId,
+                                     Double latitude,
+                                     Double longitude,
+                                     Long userId,
+                                     String sort,
+                                     String filter);
+
+    List<MiniAppMedicineSummaryDTO> searchMedicineCatalog(String medicine,
+                                                          Double latitude,
+                                                          Double longitude);
+
+    List<MiniAppMedicineSummaryDTO> searchAnalogues(String medicine,
+                                                    Long medicineId,
+                                                    Double latitude,
+                                                    Double longitude,
+                                                    Long userId);
+
+    List<com.tenahub.bot.dto.MultiMedicinePharmacyResultDTO> searchMultipleMedicines(
+            List<String> medicines,
+            Double latitude,
+            Double longitude,
+            Long userId);
 
     MiniAppPharmacyDetailDTO getPharmacyDetails(Long pharmacyId);
 

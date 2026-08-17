@@ -2,8 +2,10 @@ package com.tenahub.bot.service.impl;
 
 import com.tenahub.bot.entity.MedicineReservation;
 import com.tenahub.bot.entity.Pharmacy;
+import com.tenahub.bot.entity.PharmacyNotificationType;
 import com.tenahub.bot.entity.PrescriptionReviewStatus;
 import com.tenahub.bot.repository.PharmacyRepository;
+import com.tenahub.bot.service.PharmacyNotificationService;
 import com.tenahub.bot.service.ReservationWorkflowService;
 import com.tenahub.bot.util.TelegramClient;
 import lombok.RequiredArgsConstructor;
@@ -21,6 +23,7 @@ public class ReservationWorkflowServiceImpl implements ReservationWorkflowServic
 
     private final PharmacyRepository pharmacyRepository;
     private final TelegramClient telegramClient;
+    private final PharmacyNotificationService pharmacyNotificationService;
 
     @Override
     public void notifyPharmacyPendingReservation(MedicineReservation reservation, long pendingTimeoutMinutes) {
@@ -60,6 +63,14 @@ public class ReservationWorkflowServiceImpl implements ReservationWorkflowServic
             return;
         }
 
+        // Prescription-required reservations get one combined pharmacy card after upload
+        // (Prescription Review). Skip the early "waiting for upload" card to avoid duplicates.
+        if (isAwaitingPrescriptionUpload(reservation)) {
+            log.info("Skipping waiting-for-upload pharmacy card for reservation {} — review card sent after Rx upload",
+                    reservation.getId());
+            return;
+        }
+
         Pharmacy pharmacy = pharmacyRepository.findById(reservation.getPharmacyId()).orElse(null);
         if (pharmacy == null) {
             log.error("Cannot notify pharmacy: pharmacy {} not found for reservation {}",
@@ -83,8 +94,16 @@ public class ReservationWorkflowServiceImpl implements ReservationWorkflowServic
                 reservation.getCustomerPhone(),
                 reservation.getCustomerName(),
                 pendingTimeoutMinutes,
-                isAwaitingPrescriptionUpload(reservation)
+                false
         );
+        pharmacyNotificationService.create(
+                pharmacy.getId(),
+                PharmacyNotificationType.RESERVATION_PENDING,
+                "New reservation",
+                "Reservation #" + reservation.getId() + " for " + reservation.getMedicineName()
+                        + " (qty " + reservation.getRequestedQuantity() + ")",
+                reservation.getId(),
+                reservation.getMedicineName());
     }
 
     private void doNotifyGroup(List<MedicineReservation> reservations, long pendingTimeoutMinutes) {
@@ -93,6 +112,14 @@ public class ReservationWorkflowServiceImpl implements ReservationWorkflowServic
         }
         if (reservations.size() == 1) {
             doNotify(reservations.get(0), pendingTimeoutMinutes);
+            return;
+        }
+
+        // If every item is still waiting for prescription upload, skip the early group card.
+        boolean allAwaitingUpload = reservations.stream().allMatch(this::isAwaitingPrescriptionUpload);
+        if (allAwaitingUpload) {
+            log.info("Skipping waiting-for-upload grouped pharmacy card for group {} — review card sent after Rx upload",
+                    reservations.get(0).getReservationGroupId());
             return;
         }
 
@@ -119,6 +146,19 @@ public class ReservationWorkflowServiceImpl implements ReservationWorkflowServic
         }
 
         telegramClient.sendPharmacyGroupedReservationCard(pharmacy.getTelegramId(), groupId, reservations);
+        String medicineSummary = reservations.stream()
+                .map(MedicineReservation::getMedicineName)
+                .filter(name -> name != null && !name.isBlank())
+                .distinct()
+                .reduce((a, b) -> a + ", " + b)
+                .orElse("medicines");
+        pharmacyNotificationService.create(
+                pharmacy.getId(),
+                PharmacyNotificationType.RESERVATION_PENDING,
+                "New grouped reservation",
+                "Group " + groupId + " with " + reservations.size() + " items: " + medicineSummary,
+                first.getId(),
+                first.getMedicineName());
     }
 
     private boolean isAwaitingPrescriptionUpload(MedicineReservation reservation) {

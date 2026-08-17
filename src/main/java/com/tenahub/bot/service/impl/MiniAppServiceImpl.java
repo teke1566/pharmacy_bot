@@ -1,13 +1,18 @@
 package com.tenahub.bot.service.impl;
 
+import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -29,6 +34,7 @@ import com.tenahub.bot.dto.MiniAppAuthVerifyCodeResponseDTO;
 import com.tenahub.bot.dto.MiniAppOperationResponseDTO;
 import com.tenahub.bot.dto.MiniAppPharmacyPhotosDTO;
 import com.tenahub.bot.dto.MiniAppMedicinePhotosDTO;
+import com.tenahub.bot.dto.MiniAppMedicineSummaryDTO;
 import com.tenahub.bot.dto.MiniAppPharmacyDetailDTO;
 import com.tenahub.bot.dto.MiniAppPhotoDTO;
 import com.tenahub.bot.dto.MiniAppInventoryItemDTO;
@@ -41,8 +47,10 @@ import com.tenahub.bot.dto.MiniAppReservationPreloadItemDTO;
 import com.tenahub.bot.dto.MiniAppReservationPreloadResponseDTO;
 import com.tenahub.bot.dto.MiniAppReservationCreateRequestDTO;
 import com.tenahub.bot.dto.MiniAppReservationResponseDTO;
+import com.tenahub.bot.dto.MultiMedicinePharmacyResultDTO;
 import com.tenahub.bot.dto.PharmacyResponseDTO;
 import com.tenahub.bot.entity.MiniAppPhoneVerification;
+import com.tenahub.bot.entity.Medicine;
 import com.tenahub.bot.entity.MedicinePhoto;
 import com.tenahub.bot.entity.MedicineReservation;
 import com.tenahub.bot.entity.MedicineReservationStatus;
@@ -50,12 +58,15 @@ import com.tenahub.bot.entity.Pharmacy;
 import com.tenahub.bot.entity.PharmacyPhoto;
 import com.tenahub.bot.entity.PharmacyInventory;
 import com.tenahub.bot.entity.PrescriptionReviewStatus;
+import com.tenahub.bot.entity.UserFavoritePharmacy;
 import com.tenahub.bot.repository.MiniAppPhoneVerificationRepository;
 import com.tenahub.bot.repository.MedicineReservationRepository;
+import com.tenahub.bot.repository.MedicineRepository;
 import com.tenahub.bot.repository.PharmacyInventoryRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
 import com.tenahub.bot.repository.PharmacyPhotoRepository;
 import com.tenahub.bot.repository.MedicinePhotoRepository;
+import com.tenahub.bot.repository.UserFavoritePharmacyRepository;
 import com.tenahub.bot.service.MedicinePhotoService;
 import com.tenahub.bot.service.MiniAppAuthException;
 import com.tenahub.bot.service.MiniAppService;
@@ -93,6 +104,7 @@ public class MiniAppServiceImpl implements MiniAppService {
 
     private record SearchPreferences(SearchOption sortOption,
                                      boolean openNowOnly,
+                                     boolean inStockOnly,
                                      boolean verifiedOnly,
                                      boolean prescriptionRequiredOnly,
                                      boolean noPrescriptionOnly,
@@ -112,6 +124,9 @@ public class MiniAppServiceImpl implements MiniAppService {
     private PharmacyInventoryRepository pharmacyInventoryRepository;
 
     @Autowired
+    private MedicineRepository medicineRepository;
+
+    @Autowired
     private MedicinePhotoRepository medicinePhotoRepository;
 
     @Autowired
@@ -119,6 +134,9 @@ public class MiniAppServiceImpl implements MiniAppService {
 
     @Autowired
     private PharmacyService pharmacyService;
+
+    @Autowired
+    private UserFavoritePharmacyRepository userFavoritePharmacyRepository;
 
     @Autowired
     private ReservationService reservationService;
@@ -329,12 +347,21 @@ public class MiniAppServiceImpl implements MiniAppService {
             reservations = List.of();
         }
 
-        // Expire past-deadline reservations before building cards
+        // Expire/cancel past-deadline reservations before building cards
         LocalDateTime now = LocalDateTime.now();
         List<MedicineReservation> stillActive = new java.util.ArrayList<>();
         for (MedicineReservation r : reservations) {
-            if (r.getExpiresAt() != null && !r.getExpiresAt().isAfter(now)) {
-                try {
+            try {
+                if (r.getStatus() == MedicineReservationStatus.PENDING
+                        && r.getPendingExpiresAt() != null
+                        && !r.getPendingExpiresAt().isAfter(now)
+                        && r.getPrescriptionReviewStatus() != PrescriptionReviewStatus.UPLOAD_REQUIRED
+                        && r.getPrescriptionReviewStatus() != PrescriptionReviewStatus.PENDING_REVIEW) {
+                    reservationService.autoCancelPendingReservation(r.getId(), "AUTO_CANCELLED_PENDING_TIMEOUT");
+                    log.info("[Service] getActiveReservations: Auto-cancelled pending reservation id={}", r.getId());
+                    continue;
+                }
+                if (r.getExpiresAt() != null && !r.getExpiresAt().isAfter(now)) {
                     if (r.getStatus() == MedicineReservationStatus.PENDING) {
                         reservationService.autoCancelPendingReservation(r.getId(), "AUTO_CANCELLED_PENDING_TIMEOUT");
                         log.info("[Service] getActiveReservations: Auto-cancelled pending reservation id={}", r.getId());
@@ -342,10 +369,11 @@ public class MiniAppServiceImpl implements MiniAppService {
                         reservationService.expireReservation(r.getId());
                         log.info("[Service] getActiveReservations: Auto-expired reservation id={}", r.getId());
                     }
-                } catch (Exception ex) {
-                    log.warn("[Service] getActiveReservations: Failed to expire/cancel reservation id={}: {}", r.getId(), ex.getMessage());
+                    continue;
                 }
-            } else {
+                stillActive.add(r);
+            } catch (Exception ex) {
+                log.warn("[Service] getActiveReservations: Failed to expire/cancel reservation id={}: {}", r.getId(), ex.getMessage());
                 stillActive.add(r);
             }
         }
@@ -406,6 +434,43 @@ public class MiniAppServiceImpl implements MiniAppService {
         return MiniAppOperationResponseDTO.builder()
                 .success(true)
                 .message("Reservation removed from history.")
+                .build();
+    }
+
+    @Override
+    public MiniAppOperationResponseDTO hideReservationsFromHistory(List<Long> reservationIds, Long telegramUserId) {
+        Long userId = requireTelegramUserId(telegramUserId);
+        if (reservationIds == null || reservationIds.isEmpty()) {
+            return MiniAppOperationResponseDTO.builder()
+                    .success(true)
+                    .message("No reservations selected.")
+                    .build();
+        }
+        LocalDateTime hiddenAt = LocalDateTime.now();
+        int hiddenCount = 0;
+        for (Long reservationId : reservationIds) {
+            if (reservationId == null) {
+                continue;
+            }
+            MedicineReservation reservation = medicineReservationRepository.findById(reservationId).orElse(null);
+            if (reservation == null || reservation.getUserId() == null || !reservation.getUserId().equals(userId)) {
+                continue;
+            }
+            if (!isUserHistoryStatus(reservation.getStatus())) {
+                continue;
+            }
+            List<MedicineReservation> toHide = resolveHistoryHideTargets(reservation, userId);
+            for (MedicineReservation item : toHide) {
+                if (item.getHiddenFromUserAt() == null) {
+                    item.setHiddenFromUserAt(hiddenAt);
+                    hiddenCount++;
+                }
+            }
+            medicineReservationRepository.saveAll(toHide);
+        }
+        return MiniAppOperationResponseDTO.builder()
+                .success(true)
+                .message("Removed " + hiddenCount + " reservation(s) from history.")
                 .build();
     }
 
@@ -542,10 +607,30 @@ public class MiniAppServiceImpl implements MiniAppService {
 
     @Override
     public MiniAppMedicinePhotosDTO getMedicinePhotos(Long medicineId) {
-        PharmacyInventory medicine = pharmacyInventoryRepository.findById(medicineId)
-                .orElseThrow(() -> new RuntimeException("Medicine not found with ID: " + medicineId));
+        PharmacyInventory medicine = pharmacyInventoryRepository.findById(medicineId).orElse(null);
+        Long photoMedicineId = medicineId;
+        Long pharmacyId = medicine == null ? null : medicine.getPharmacyId();
+        String medicineName = medicine == null ? null : medicine.getMedicineName();
 
-        List<MedicinePhoto> photos = medicinePhotoService.listByMedicineId(medicineId);
+        if (medicine == null) {
+            Medicine catalog = medicineRepository.findById(medicineId)
+                    .orElseThrow(() -> new RuntimeException("Medicine not found with ID: " + medicineId));
+            medicineName = catalog.getName();
+            List<PharmacyInventory> linked = pharmacyInventoryRepository.findByCatalogMedicineId(medicineId);
+            for (PharmacyInventory item : linked) {
+                if (item.getId() != null && medicinePhotoRepository.countByMedicineId(item.getId()) > 0) {
+                    photoMedicineId = item.getId();
+                    pharmacyId = item.getPharmacyId();
+                    break;
+                }
+            }
+            if (photoMedicineId.equals(medicineId) && !linked.isEmpty()) {
+                photoMedicineId = linked.get(0).getId();
+                pharmacyId = linked.get(0).getPharmacyId();
+            }
+        }
+
+        List<MedicinePhoto> photos = medicinePhotoService.listByMedicineId(photoMedicineId);
 
         List<MiniAppPhotoDTO> photoDTOs = photos.stream()
                 .map(photo -> MiniAppPhotoDTO.builder()
@@ -559,20 +644,29 @@ public class MiniAppServiceImpl implements MiniAppService {
 
         return MiniAppMedicinePhotosDTO.builder()
                 .medicineId(medicineId)
-                .pharmacyId(medicine.getPharmacyId())
-                .medicineName(medicine.getMedicineName())
+                .pharmacyId(pharmacyId)
+                .medicineName(medicineName)
                 .photos(photoDTOs)
                 .build();
     }
 
     @Override
     public byte[] downloadMedicinePhoto(Long medicineId, Long photoId) {
-        pharmacyInventoryRepository.findById(medicineId)
+        if (pharmacyInventoryRepository.findById(medicineId).isPresent()) {
+            MedicinePhoto photo = medicinePhotoRepository.findByIdAndMedicineId(photoId, medicineId)
+                    .orElseThrow(() -> new RuntimeException("Medicine photo not found with ID: " + photoId));
+            return medicinePhotoService.getImageBytesByTelegramFileId(photo.getTelegramFileId());
+        }
+
+        Medicine catalog = medicineRepository.findById(medicineId)
                 .orElseThrow(() -> new RuntimeException("Medicine not found with ID: " + medicineId));
-
-        MedicinePhoto photo = medicinePhotoRepository.findByIdAndMedicineId(photoId, medicineId)
+        MedicinePhoto photo = medicinePhotoRepository.findById(photoId)
                 .orElseThrow(() -> new RuntimeException("Medicine photo not found with ID: " + photoId));
-
+        boolean linked = pharmacyInventoryRepository.findByCatalogMedicineId(catalog.getId()).stream()
+                .anyMatch(item -> item.getId() != null && item.getId().equals(photo.getMedicineId()));
+        if (!linked) {
+            throw new RuntimeException("Medicine photo not found with ID: " + photoId);
+        }
         return medicinePhotoService.getImageBytesByTelegramFileId(photo.getTelegramFileId());
     }
 
@@ -661,20 +755,266 @@ public class MiniAppServiceImpl implements MiniAppService {
                                             Long userId,
                                             String sort,
                                             String filter) {
-        if (medicine == null || medicine.isBlank()) {
+        return search(medicine, null, latitude, longitude, userId, sort, filter);
+    }
+
+    @Override
+    public List<PharmacyResponseDTO> search(String medicine,
+                                            Long catalogMedicineId,
+                                            Double latitude,
+                                            Double longitude,
+                                            Long userId,
+                                            String sort,
+                                            String filter) {
+        if ((medicine == null || medicine.isBlank()) && catalogMedicineId == null) {
             throw new RuntimeException("medicine is required");
         }
 
+        String query = medicine == null ? "" : medicine.trim();
         boolean hasBothCoordinates = latitude != null && longitude != null;
         List<PharmacyResponseDTO> results;
         if (hasBothCoordinates) {
             Long safeUserId = userId == null ? 0L : userId;
-            results = pharmacyService.searchMedicineNearby(medicine.trim(), latitude, longitude, safeUserId);
+            if (catalogMedicineId == null) {
+                results = pharmacyService.searchMedicineNearby(query, latitude, longitude, safeUserId);
+            } else {
+                results = pharmacyService.searchMedicineNearby(query, catalogMedicineId, latitude, longitude, safeUserId);
+            }
+        } else if (catalogMedicineId == null) {
+            results = pharmacyService.searchMedicine(query);
         } else {
-            results = pharmacyService.searchMedicine(medicine.trim());
+            results = pharmacyService.searchMedicine(query, catalogMedicineId);
         }
 
-        return applySearchPreferences(results, sort, filter, hasBothCoordinates);
+        List<PharmacyResponseDTO> ranked = applySearchPreferences(results, sort, filter, hasBothCoordinates);
+        markFavouritePharmacies(ranked, userId);
+        return ranked;
+    }
+
+    @Override
+    public List<MiniAppMedicineSummaryDTO> searchMedicineCatalog(String medicine,
+                                                                 Double latitude,
+                                                                 Double longitude) {
+        List<Medicine> medicines;
+        if (medicine == null || medicine.isBlank()) {
+            List<Long> inStockIds = pharmacyInventoryRepository.findInStockCatalogMedicineIds();
+            if (inStockIds.isEmpty()) {
+                return List.of();
+            }
+            medicines = medicineRepository.findAllById(inStockIds);
+        } else {
+            String canonical = MedicineSearchNormalizer.normalizeToEnglishCanonical(medicine);
+            String term = canonical.isBlank()
+                    ? medicine.trim().toLowerCase(Locale.ROOT)
+                    : canonical.toLowerCase(Locale.ROOT);
+            medicines = medicineRepository.searchByName(term, term);
+        }
+
+        if (medicines.isEmpty()) {
+            return List.of();
+        }
+
+        List<Long> ids = medicines.stream().map(Medicine::getId).toList();
+        Map<Long, List<PharmacyInventory>> byCatalog = pharmacyInventoryRepository.findByCatalogMedicineIdIn(ids)
+                .stream()
+                .filter(item -> item.getCatalogMedicineId() != null)
+                .filter(item -> !item.isArchived())
+                .collect(Collectors.groupingBy(PharmacyInventory::getCatalogMedicineId, LinkedHashMap::new, Collectors.toList()));
+
+        List<MiniAppMedicineSummaryDTO> summaries = new ArrayList<>();
+        for (Medicine catalog : medicines) {
+            summaries.add(toCatalogSummary(catalog, byCatalog.getOrDefault(catalog.getId(), List.of())));
+        }
+
+        if (medicine == null || medicine.isBlank()) {
+            summaries.sort(Comparator
+                    .comparing(MiniAppMedicineSummaryDTO::isOutOfStock)
+                    .thenComparing(MiniAppMedicineSummaryDTO::getAvailablePharmacies, Comparator.reverseOrder()));
+            if (summaries.size() > 12) {
+                summaries = new ArrayList<>(summaries.subList(0, 12));
+            }
+        }
+        return summaries;
+    }
+
+    @Override
+    public List<MiniAppMedicineSummaryDTO> searchAnalogues(String medicine,
+                                                           Long medicineId,
+                                                           Double latitude,
+                                                           Double longitude,
+                                                           Long userId) {
+        try {
+            Medicine selected = resolveCatalogMedicine(medicine, medicineId);
+            if (selected == null) {
+                return List.of();
+            }
+
+            String ingredient = selected.getActiveIngredient();
+            if (ingredient == null || ingredient.isBlank()) {
+                ingredient = MedicineSearchNormalizer.catalogActiveIngredient(selected.getCanonicalName());
+            }
+            if (ingredient == null || ingredient.isBlank()) {
+                return List.of();
+            }
+
+            List<Medicine> others = medicineRepository.findByActiveIngredientIgnoreCase(ingredient).stream()
+                    .filter(item -> !isSameSourceMedicine(selected, item))
+                    .filter(item -> structuredFieldsCompatible(selected, item))
+                    .toList();
+            if (others.isEmpty()) {
+                return List.of();
+            }
+
+            List<Long> ids = others.stream().map(Medicine::getId).toList();
+            Map<Long, List<PharmacyInventory>> byCatalog = pharmacyInventoryRepository.findByCatalogMedicineIdIn(ids)
+                    .stream()
+                    .filter(item -> item.getCatalogMedicineId() != null)
+                    .filter(item -> !item.isArchived())
+                    .collect(Collectors.groupingBy(PharmacyInventory::getCatalogMedicineId, LinkedHashMap::new, Collectors.toList()));
+
+            List<MiniAppMedicineSummaryDTO> summaries = new ArrayList<>();
+            for (Medicine analogue : others) {
+                List<PharmacyInventory> rows = byCatalog.getOrDefault(analogue.getId(), List.of());
+                if (!hasInStockInventory(rows)) {
+                    continue;
+                }
+                summaries.add(toCatalogSummary(analogue, rows));
+            }
+            return summaries;
+        } catch (RuntimeException e) {
+            log.warn("Analogue search failed for '{}': {}", medicine, e.getMessage());
+            return List.of();
+        }
+    }
+
+    @Override
+    public List<MultiMedicinePharmacyResultDTO> searchMultipleMedicines(
+            List<String> medicines,
+            Double latitude,
+            Double longitude,
+            Long userId) {
+        if (medicines == null || medicines.isEmpty()) {
+            throw new RuntimeException("medicines is required");
+        }
+        if (latitude == null || longitude == null) {
+            throw new RuntimeException("latitude and longitude are required");
+        }
+        Long safeUserId = userId == null ? 0L : userId;
+        List<MultiMedicinePharmacyResultDTO> results =
+                pharmacyService.searchMultipleMedicinesNearby(medicines, latitude, longitude, safeUserId);
+        markFavouriteMultiMedicinePharmacies(results, userId);
+        return results;
+    }
+
+    private boolean isSameSourceMedicine(Medicine selected, Medicine item) {
+        if (item == null || item.getId() == null) {
+            return true;
+        }
+        if (item.getId().equals(selected.getId())) {
+            return true;
+        }
+        if (selected.getCanonicalName() != null && item.getCanonicalName() != null
+                && selected.getCanonicalName().equalsIgnoreCase(item.getCanonicalName())) {
+            return true;
+        }
+        return selected.getName() != null && item.getName() != null
+                && selected.getName().trim().equalsIgnoreCase(item.getName().trim());
+    }
+
+    private boolean structuredFieldsCompatible(Medicine selected, Medicine candidate) {
+        if (bothPresent(selected.getStrength(), candidate.getStrength())
+                && !selected.getStrength().trim().equalsIgnoreCase(candidate.getStrength().trim())) {
+            return false;
+        }
+        return !bothPresent(selected.getDosageForm(), candidate.getDosageForm())
+                || selected.getDosageForm().trim().equalsIgnoreCase(candidate.getDosageForm().trim());
+    }
+
+    private boolean bothPresent(String left, String right) {
+        return left != null && !left.isBlank() && right != null && !right.isBlank();
+    }
+
+    private boolean hasInStockInventory(List<PharmacyInventory> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return false;
+        }
+        return rows.stream().anyMatch(item ->
+                !item.isArchived()
+                        && (item.getExpiryDate() == null || !item.getExpiryDate().isBefore(LocalDate.now()))
+                        && !item.isOutOfStock()
+                        && item.getQuantity() != null
+                        && item.getQuantity() > 0);
+    }
+
+    private Medicine resolveCatalogMedicine(String medicine, Long medicineId) {
+        if (medicineId != null) {
+            Medicine byId = medicineRepository.findById(medicineId).orElse(null);
+            if (byId != null) {
+                return byId;
+            }
+            PharmacyInventory inventory = pharmacyInventoryRepository.findById(medicineId).orElse(null);
+            if (inventory != null && inventory.getCatalogMedicineId() != null) {
+                Medicine linked = medicineRepository.findById(inventory.getCatalogMedicineId()).orElse(null);
+                if (linked != null) {
+                    return linked;
+                }
+            }
+        }
+        if (medicine == null || medicine.isBlank()) {
+            return null;
+        }
+        String canonical = MedicineSearchNormalizer.normalizeToEnglishCanonical(medicine);
+        if (canonical.isBlank()) {
+            return null;
+        }
+        return medicineRepository.findByCanonicalName(canonical).orElse(null);
+    }
+
+    private MiniAppMedicineSummaryDTO toCatalogSummary(Medicine catalog, List<PharmacyInventory> rows) {
+        BigDecimal minPrice = null;
+        boolean anyRx = catalog.isPrescriptionRequired();
+        boolean outOfStock = true;
+        HashSet<Long> pharmacyIds = new HashSet<>();
+
+        for (PharmacyInventory item : rows) {
+            if (item.isArchived()) {
+                continue;
+            }
+            if (item.isRequiresPrescription()) {
+                anyRx = true;
+            }
+            if (item.getPrice() != null && item.getPrice().compareTo(BigDecimal.ZERO) > 0) {
+                if (minPrice == null || item.getPrice().compareTo(minPrice) < 0) {
+                    minPrice = item.getPrice();
+                }
+            }
+            boolean expired = item.getExpiryDate() != null && item.getExpiryDate().isBefore(LocalDate.now());
+            boolean inStock = !expired && !item.isOutOfStock() && item.getQuantity() != null && item.getQuantity() > 0;
+            if (inStock) {
+                outOfStock = false;
+                if (item.getPharmacyId() != null) {
+                    pharmacyIds.add(item.getPharmacyId());
+                }
+            }
+        }
+
+        String imageUrl = catalog.getImageUrl();
+        if (imageUrl != null && imageUrl.isBlank()) {
+            imageUrl = null;
+        }
+
+        return MiniAppMedicineSummaryDTO.builder()
+                .medicineId(catalog.getId())
+                .medicineName(catalog.getName())
+                .manufacturer(catalog.getManufacturer())
+                .strength(catalog.getStrength())
+                .dosageForm(catalog.getDosageForm())
+                .prescriptionRequired(anyRx)
+                .price(minPrice)
+                .availablePharmacies(pharmacyIds.size())
+                .outOfStock(outOfStock)
+                .imageUrl(imageUrl)
+                .build();
     }
 
     @Override
@@ -683,15 +1023,19 @@ public class MiniAppServiceImpl implements MiniAppService {
                 .orElseThrow(() -> new RuntimeException("Pharmacy not found with ID: " + pharmacyId));
 
         List<MiniAppInventoryItemDTO> medicines = pharmacyInventoryRepository.findByPharmacyId(pharmacyId).stream()
-                .map(item -> MiniAppInventoryItemDTO.builder()
+                .filter(item -> !item.isArchived())
+                .map(item -> {
+                    boolean expired = item.getExpiryDate() != null && item.getExpiryDate().isBefore(LocalDate.now());
+                    return MiniAppInventoryItemDTO.builder()
                         .medicineId(item.getId())
                         .medicineName(item.getMedicineName())
                         .quantity(item.getQuantity())
-                        .outOfStock(item.isOutOfStock() || item.getQuantity() == null || item.getQuantity() <= 0)
+                        .outOfStock(expired || item.isOutOfStock() || item.getQuantity() == null || item.getQuantity() <= 0)
                     .requiresPrescription(item.isRequiresPrescription())
                         .price(item.getPrice())
                         .currency(item.getCurrency())
-                        .build())
+                        .build();
+                })
                 .collect(Collectors.toList());
 
         boolean temporaryClosureActive = isTemporaryClosureActive(pharmacy);
@@ -985,17 +1329,23 @@ public class MiniAppServiceImpl implements MiniAppService {
         Runnable notifier = () -> {
             try {
                 if (reservation.getUserId() != null && reservation.getUserId() > 0) {
-                    telegramClient.sendMessage(
-                        reservation.getUserId(),
-                        localizationService.text(
+                    String text = localizationService.text(
                             reservation.getUserId(),
                             "reservation_contact_sent",
                             reservation.getMedicineName(),
                             reservation.getRequestedQuantity(),
                             customerName,
                             customerPhone
-                        ) + "\n\u23F1 Auto-cancels in " + pendingReservationTimeoutMinutes + " minutes if not approved."
-                    );
+                        ) + "\n\u23F1 Auto-cancels in " + pendingReservationTimeoutMinutes + " minutes if not approved.";
+                    String statusUrl = telegramClient.buildMiniAppUserReservationStatusUrl(
+                            "active",
+                            reservation.getId(),
+                            reservation.getReservationGroupId());
+                    telegramClient.sendMessageWithMiniAppButton(
+                            reservation.getUserId(),
+                            text,
+                            statusUrl,
+                            "📄 View reservation");
                 }
             } catch (Exception notificationError) {
                 log.warn("Mini app user reservation confirmation failed for reservation {}: {}",
@@ -1083,6 +1433,7 @@ public class MiniAppServiceImpl implements MiniAppService {
                 reservation.isPrescriptionRequired(),
                 reservation.getPrescriptionReviewStatus()))
             .prescriptionRejectionReason(reservation.getPrescriptionRejectionReason())
+            .prescriptionClarificationMessage(reservation.getPrescriptionClarificationMessage())
             .pharmacyId(reservation.getPharmacyId())
             .pharmacyName(pharmacy == null ? null : pharmacy.getName())
             .medicineId(inventory == null ? null : inventory.getId())
@@ -1172,6 +1523,7 @@ public class MiniAppServiceImpl implements MiniAppService {
                                     group.stream().anyMatch(MedicineReservation::isPrescriptionRequired),
                                     parsePrescriptionStatus(resolveGroupedPrescriptionStatus(group))))
                             .prescriptionRejectionReason(resolveGroupedPrescriptionRejectionReason(group))
+                            .prescriptionClarificationMessage(resolveGroupedPrescriptionClarificationMessage(group))
                             .pharmacyId(first.getPharmacyId())
                             .pharmacyName(pharmacy == null ? null : pharmacy.getName())
                             .medicineName(group.size() + " medicines")
@@ -1257,6 +1609,7 @@ public class MiniAppServiceImpl implements MiniAppService {
         return switch (resolvedStatus) {
             case UPLOAD_REQUIRED -> "Prescription required - upload needed";
             case PENDING_REVIEW -> "Prescription under review";
+            case NEEDS_CLARIFICATION -> "Prescription needs clarification";
             case APPROVED -> "Prescription approved";
             case REJECTED -> "Prescription rejected";
             case NOT_REQUIRED -> "Not required";
@@ -1299,6 +1652,9 @@ public class MiniAppServiceImpl implements MiniAppService {
             }
             if (prescriptionStatus == PrescriptionReviewStatus.PENDING_REVIEW) {
                 return "Waiting for prescription review";
+            }
+            if (prescriptionStatus == PrescriptionReviewStatus.NEEDS_CLARIFICATION) {
+                return "Pharmacy requested prescription clarification";
             }
             if (prescriptionStatus == PrescriptionReviewStatus.UPLOAD_REQUIRED || prescriptionStatus == null) {
                 return "Waiting for prescription upload";
@@ -1358,6 +1714,9 @@ public class MiniAppServiceImpl implements MiniAppService {
         if (prescriptionRequired && prescriptionStatus == PrescriptionReviewStatus.PENDING_REVIEW) {
             return "PRESCRIPTION_REVIEW";
         }
+        if (prescriptionRequired && prescriptionStatus == PrescriptionReviewStatus.NEEDS_CLARIFICATION) {
+            return "PRESCRIPTION_CLARIFICATION";
+        }
         if (prescriptionRequired
                 && (prescriptionStatus == PrescriptionReviewStatus.UPLOAD_REQUIRED || prescriptionStatus == null)) {
             return "UPLOAD_PRESCRIPTION";
@@ -1408,6 +1767,14 @@ public class MiniAppServiceImpl implements MiniAppService {
             return PrescriptionReviewStatus.APPROVED.name();
         }
         if (requiredReservations.stream().anyMatch(reservation ->
+                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.NEEDS_CLARIFICATION)) {
+            return PrescriptionReviewStatus.NEEDS_CLARIFICATION.name();
+        }
+        if (requiredReservations.stream().anyMatch(reservation ->
+                reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.PENDING_REVIEW)) {
+            return PrescriptionReviewStatus.PENDING_REVIEW.name();
+        }
+        if (requiredReservations.stream().anyMatch(reservation ->
                 reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.UPLOAD_REQUIRED)) {
             return PrescriptionReviewStatus.UPLOAD_REQUIRED.name();
         }
@@ -1417,6 +1784,14 @@ public class MiniAppServiceImpl implements MiniAppService {
     private String resolveGroupedPrescriptionRejectionReason(List<MedicineReservation> reservations) {
         return reservations.stream()
                 .map(MedicineReservation::getPrescriptionRejectionReason)
+                .filter(value -> value != null && !value.isBlank())
+                .findFirst()
+                .orElse(null);
+    }
+
+    private String resolveGroupedPrescriptionClarificationMessage(List<MedicineReservation> reservations) {
+        return reservations.stream()
+                .map(MedicineReservation::getPrescriptionClarificationMessage)
                 .filter(value -> value != null && !value.isBlank())
                 .findFirst()
                 .orElse(null);
@@ -1491,6 +1866,11 @@ public class MiniAppServiceImpl implements MiniAppService {
         if (preferences.openNowOnly()) {
             stream = stream.filter(PharmacyResponseDTO::isOpenNow);
         }
+        if (preferences.inStockOnly()) {
+            stream = stream.filter(item -> !item.isOutOfStock()
+                    && item.getStockQuantity() != null
+                    && item.getStockQuantity() > 0);
+        }
         if (preferences.verifiedOnly()) {
             stream = stream.filter(PharmacyResponseDTO::isVerified);
         }
@@ -1516,12 +1896,14 @@ public class MiniAppServiceImpl implements MiniAppService {
         boolean verifiedOnly = hasVerifiedOnlyFilter(mergedRawFilters);
         boolean prescriptionRequiredOnly = hasPrescriptionRequiredFilter(mergedRawFilters);
         boolean noPrescriptionOnly = hasNoPrescriptionFilter(mergedRawFilters);
+        boolean inStockOnly = hasInStockFilter(mergedRawFilters);
 
         boolean explicitSelection = sortOption != SearchOption.NONE
             || filterOption != SearchOption.NONE
             || verifiedOnly
             || prescriptionRequiredOnly
-            || noPrescriptionOnly;
+            || noPrescriptionOnly
+            || inStockOnly;
         boolean openNowOnly = sortOption == SearchOption.OPEN_NOW || filterOption == SearchOption.OPEN_NOW;
 
         if (sortOption == SearchOption.OPEN_NOW) {
@@ -1540,6 +1922,7 @@ public class MiniAppServiceImpl implements MiniAppService {
         return new SearchPreferences(
                 sortOption,
                 openNowOnly,
+                inStockOnly,
                 verifiedOnly,
                 prescriptionRequiredOnly,
                 noPrescriptionOnly,
@@ -1571,6 +1954,42 @@ public class MiniAppServiceImpl implements MiniAppService {
                 || normalizedLettersOnly.contains("withoutprescription")
                 || normalizedLettersOnly.contains("nonprescription")
                 || normalizedLettersOnly.contains("prescriptionnotrequired");
+    }
+
+    private boolean hasInStockFilter(String mergedRawFilters) {
+        String normalizedLettersOnly = mergedRawFilters.replaceAll("[^a-z]", "");
+        return normalizedLettersOnly.contains("instock")
+                || normalizedLettersOnly.contains("allinstock")
+                || normalizedLettersOnly.contains("instockonly");
+    }
+
+    private Set<Long> favoritePharmacyIds(Long userId) {
+        if (userId == null || userId <= 0 || userFavoritePharmacyRepository == null) {
+            return Set.of();
+        }
+        return userFavoritePharmacyRepository.findByUserIdOrderByCreatedAtDesc(userId).stream()
+                .map(UserFavoritePharmacy::getPharmacyId)
+                .collect(Collectors.toSet());
+    }
+
+    private void markFavouritePharmacies(List<PharmacyResponseDTO> results, Long userId) {
+        if (results == null || results.isEmpty()) {
+            return;
+        }
+        Set<Long> favoriteIds = favoritePharmacyIds(userId);
+        for (PharmacyResponseDTO dto : results) {
+            dto.setFavourite(dto.getId() != null && favoriteIds.contains(dto.getId()));
+        }
+    }
+
+    private void markFavouriteMultiMedicinePharmacies(List<MultiMedicinePharmacyResultDTO> results, Long userId) {
+        if (results == null || results.isEmpty()) {
+            return;
+        }
+        Set<Long> favoriteIds = favoritePharmacyIds(userId);
+        for (MultiMedicinePharmacyResultDTO dto : results) {
+            dto.setFavourite(dto.getPharmacyId() != null && favoriteIds.contains(dto.getPharmacyId()));
+        }
     }
 
     private SearchOption normalizeSearchOption(String rawValue) {

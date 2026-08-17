@@ -149,30 +149,7 @@ public class TelegramClient {
                 .replace("{medicineId}", String.valueOf(medicineId))
                 .replace("{medicineName}", "");
 
-        String finalUrl;
-
-        if (normalizedBase.contains("t.me/")) {
-            String appStatePayload = resolvedPath.startsWith("/") ? resolvedPath.substring(1) : resolvedPath;
-            String appState = URLEncoder.encode(appStatePayload, StandardCharsets.UTF_8);
-            String separator = normalizedBase.contains("?") ? "&" : "?";
-            finalUrl = normalizedBase + separator + "startapp=" + appState;
-            log.info("Mini app cart URL built: pharmacyId={}, medicineId={}, url={}", pharmacyId, medicineId, finalUrl);
-            return finalUrl;
-        }
-
-        if (resolvedPath.startsWith("http://") || resolvedPath.startsWith("https://")) {
-            finalUrl = resolvedPath;
-            log.info("Mini app cart URL built: pharmacyId={}, medicineId={}, url={}", pharmacyId, medicineId, finalUrl);
-            return finalUrl;
-        }
-
-        if (resolvedPath.startsWith("/")) {
-            finalUrl = normalizedBase + resolvedPath;
-            log.info("Mini app cart URL built: pharmacyId={}, medicineId={}, url={}", pharmacyId, medicineId, finalUrl);
-            return finalUrl;
-        }
-
-        finalUrl = normalizedBase + "/" + resolvedPath;
+        String finalUrl = resolveMiniAppUrl(normalizedBase, resolvedPath);
         log.info("Mini app cart URL built: pharmacyId={}, medicineId={}, url={}", pharmacyId, medicineId, finalUrl);
         return finalUrl;
     }
@@ -227,6 +204,11 @@ public class TelegramClient {
         return resolveMiniAppUrl(normalizedBase, resolvedPath);
     }
 
+    /**
+     * Telegram WebViews often replace the hash with {@code tgWebAppData} and drop
+     * post-hash query params. Copy the hash query in front of {@code #} so ModeEntry
+     * can still route Reserve / Details / See more after the hash is rewritten.
+     */
     private String resolveMiniAppUrl(String normalizedBase, String resolvedPath) {
         if (normalizedBase.contains("t.me/")) {
             String appStatePayload = resolvedPath.startsWith("/") ? resolvedPath.substring(1) : resolvedPath;
@@ -239,11 +221,51 @@ public class TelegramClient {
             return resolvedPath;
         }
 
-        if (resolvedPath.startsWith("/")) {
-            return normalizedBase + resolvedPath;
+        String path = resolvedPath.startsWith("/") ? resolvedPath : "/" + resolvedPath;
+        int hashIdx = path.indexOf('#');
+        if (hashIdx >= 0) {
+            String fragment = path.substring(hashIdx);
+            int queryIdx = fragment.indexOf('?');
+            if (queryIdx >= 0) {
+                String query = fragment.substring(queryIdx + 1);
+                if (!query.isBlank()) {
+                    return normalizedBase + "/?" + query + fragment;
+                }
+            }
+            return normalizedBase + path;
         }
 
-        return normalizedBase + "/" + resolvedPath;
+        return normalizedBase + path;
+    }
+
+    public String buildMiniAppPharmacySearchUrl(String medicine, Long focusPharmacyId, Long medicineId) {
+        String normalizedBase = miniAppBaseUrl == null ? "" : miniAppBaseUrl.trim();
+        if (normalizedBase.endsWith("/")) {
+            normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 1);
+        }
+
+        StringBuilder query = new StringBuilder();
+        if (medicine != null && !medicine.isBlank()) {
+            query.append("medicine=").append(URLEncoder.encode(medicine.trim(), StandardCharsets.UTF_8));
+        }
+        if (focusPharmacyId != null) {
+            if (!query.isEmpty()) {
+                query.append('&');
+            }
+            query.append("focusPharmacyId=").append(focusPharmacyId);
+        }
+        if (medicineId != null) {
+            if (!query.isEmpty()) {
+                query.append('&');
+            }
+            query.append("medicineId=").append(medicineId);
+        }
+
+        String resolvedPath = "/#/pharmacy-results";
+        if (!query.isEmpty()) {
+            resolvedPath = resolvedPath + "?" + query;
+        }
+        return resolveMiniAppUrl(normalizedBase, resolvedPath);
     }
 
     public String buildMiniAppSearchUrl() {
@@ -251,24 +273,217 @@ public class TelegramClient {
     }
 
     public String buildMiniAppSearchUrl(String section) {
+        return buildMiniAppUserReservationStatusUrl(section, null, null);
+    }
+
+    /**
+     * Compact Telegram startapp payload: a{id} = active, h{id} = history.
+     * Optional g{group} suffix if it fits in 64 alphanumeric/underscore/hyphen chars.
+     */
+    static String encodeReservationStartApp(String section, Long reservationId, String reservationGroupId) {
+        if (reservationId == null) {
+            return "";
+        }
+        String prefix = "history".equalsIgnoreCase(section == null ? "" : section.trim()) ? "h" : "a";
+        StringBuilder payload = new StringBuilder(prefix).append(reservationId);
+        if (reservationGroupId != null && !reservationGroupId.isBlank()) {
+            String group = reservationGroupId.trim().replaceAll("[^A-Za-z0-9_-]", "");
+            if (!group.isBlank() && payload.length() + 1 + group.length() <= 64) {
+                payload.append('g').append(group);
+            }
+        }
+        return payload.length() <= 64 ? payload.toString() : payload.substring(0, 64);
+    }
+
+    /**
+     * User Mini App URL for reservation status (active/history), optionally focused on one reservation/group.
+     * Query params are placed BEFORE the hash so Telegram WebViews keep them when the hash is rewritten,
+     * plus compact startapp (Telegram Desktop's reliable start_param).
+     * Path targets /pharmacy-results (SearchPage) directly.
+     */
+    public String buildMiniAppUserReservationStatusUrl(String section, Long reservationId, String reservationGroupId) {
         String normalizedBase = miniAppBaseUrl == null ? "" : miniAppBaseUrl.trim();
         if (normalizedBase.endsWith("/")) {
             normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 1);
         }
 
-        String resolvedPath = "/#/search";
+        String startapp = encodeReservationStartApp(section, reservationId, reservationGroupId);
+
+        StringBuilder query = new StringBuilder();
+        if (!startapp.isBlank()) {
+            query.append("startapp=").append(URLEncoder.encode(startapp, StandardCharsets.UTF_8));
+        }
         if (section != null && !section.isBlank()) {
-            resolvedPath = resolvedPath + "?section=" + section.trim();
+            if (!query.isEmpty()) query.append('&');
+            query.append("section=").append(URLEncoder.encode(section.trim(), StandardCharsets.UTF_8));
+        }
+        if (reservationId != null) {
+            if (!query.isEmpty()) query.append('&');
+            query.append("reservationId=")
+                    .append(URLEncoder.encode(String.valueOf(reservationId), StandardCharsets.UTF_8));
+        }
+        if (reservationGroupId != null && !reservationGroupId.isBlank()) {
+            if (!query.isEmpty()) query.append('&');
+            query.append("groupId=").append(URLEncoder.encode(reservationGroupId.trim(), StandardCharsets.UTF_8));
+        }
+
+        String hashPath = "/#/pharmacy-results";
+        if (!query.isEmpty()) {
+            hashPath = hashPath + "?" + query;
         }
 
         if (normalizedBase.contains("t.me/")) {
-            String appStatePayload = resolvedPath.startsWith("/") ? resolvedPath.substring(1) : resolvedPath;
-            String appState = URLEncoder.encode(appStatePayload, StandardCharsets.UTF_8);
+            String appState = URLEncoder.encode(
+                    startapp.isBlank() ? (hashPath.startsWith("/") ? hashPath.substring(1) : hashPath) : startapp,
+                    StandardCharsets.UTF_8);
             String separator = normalizedBase.contains("?") ? "&" : "?";
             return normalizedBase + separator + "startapp=" + appState;
         }
 
-        return normalizedBase + resolvedPath;
+        if (!query.isEmpty()) {
+            return normalizedBase + "/?" + query + hashPath;
+        }
+        return normalizedBase + hashPath;
+    }
+
+    public String buildMiniAppPharmacyRegisterUrl() {
+        String normalizedBase = miniAppBaseUrl == null ? "" : miniAppBaseUrl.trim();
+        if (normalizedBase.endsWith("/")) {
+            normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 1);
+        }
+        String startapp = "preg";
+        String query = "startapp=" + startapp;
+        String hashPath = "/#/pharmacy/register?startapp=" + startapp;
+        if (normalizedBase.contains("t.me/")) {
+            String separator = normalizedBase.contains("?") ? "&" : "?";
+            return normalizedBase + separator + "startapp=" + startapp;
+        }
+        return normalizedBase + "/?" + query + hashPath;
+    }
+
+    public void sendPharmacyRegistrationChoice(Long chatId) {
+        if (chatId == null) {
+            return;
+        }
+        try {
+            String miniAppUrl = buildMiniAppPharmacyRegisterUrl();
+            Map<String, Object> body = new HashMap<>();
+            body.put("chat_id", chatId);
+            body.put("text", t(chatId, "reg_miniapp_choice_text"));
+            body.put("parse_mode", "HTML");
+            Map<String, Object> miniAppButton = canUseWebAppButton(miniAppUrl)
+                    ? Map.of("text", t(chatId, "reg_miniapp_open_button"), "web_app", Map.of("url", miniAppUrl))
+                    : Map.of("text", t(chatId, "reg_miniapp_open_button"), "url", miniAppUrl);
+            Map<String, Object> chatButton = Map.of(
+                    "text", t(chatId, "reg_in_chat_button"),
+                    "callback_data", "register_in_chat"
+            );
+            body.put("reply_markup", Map.of("inline_keyboard", List.of(List.of(miniAppButton, chatButton))));
+            restTemplate.postForObject(apiUrl + "/sendMessage", body, String.class);
+        } catch (Exception e) {
+            log.warn("sendPharmacyRegistrationChoice error: chatId={}, error={}", chatId, e.getMessage());
+        }
+    }
+
+    public void sendPendingPharmacyStatusMiniAppButton(Long chatId) {
+        sendMessageWithMiniAppButton(
+                chatId,
+                t(chatId, "pending_home_text"),
+                buildMiniAppPharmacyRegisterUrl(),
+                t(chatId, "reg_pending_view_status_button"));
+    }
+
+    public void sendMessageWithMiniAppButton(Long chatId, String text, String miniAppUrl, String buttonLabel) {
+        if (chatId == null || text == null || text.isBlank()) {
+            return;
+        }
+        try {
+            String url = apiUrl + "/sendMessage";
+            Map<String, Object> body = new HashMap<>();
+            body.put("chat_id", chatId);
+            body.put("text", text);
+            body.put("parse_mode", "HTML");
+
+            if (miniAppUrl != null && !miniAppUrl.isBlank()) {
+                String label = buttonLabel == null || buttonLabel.isBlank() ? "Open Mini App" : buttonLabel;
+                Map<String, Object> button = canUseWebAppButton(miniAppUrl)
+                        ? Map.of("text", label, "web_app", Map.of("url", miniAppUrl))
+                        : Map.of("text", label, "url", miniAppUrl);
+                body.put("reply_markup", Map.of("inline_keyboard", List.of(List.of(button))));
+            }
+
+            restTemplate.postForObject(url, body, String.class);
+        } catch (Exception e) {
+            log.warn("sendMessageWithMiniAppButton error: chatId={}, error={}", chatId, e.getMessage());
+        }
+    }
+
+    public String buildMiniAppPharmacyHomeUrl(Long pharmacyTelegramId) {
+        return buildPharmacyMiniAppUrl(null, "/#/pharmacy?pharmacyTelegramId={pharmacyTelegramId}", pharmacyTelegramId);
+    }
+
+    public String buildMiniAppAdminHomeUrl(Long adminTelegramId) {
+        return buildAdminMiniAppUrl(miniAppAdminDashboardPagePath, "/#/admin?adminTelegramId={adminTelegramId}", adminTelegramId);
+    }
+
+    public void sendPharmacyHomeMiniAppPrompt(Long chatId) {
+        sendPharmacyMiniAppPrompt(chatId,
+                buildMiniAppPharmacyHomeUrl(chatId),
+                "📱 Open your pharmacy dashboard in the mini app.",
+                "📱 Open Pharmacy Dashboard",
+                "sendPharmacyHomeMiniAppPrompt");
+    }
+
+    public void sendRoleHomeMiniAppPrompt(Long chatId, String role) {
+        String normalized = role == null ? "" : role.trim().toLowerCase();
+        if ("admin".equals(normalized)) {
+            sendAdminDashboardMiniAppPrompt(chatId);
+            return;
+        }
+        if ("pharmacy".equals(normalized)) {
+            sendPharmacyHomeMiniAppPrompt(chatId);
+            return;
+        }
+        sendMiniAppSearchPrompt(chatId);
+    }
+
+    /**
+     * Sets the left-side Telegram Menu button for this chat to a role-specific Mini App URL.
+     */
+    public void setChatMenuButton(Long chatId, String webAppUrl) {
+        if (chatId == null || webAppUrl == null || webAppUrl.isBlank()) {
+            return;
+        }
+        try {
+            Map<String, Object> menuButton = canUseWebAppButton(webAppUrl)
+                    ? Map.of(
+                    "type", "web_app",
+                    "text", "Menu",
+                    "web_app", Map.of("url", webAppUrl)
+            )
+                    : Map.of("type", "commands");
+            Map<String, Object> body = new HashMap<>();
+            body.put("chat_id", chatId);
+            body.put("menu_button", menuButton);
+            restTemplate.postForObject(apiUrl + "/setChatMenuButton", body, String.class);
+        } catch (Exception e) {
+            log.warn("setChatMenuButton error: chatId={}, error={}", chatId, e.getMessage());
+        }
+    }
+
+    public void setRoleChatMenuButton(Long chatId, String role) {
+        String normalized = role == null ? "" : role.trim().toLowerCase();
+        try {
+            if ("admin".equals(normalized)) {
+                setChatMenuButton(chatId, buildMiniAppAdminHomeUrl(chatId));
+            } else if ("pharmacy".equals(normalized)) {
+                setChatMenuButton(chatId, buildMiniAppPharmacyHomeUrl(chatId));
+            } else {
+                setChatMenuButton(chatId, buildMiniAppSearchUrl());
+            }
+        } catch (Exception e) {
+            log.warn("setRoleChatMenuButton error: chatId={}, role={}, error={}", chatId, role, e.getMessage());
+        }
     }
 
     /**
@@ -320,29 +535,8 @@ public class TelegramClient {
     }
 
     public String buildMiniAppPharmacyInventoryUrl(Long pharmacyTelegramId) {
-        String normalizedBase = miniAppBaseUrl == null ? "" : miniAppBaseUrl.trim();
-        if (normalizedBase.endsWith("/")) {
-            normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 1);
-        }
-
-        if (pharmacyTelegramId == null) {
-            throw new IllegalArgumentException("pharmacyTelegramId is required for inventory page");
-        }
-
-        String pathTemplate = (miniAppPharmacyInventoryPagePath == null || miniAppPharmacyInventoryPagePath.isBlank())
-            ? "/#/pharmacy-inventory?pharmacyTelegramId={pharmacyTelegramId}"
-                : miniAppPharmacyInventoryPagePath.trim();
-
-        String resolvedPath = pathTemplate
-                .replace("{pharmacyTelegramId}", URLEncoder.encode(String.valueOf(pharmacyTelegramId), StandardCharsets.UTF_8));
-
-        if (resolvedPath.startsWith("http://") || resolvedPath.startsWith("https://")) {
-            return resolvedPath;
-        }
-        if (resolvedPath.startsWith("/")) {
-            return normalizedBase + resolvedPath;
-        }
-        return normalizedBase + "/" + resolvedPath;
+        return buildPharmacyMiniAppUrl(miniAppPharmacyInventoryPagePath,
+                "/#/pharmacy-inventory?pharmacyTelegramId={pharmacyTelegramId}", pharmacyTelegramId);
     }
 
     public void sendPharmacyInventoryMiniAppPrompt(Long chatId) {
@@ -385,10 +579,42 @@ public class TelegramClient {
                 "/#/pharmacy-prescriptions?pharmacyTelegramId={pharmacyTelegramId}", pharmacyTelegramId);
     }
 
+    /**
+     * Deep-link into prescriptions Mini App focused on one reservation/group with files auto-revealed.
+     */
+    public String buildMiniAppPharmacyPrescriptionViewUrl(Long pharmacyTelegramId,
+                                                          Long reservationId,
+                                                          String reservationGroupId) {
+        String base = buildMiniAppPharmacyPrescriptionsUrl(pharmacyTelegramId);
+        StringBuilder url = new StringBuilder(base);
+        url.append(base.contains("?") ? "&" : "?");
+        if (reservationGroupId != null && !reservationGroupId.isBlank()) {
+            url.append("groupId=")
+                    .append(URLEncoder.encode(reservationGroupId, StandardCharsets.UTF_8));
+        } else if (reservationId != null) {
+            url.append("reservationId=")
+                    .append(URLEncoder.encode(String.valueOf(reservationId), StandardCharsets.UTF_8));
+        } else {
+            url.append("viewRx=1");
+            return url.toString();
+        }
+        url.append("&viewRx=1");
+        return url.toString();
+    }
+
     public void sendPharmacyPrescriptionsMiniAppPrompt(Long chatId) {
         sendPharmacyMiniAppPrompt(chatId, buildMiniAppPharmacyPrescriptionsUrl(chatId),
                 "📱 Open prescription reviews in the mini app.", "📱 Open Prescriptions App",
                 "sendPharmacyPrescriptionsMiniAppPrompt");
+    }
+
+    public void sendPharmacyPrescriptionViewPrompt(Long chatId, Long reservationId, String reservationGroupId) {
+        sendPharmacyMiniAppPrompt(
+                chatId,
+                buildMiniAppPharmacyPrescriptionViewUrl(chatId, reservationId, reservationGroupId),
+                "📄 Open the Mini App to view this prescription.",
+                "📄 View Prescription",
+                "sendPharmacyPrescriptionViewPrompt");
     }
 
     // -------- Performance Mini App --------
@@ -434,10 +660,8 @@ public class TelegramClient {
         if (resolvedPath.startsWith("http://") || resolvedPath.startsWith("https://")) {
             return resolvedPath;
         }
-        if (resolvedPath.startsWith("/")) {
-            return normalizedBase + resolvedPath;
-        }
-        return normalizedBase + "/" + resolvedPath;
+        String path = resolvedPath.startsWith("/") ? resolvedPath : "/" + resolvedPath;
+        return resolveMiniAppUrl(normalizedBase, path);
     }
 
     private void sendPharmacyMiniAppPrompt(Long chatId, String miniAppUrl, String text, String buttonLabel, String methodName) {
@@ -456,8 +680,6 @@ public class TelegramClient {
         }
     }
 
-    // -------- Admin Mini App URL builders + prompts --------
-
     private String buildAdminMiniAppUrl(String configuredPath, String defaultPath, Long adminTelegramId) {
         String normalizedBase = miniAppBaseUrl == null ? "" : miniAppBaseUrl.trim();
         if (normalizedBase.endsWith("/")) {
@@ -473,10 +695,8 @@ public class TelegramClient {
         if (resolvedPath.startsWith("http://") || resolvedPath.startsWith("https://")) {
             return resolvedPath;
         }
-        if (resolvedPath.startsWith("/")) {
-            return normalizedBase + resolvedPath;
-        }
-        return normalizedBase + "/" + resolvedPath;
+        String path = resolvedPath.startsWith("/") ? resolvedPath : "/" + resolvedPath;
+        return resolveMiniAppUrl(normalizedBase, path);
     }
 
     private void sendAdminMiniAppPrompt(Long chatId, String miniAppUrl, String text, String buttonLabel, String methodName) {
@@ -554,12 +774,13 @@ public class TelegramClient {
             throw new IllegalArgumentException("pharmacyTelegramId is required for pickup redirect");
         }
 
+        String encodedId = URLEncoder.encode(String.valueOf(pharmacyTelegramId), StandardCharsets.UTF_8);
         String pathTemplate = (miniAppPharmacyPickupPagePath == null || miniAppPharmacyPickupPagePath.isBlank())
             ? "/#/pickup-scanner?pharmacyTelegramId={pharmacyTelegramId}"
                 : miniAppPharmacyPickupPagePath.trim();
 
-        String resolvedPath = pathTemplate
-                .replace("{pharmacyTelegramId}", URLEncoder.encode(String.valueOf(pharmacyTelegramId), StandardCharsets.UTF_8));
+        String resolvedPath = pathTemplate.replace("{pharmacyTelegramId}", encodedId);
+        String preHashQuery = "pickup=1&pharmacyTelegramId=" + encodedId;
 
         if (normalizedBase.contains("t.me/")) {
             String appStatePayload = resolvedPath.startsWith("/") ? resolvedPath.substring(1) : resolvedPath;
@@ -572,11 +793,8 @@ public class TelegramClient {
             return resolvedPath;
         }
 
-        if (resolvedPath.startsWith("/")) {
-            return normalizedBase + resolvedPath;
-        }
-
-        return normalizedBase + "/" + resolvedPath;
+        String hashPath = resolvedPath.startsWith("/") ? resolvedPath : "/" + resolvedPath;
+        return normalizedBase + "/?" + preHashQuery + hashPath;
     }
 
     private void registerBotCommands() {
@@ -602,6 +820,26 @@ public class TelegramClient {
             body.put("language_code", languageCode);
         }
         restTemplate.postForObject(apiUrl + "/setMyCommands", body, String.class);
+    }
+
+    public void sendSeeMorePharmaciesMiniApp(Long chatId, String medicine, Long medicineId) {
+        try {
+            String url = apiUrl + "/sendMessage";
+            String miniAppUrl = buildMiniAppPharmacySearchUrl(medicine, null, medicineId);
+            Map<String, Object> button = canUseWebAppButton(miniAppUrl)
+                    ? Map.of("text", t(chatId, "see_more_pharmacies_btn"), "web_app", Map.of("url", miniAppUrl))
+                    : Map.of("text", t(chatId, "see_more_pharmacies_btn"), "url", miniAppUrl);
+
+            Map<String, Object> body = new HashMap<>();
+            body.put("chat_id", chatId);
+            body.put("text", t(chatId, "see_more_pharmacies_msg"));
+            body.put("parse_mode", "HTML");
+            body.put("reply_markup", Map.of("inline_keyboard", List.of(List.of(button))));
+
+            restTemplate.postForObject(url, body, String.class);
+        } catch (Exception e) {
+            log.warn("sendSeeMorePharmaciesMiniApp error: {}", e.getMessage());
+        }
     }
 
     public void sendMiniAppSearchPrompt(Long chatId) {
@@ -788,7 +1026,7 @@ public class TelegramClient {
             inlineKeyboard.add(row2);
 
             inlineKeyboard.add(List.of(
-                    Map.of("text", t(chatId, "card_details_btn"), "callback_data", "details_" + pharmacyId + "_" + medicineName)
+                    detailsMiniAppButton(chatId, pharmacyId, medicineName, medicineId)
             ));
 
             if (canRate) {
@@ -923,6 +1161,22 @@ public class TelegramClient {
         } catch (Exception e) {
             return false;
         }
+    }
+
+    private Map<String, Object> detailsMiniAppButton(Long chatId, Long pharmacyId, String medicineName) {
+        return detailsMiniAppButton(chatId, pharmacyId, medicineName, null);
+    }
+
+    private Map<String, Object> detailsMiniAppButton(Long chatId, Long pharmacyId, String medicineName, Long medicineId) {
+        String miniAppUrl = buildMiniAppPharmacySearchUrl(medicineName, pharmacyId, medicineId);
+        String label = t(chatId, "card_details_btn");
+        if (canUseWebAppButton(miniAppUrl)) {
+            return Map.of(
+                    "text", label,
+                    "web_app", Map.of("url", miniAppUrl)
+            );
+        }
+        return Map.of("text", label, "url", miniAppUrl);
     }
 
     private Map<String, Object> miniAppPhotosButton(Long chatId, Long pharmacyId) {
@@ -1525,10 +1779,8 @@ public void sendPharmacyVenue(Long chatId,
             body.put("parse_mode", "HTML");
 
             List<List<Map<String, Object>>> keyboard = List.of(
-                    List.of(Map.of("text", "📦 Inventory")),
-                    List.of(Map.of("text", "📦 Reservations")),
-                    List.of(Map.of("text", "📊 Performance")),
-                    List.of(Map.of("text", "⚙️ Profile")),
+                    List.of(Map.of("text", "📦 Inventory"), Map.of("text", "📦 Reservations")),
+                    List.of(Map.of("text", "📊 Performance"), Map.of("text", "⚙️ Profile")),
                     List.of(Map.of("text", "⬅️ Back"), Map.of("text", "🏠 Home"))
             );
 
@@ -3462,15 +3714,11 @@ private Map<String, Object> reserveAgainButton(Long chatId,
             body.put("parse_mode", "HTML");
 
             List<List<Map<String, Object>>> keyboard = List.of(
-                    List.of(Map.of("text", "📦 View Reservations")),
-                    List.of(Map.of("text", "📦 Pending Reservations")),
-                    List.of(Map.of("text", "🧾 Prescription Reviews")),
-                    List.of(Map.of("text", "✅ Approved Reservations")),
-                    List.of(Map.of("text", "📦 Mark Fulfilled")),
-                    List.of(Map.of("text", "📷 Pickup Scanner")),
-                    List.of(Map.of("text", "📜 Reservation History")),
-                    List.of(Map.of("text", "🏠 Home"), Map.of("text", "🔙 Back")),
-                    List.of(Map.of("text", "❌ Cancel"))
+                    List.of(Map.of("text", "📦 View Reservations"), Map.of("text", "📦 Pending Reservations")),
+                    List.of(Map.of("text", "🧾 Prescription Reviews"), Map.of("text", "✅ Approved Reservations")),
+                    List.of(Map.of("text", "📦 Mark Fulfilled"), Map.of("text", "📷 Pickup Scanner")),
+                    List.of(Map.of("text", "📜 Reservation History"), Map.of("text", "❌ Cancel")),
+                    List.of(Map.of("text", "🏠 Home"), Map.of("text", "🔙 Back"))
             );
 
             body.put("reply_markup", persistentReplyKeyboard(keyboard));
@@ -3596,7 +3844,7 @@ public void sendPharmacyResult(Long chatId,
         }
 
         List<Map<String, Object>> row2 = new ArrayList<>();
-        row2.add(Map.of("text", t(chatId, "card_details_btn"), "callback_data", "details_" + pharmacyId + "_" + medicineName));
+        row2.add(detailsMiniAppButton(chatId, pharmacyId, medicineName, medicineId));
         row2.add(Map.of("text", t(chatId, "card_navigate_btn"), "url", navigateUrl));
         inlineKeyboard.add(row2);
 
@@ -3690,7 +3938,7 @@ public void editPharmacyMessageToCompact(Long chatId,
         }
 
         List<Map<String, Object>> row2 = new ArrayList<>();
-        row2.add(Map.of("text", t(chatId, "card_details_btn"), "callback_data", "details_" + pharmacyId + "_" + medicineName));
+        row2.add(detailsMiniAppButton(chatId, pharmacyId, medicineName, medicineId));
         row2.add(Map.of("text", t(chatId, "card_navigate_btn"), "url", navigateUrl));
         inlineKeyboard.add(row2);
 
@@ -3784,7 +4032,7 @@ public void editPharmacyMessageToCompactWithCall(Long chatId,
         if (!outOfStock && openNow && medicineId != null) {
             row2.add(directReserveButton(chatId, pharmacyId, medicineId));
         }
-        row2.add(Map.of("text", t(chatId, "card_details_btn"), "callback_data", "details_" + pharmacyId + "_" + medicineName));
+        row2.add(detailsMiniAppButton(chatId, pharmacyId, medicineName, medicineId));
         inlineKeyboard.add(row2);
 
         List<Map<String, Object>> row3 = new ArrayList<>();
@@ -3856,7 +4104,7 @@ public void editPharmacyMessageToggleReserve(Long chatId,
             ));
         }
 
-        row2.add(Map.of("text", t(chatId, "card_details_btn"), "callback_data", "details_" + pharmacyId + "_" + medicineName));
+        row2.add(detailsMiniAppButton(chatId, pharmacyId, medicineName));
         inlineKeyboard.add(row2);
 
         if (reserveOpen && !outOfStock) {
@@ -4657,7 +4905,7 @@ public void restoreNormalPharmacyButtonsAfterRating(Long chatId,
         }
 
         List<Map<String, Object>> row2 = new ArrayList<>();
-        row2.add(Map.of("text", t(chatId, "card_details_btn"), "callback_data", "details_" + pharmacyId + "_" + medicineName));
+        row2.add(detailsMiniAppButton(chatId, pharmacyId, medicineName, medicineId));
         row2.add(Map.of("text", t(chatId, "card_navigate_btn"), "url", navigateUrl));
         inlineKeyboard.add(row2);
 
@@ -4700,7 +4948,7 @@ public void restoreRateButtonAfterCancel(Long chatId,
         }
 
         List<Map<String, Object>> row2 = new ArrayList<>();
-        row2.add(Map.of("text", t(chatId, "card_details_btn"), "callback_data", "details_" + pharmacyId + "_" + medicineName));
+        row2.add(detailsMiniAppButton(chatId, pharmacyId, medicineName, medicineId));
         row2.add(Map.of("text", t(chatId, "card_navigate_btn"), "url", navigateUrl));
         inlineKeyboard.add(row2);
 
@@ -4749,7 +4997,7 @@ public void togglePharmacyReservePicker(Long chatId,
 
         List<Map<String, Object>> row2 = new ArrayList<>();
         row2.add(Map.of("text", t(chatId, "card_close_reserve_btn"), "callback_data", "close_reserve_" + pharmacyId + "_" + medicineName));
-        row2.add(Map.of("text", t(chatId, "card_details_btn"), "callback_data", "details_" + pharmacyId + "_" + medicineName));
+        row2.add(detailsMiniAppButton(chatId, pharmacyId, medicineName));
         inlineKeyboard.add(row2);
 
         if (!outOfStock) {
@@ -4819,7 +5067,7 @@ public void restorePharmacyCardButtons(Long chatId,
         }
 
         List<Map<String, Object>> row2 = new ArrayList<>();
-        row2.add(Map.of("text", t(chatId, "card_details_btn"), "callback_data", "details_" + pharmacyId + "_" + medicineName));
+        row2.add(detailsMiniAppButton(chatId, pharmacyId, medicineName, medicineId));
         row2.add(Map.of("text", t(chatId, "card_navigate_btn"), "url", navigateUrl));
         inlineKeyboard.add(row2);
 
@@ -4863,7 +5111,7 @@ public void editPharmacyMessageToRatingPicker(Long chatId,
           if (!outOfStock && medicineId != null) {
               row2.add(directReserveButton(chatId, pharmacyId, medicineId));
         }
-        row2.add(Map.of("text", t(chatId, "card_details_btn"), "callback_data", "details_" + pharmacyId + "_" + medicineName));
+        row2.add(detailsMiniAppButton(chatId, pharmacyId, medicineName, medicineId));
         inlineKeyboard.add(row2);
 
         inlineKeyboard.add(List.of(
@@ -4943,7 +5191,7 @@ public void restoreNormalPharmacyButtons(Long chatId,
         }
 
         inlineKeyboard.add(List.of(
-                Map.of("text", t(chatId, "card_details_btn"), "callback_data", "details_" + pharmacyId + "_" + medicineName),
+                detailsMiniAppButton(chatId, pharmacyId, medicineName),
                 Map.of("text", t(chatId, "card_rate_btn"), "callback_data", "show_rate_" + pharmacyId + "_" + medicineName)
         ));
 
@@ -4984,7 +5232,7 @@ public void restorePharmacyButtonsAfterRating(Long chatId,
         }
 
         inlineKeyboard.add(List.of(
-                Map.of("text", t(chatId, "card_details_btn"), "callback_data", "details_" + pharmacyId + "_" + medicineName),
+                detailsMiniAppButton(chatId, pharmacyId, medicineName),
                 Map.of("text", t(chatId, "btn_rated"), "callback_data", "rated_done")
         ));
 
@@ -5144,17 +5392,12 @@ public void sendIssueTypePicker(Long chatId, Long pharmacyId, String medicineNam
         body.put("text", "⚙️ Pharmacy Profile Update\n\nSelect what you want to update:");
 
         List<List<Map<String, Object>>> keyboard = List.of(
-                List.of(Map.of("text", "📞 Update Phone")),
-                List.of(Map.of("text", "📄 Update License")),
-                List.of(Map.of("text", "⏰ Update Hours")),
-                List.of(Map.of("text", "💊 Update Medicines")),
-                List.of(Map.of("text", "📍 Update Location")),
-                List.of(Map.of("text", "🖼 Manage Photos")),
-            List.of(Map.of("text", "💊 Manage Medicine Photos")),
-            List.of(Map.of("text", "🛑 Temporary Close")),
-            List.of(Map.of("text", "✅ Reopen Now")),
-                List.of(Map.of("text", "🏠 Home"), Map.of("text", "🔙 Back")),
-                List.of(Map.of("text", "❌ Cancel"))
+                List.of(Map.of("text", "📞 Update Phone"), Map.of("text", "📄 Update License")),
+                List.of(Map.of("text", "⏰ Update Hours"), Map.of("text", "💊 Update Medicines")),
+                List.of(Map.of("text", "📍 Update Location"), Map.of("text", "🖼 Manage Photos")),
+                List.of(Map.of("text", "💊 Manage Medicine Photos"), Map.of("text", "🛑 Temporary Close")),
+                List.of(Map.of("text", "✅ Reopen Now"), Map.of("text", "❌ Cancel")),
+                List.of(Map.of("text", "🏠 Home"), Map.of("text", "🔙 Back"))
         );
 
         body.put("reply_markup", persistentReplyKeyboard(keyboard));
@@ -5174,10 +5417,8 @@ public void sendPharmacyPhotoManagementMenu(Long chatId) {
         body.put("parse_mode", "HTML");
 
         List<List<Map<String, Object>>> keyboard = List.of(
-                List.of(Map.of("text", "➕ Add Photo")),
-                List.of(Map.of("text", "👁 View Photos")),
-                List.of(Map.of("text", "⭐ Set Main Photo")),
-                List.of(Map.of("text", "🗑 Remove Photo")),
+                List.of(Map.of("text", "➕ Add Photo"), Map.of("text", "👁 View Photos")),
+                List.of(Map.of("text", "⭐ Set Main Photo"), Map.of("text", "🗑 Remove Photo")),
                 List.of(Map.of("text", "⬅️ Back"), Map.of("text", "🏠 Home"))
         );
 
@@ -5198,10 +5439,8 @@ public void sendMedicinePhotoManagementMenu(Long chatId) {
         body.put("parse_mode", "HTML");
 
         List<List<Map<String, Object>>> keyboard = List.of(
-                List.of(Map.of("text", "➕ Add Medicine Photo")),
-                List.of(Map.of("text", "👁 View Medicine Photos")),
-                List.of(Map.of("text", "⭐ Set Main Medicine Photo")),
-                List.of(Map.of("text", "🗑 Remove Medicine Photo")),
+                List.of(Map.of("text", "➕ Add Medicine Photo"), Map.of("text", "👁 View Medicine Photos")),
+                List.of(Map.of("text", "⭐ Set Main Medicine Photo"), Map.of("text", "🗑 Remove Medicine Photo")),
                 List.of(Map.of("text", "⬅️ Back"), Map.of("text", "🏠 Home"))
         );
 
@@ -5462,13 +5701,11 @@ public void sendTemporaryCloseReasonPicker(Long chatId, int durationHours) {
         List<List<Map<String, Object>>> keyboard = List.of(
                 List.of(
                         Map.of("text", "➕ Add / Update Stock"),
-                    Map.of("text", "📦 Bulk Inventory Update")
+                        Map.of("text", "📦 Bulk Inventory Update")
                 ),
                 List.of(
-                    Map.of("text", "💰 Update Price")
-                ),
-                List.of(
-                    Map.of("text", "🧾 Prescription Settings")
+                        Map.of("text", "💰 Update Price"),
+                        Map.of("text", "🧾 Prescription Settings")
                 ),
                 List.of(
                         Map.of("text", "📉 Mark Out of Stock"),
@@ -5487,14 +5724,12 @@ public void sendTemporaryCloseReasonPicker(Long chatId, int durationHours) {
                         Map.of("text", "🎯 Set Low Stock Threshold")
                 ),
                 List.of(
-                    Map.of("text", "💡 Restock Suggestions")
+                        Map.of("text", "💡 Restock Suggestions"),
+                        Map.of("text", "❌ Cancel")
                 ),
                 List.of(
                         Map.of("text", "🔙 Back"),
                         Map.of("text", "🏠 Home")
-                ),
-                List.of(
-                        Map.of("text", "❌ Cancel")
                 )
         );
 
@@ -5563,17 +5798,12 @@ public void sendTemporaryCloseReasonPicker(Long chatId, int durationHours) {
             body.put("parse_mode", "HTML");
 
             List<List<Map<String, Object>>> keyboard = List.of(
-                    List.of(Map.of("text", "📊 Daily Summary")),
-                    List.of(Map.of("text", "📊 Weekly Summary")),
-                    List.of(Map.of("text", "📊 Monthly Summary")),
-                    List.of(Map.of("text", "📊 Yearly Summary")),
-                    List.of(Map.of("text", "⚠️ Low Stock Alert")),
-                    List.of(Map.of("text", "📈 Demand Insights")),
-                    List.of(Map.of("text", "💡 Restock Suggestions")),
-                    List.of(Map.of("text", "🎯 Set Low Stock Threshold")),
-                    List.of(Map.of("text", "📥 Import Inventory CSV")),
-                    List.of(Map.of("text", "🏠 Home"), Map.of("text", "🔙 Back")),
-                    List.of(Map.of("text", "❌ Cancel"))
+                    List.of(Map.of("text", "📊 Daily Summary"), Map.of("text", "📊 Weekly Summary")),
+                    List.of(Map.of("text", "📊 Monthly Summary"), Map.of("text", "📊 Yearly Summary")),
+                    List.of(Map.of("text", "⚠️ Low Stock Alert"), Map.of("text", "📈 Demand Insights")),
+                    List.of(Map.of("text", "💡 Restock Suggestions"), Map.of("text", "🎯 Set Low Stock Threshold")),
+                    List.of(Map.of("text", "📥 Import Inventory CSV"), Map.of("text", "❌ Cancel")),
+                    List.of(Map.of("text", "🏠 Home"), Map.of("text", "🔙 Back"))
             );
 
             body.put("reply_markup", persistentReplyKeyboard(keyboard));
@@ -6294,7 +6524,7 @@ public void deleteMessage(Long chatId, Integer messageId) {
             String url = apiUrl + "/sendMessage";
             boolean grouped = status.getReservationGroupId() != null && !status.getReservationGroupId().isBlank();
             StringBuilder message = new StringBuilder();
-            message.append("🧾 <b>Prescription Review</b>\n\n");
+            message.append("🧾 <b>New reservation — Prescription Review</b>\n\n");
 
             if (grouped) {
                 String groupId = status.getReservationGroupId();
@@ -6306,17 +6536,28 @@ public void deleteMessage(Long chatId, Integer messageId) {
                         .append(status.getReservationId())
                         .append("\n");
             }
+            if (status.getMedicineName() != null && !status.getMedicineName().isBlank()) {
+                message.append("💊 <b>Medicine:</b> ")
+                        .append(safeText(displayMedicine(chatId, status.getMedicineName())))
+                        .append("\n");
+            }
+            if (status.getQuantity() != null) {
+                message.append("🔢 <b>Quantity:</b> ")
+                        .append(status.getQuantity())
+                        .append("\n");
+            }
+            message.append("👤 <b>Full Name:</b> ")
+                    .append(safeText(status.getCustomerName()))
+                    .append("\n");
+            message.append("📱 <b>Phone:</b> ")
+                    .append(safeText(status.getCustomerPhone()))
+                    .append("\n");
+            message.append("👤 <b>User ID:</b> ")
+                    .append(status.getUserId() == null || status.getUserId() == 0 ? "-" : status.getUserId())
+                    .append("\n");
             message.append("📌 <b>Status:</b> ")
                     .append(safeText(status.getReviewStatus()))
                     .append("\n");
-            message.append("👤 <b>Uploader:</b> ")
-                    .append(status.getUserId() == null || status.getUserId() == 0 ? "-" : status.getUserId())
-                    .append("\n");
-            if (status.getCustomerPhone() != null && !status.getCustomerPhone().isBlank()) {
-                message.append("📱 <b>Phone:</b> ")
-                        .append(safeText(status.getCustomerPhone()))
-                        .append("\n");
-            }
             String lastUploadedAt = status.getFiles() == null || status.getFiles().isEmpty()
                     ? null
                     : status.getFiles().stream()
@@ -6383,10 +6624,17 @@ public void deleteMessage(Long chatId, Integer messageId) {
                     ? "group_" + status.getReservationGroupId()
                     : "res_" + status.getReservationId();
 
+            String viewUrl = buildMiniAppPharmacyPrescriptionViewUrl(
+                    chatId,
+                    status.getReservationId(),
+                    grouped ? status.getReservationGroupId() : null
+            );
+            Map<String, Object> viewButton = canUseWebAppButton(viewUrl)
+                    ? Map.of("text", "📄 View Prescription", "web_app", Map.of("url", viewUrl))
+                    : Map.of("text", "📄 View Prescription", "url", viewUrl);
+
             List<List<Map<String, Object>>> keyboard = new ArrayList<>();
-            keyboard.add(List.of(
-                    Map.of("text", "📄 View Prescription", "callback_data", "pres_files_" + callbackSuffix)
-            ));
+            keyboard.add(List.of(viewButton));
 
             if ("PENDING_REVIEW".equalsIgnoreCase(status.getReviewStatus())) {
                 keyboard.add(List.of(
@@ -6446,6 +6694,82 @@ public void deleteMessage(Long chatId, Integer messageId) {
             System.out.println("Telegram sendPhotoWithButtons error: " + e.getMessage());
         }
 
+        return null;
+    }
+
+    /**
+     * Uploads photo bytes to Telegram and returns file_id. Sends the photo to {@code chatId}.
+     */
+    public String sendPhotoBytes(Long chatId, byte[] content, String filename, String caption) {
+        return sendPhotoBytesInternal(chatId, content, filename, caption, null);
+    }
+
+    /**
+     * Uploads a photo from Mini App bytes, notifies admin with approve/reject, and returns Telegram file_id.
+     */
+    public String sendPhotoBytesWithButtons(Long chatId, byte[] content, String filename, String caption, Long registrationId) {
+        if (registrationId == null) {
+            return null;
+        }
+        String replyMarkup = "{\"inline_keyboard\":[[{\"text\":\"\\u2705 Approve\",\"callback_data\":\"approve_"
+                + registrationId + "\"},{\"text\":\"\\u274c Reject\",\"callback_data\":\"reject_"
+                + registrationId + "\"}]]}";
+        return sendPhotoBytesInternal(chatId, content, filename, caption, replyMarkup);
+    }
+
+    @SuppressWarnings("unchecked")
+    private String sendPhotoBytesInternal(Long chatId, byte[] content, String filename, String caption, String replyMarkup) {
+        if (chatId == null || content == null || content.length == 0) {
+            return null;
+        }
+        try {
+            String url = apiUrl + "/sendPhoto";
+            MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+            body.add("chat_id", String.valueOf(chatId));
+            if (caption != null && !caption.isBlank()) {
+                body.add("caption", caption);
+                body.add("parse_mode", "HTML");
+            }
+            String safeName = (filename == null || filename.isBlank()) ? "pharmacy-photo.jpg" : filename;
+            ByteArrayResource resource = new ByteArrayResource(content) {
+                @Override
+                public String getFilename() {
+                    return safeName;
+                }
+            };
+            body.add("photo", resource);
+            if (replyMarkup != null && !replyMarkup.isBlank()) {
+                body.add("reply_markup", replyMarkup);
+            }
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+            HttpEntity<MultiValueMap<String, Object>> requestEntity = new HttpEntity<>(body, headers);
+
+            Map<String, Object> response = restTemplate.postForObject(url, requestEntity, Map.class);
+            if (response == null || !Boolean.TRUE.equals(response.get("ok"))) {
+                return null;
+            }
+            Object resultObj = response.get("result");
+            if (!(resultObj instanceof Map<?, ?> result)) {
+                return null;
+            }
+            Object photoObj = result.get("photo");
+            if (photoObj instanceof List<?> photos && !photos.isEmpty()) {
+                Object last = photos.get(photos.size() - 1);
+                if (last instanceof Map<?, ?> photo) {
+                    Object fileId = photo.get("file_id");
+                    return fileId == null ? null : String.valueOf(fileId);
+                }
+            }
+            Object document = result.get("document");
+            if (document instanceof Map<?, ?> doc) {
+                Object fileId = doc.get("file_id");
+                return fileId == null ? null : String.valueOf(fileId);
+            }
+        } catch (Exception e) {
+            log.warn("sendPhotoBytes error: chatId={}, error={}", chatId, e.getMessage());
+        }
         return null;
     }
 

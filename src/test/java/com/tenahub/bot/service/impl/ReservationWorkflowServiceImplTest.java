@@ -2,8 +2,10 @@ package com.tenahub.bot.service.impl;
 
 import com.tenahub.bot.entity.MedicineReservation;
 import com.tenahub.bot.entity.Pharmacy;
+import com.tenahub.bot.entity.PharmacyNotificationType;
 import com.tenahub.bot.entity.PrescriptionReviewStatus;
 import com.tenahub.bot.repository.PharmacyRepository;
+import com.tenahub.bot.service.PharmacyNotificationService;
 import com.tenahub.bot.util.TelegramClient;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -18,6 +20,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -29,12 +32,14 @@ class ReservationWorkflowServiceImplTest {
     private PharmacyRepository pharmacyRepository;
     @Mock
     private TelegramClient telegramClient;
+    @Mock
+    private PharmacyNotificationService pharmacyNotificationService;
 
     private ReservationWorkflowServiceImpl service;
 
     @BeforeEach
     void setUp() {
-        service = new ReservationWorkflowServiceImpl(pharmacyRepository, telegramClient);
+        service = new ReservationWorkflowServiceImpl(pharmacyRepository, telegramClient, pharmacyNotificationService);
     }
 
     @Test
@@ -57,10 +62,17 @@ class ReservationWorkflowServiceImplTest {
 
         verify(telegramClient).sendReservationRequestToPharmacy(
                 777L, 10L, 9L, "paracetamol", 3, "+251911000000", "Abel", 20L, false);
+        verify(pharmacyNotificationService).create(
+                eq(5L),
+                eq(PharmacyNotificationType.RESERVATION_PENDING),
+                anyString(),
+                anyString(),
+                eq(10L),
+                eq("paracetamol"));
     }
 
     @Test
-    void notifyPharmacyPendingReservation_rxAwaitingUpload_stillSends() {
+    void notifyPharmacyPendingReservation_rxAwaitingUpload_skipsEarlyCard() {
         MedicineReservation reservation = MedicineReservation.builder()
                 .id(11L)
                 .pharmacyId(7L)
@@ -72,13 +84,13 @@ class ReservationWorkflowServiceImplTest {
                 .prescriptionRequired(true)
                 .prescriptionReviewStatus(PrescriptionReviewStatus.UPLOAD_REQUIRED)
                 .build();
-        Pharmacy pharmacy = Pharmacy.builder().id(7L).telegramId(888L).build();
-        when(pharmacyRepository.findById(7L)).thenReturn(Optional.of(pharmacy));
 
         service.notifyPharmacyPendingReservation(reservation, 20L);
 
-        verify(telegramClient).sendReservationRequestToPharmacy(
-                888L, 11L, 12L, "amoxicillin", 2, "+251900000000", "Liya", 20L, true);
+        verify(telegramClient, never()).sendReservationRequestToPharmacy(
+                anyLong(), any(), any(), anyString(), any(), anyString(), anyString(), anyLong(), anyBoolean());
+        verify(pharmacyNotificationService, never()).create(
+                anyLong(), any(), anyString(), anyString(), any(), any());
     }
 
     @Test

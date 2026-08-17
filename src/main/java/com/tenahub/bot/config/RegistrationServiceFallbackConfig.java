@@ -67,6 +67,11 @@ public class RegistrationServiceFallbackConfig {
         }
 
         @Override
+        public String buildExpiryAlert(Long telegramId) {
+            return "Inventory service is not available.";
+        }
+
+        @Override
         public void setLowStockThreshold(Long telegramId, String medicineName, Integer threshold) {
         }
 
@@ -81,7 +86,20 @@ public class RegistrationServiceFallbackConfig {
         }
 
         @Override
-        public void importInventoryCsv(Long telegramId, String csvContent) {
+        public java.util.List<com.tenahub.bot.dto.RestockSuggestionDTO> listRestockSuggestions(Long telegramId) {
+            return List.of();
+        }
+
+        @Override
+        public void ignoreRestockSuggestion(Long telegramId, String medicineName) {
+        }
+
+        @Override
+        public com.tenahub.bot.dto.InventoryCsvImportResultDTO importInventoryCsv(Long telegramId, String csvContent) {
+            return com.tenahub.bot.dto.InventoryCsvImportResultDTO.builder()
+                    .success(false)
+                    .message("Inventory service is not available.")
+                    .build();
         }
 
         @Override
@@ -117,6 +135,12 @@ public class RegistrationServiceFallbackConfig {
         }
 
         @Override
+        public List<com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO> getPharmacyMiniAppInventory(
+                Long pharmacyTelegramId, String search, String stockStatus, String expiryStatus, Boolean includeArchived) {
+            return List.of();
+        }
+
+        @Override
         public com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO updateStockFromMiniApp(Long pharmacyTelegramId, Long itemId, Integer quantity) {
             return null;
         }
@@ -137,7 +161,44 @@ public class RegistrationServiceFallbackConfig {
         }
 
         @Override
-        public com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO addStockFromMiniApp(Long pharmacyTelegramId, String medicineName, Integer quantity, java.math.BigDecimal price, Integer lowStockThreshold) {
+        public com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO addStockFromMiniApp(Long pharmacyTelegramId, com.tenahub.bot.dto.PharmacyMiniAppAddStockRequest request) {
+            return null;
+        }
+
+        @Override
+        public com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO patchInventoryFromMiniApp(
+                Long pharmacyTelegramId, Long itemId, com.tenahub.bot.dto.PharmacyMiniAppInventoryPatchRequest request) {
+            return null;
+        }
+
+        @Override
+        public void archiveInventoryItem(Long pharmacyTelegramId, Long itemId) {
+        }
+
+        @Override
+        public java.util.List<com.tenahub.bot.dto.MedicineBatchDTO> listInventoryBatches(Long pharmacyTelegramId, Long itemId) {
+            return List.of();
+        }
+
+        @Override
+        public java.util.List<com.tenahub.bot.dto.StockMovementDTO> listInventoryMovements(Long pharmacyTelegramId, Long itemId) {
+            return List.of();
+        }
+
+        @Override
+        public java.util.List<com.tenahub.bot.dto.MedicineBatchDTO> listExpiryBatches(Long pharmacyTelegramId, String bucket) {
+            return List.of();
+        }
+
+        @Override
+        public com.tenahub.bot.dto.PharmacyMiniAppInventoryItemDTO adjustInventoryFromMiniApp(
+                Long pharmacyTelegramId,
+                Long itemId,
+                Integer quantityChange,
+                String reason,
+                String movementType,
+                String batchNumber,
+                LocalDate expiryDate) {
             return null;
         }
     }
@@ -233,6 +294,11 @@ public class RegistrationServiceFallbackConfig {
 
         @Override
         public PharmacyRegistration getLatestRejected(Long telegramId) {
+            return null;
+        }
+
+        @Override
+        public PharmacyRegistration getLatest(Long telegramId) {
             return null;
         }
 

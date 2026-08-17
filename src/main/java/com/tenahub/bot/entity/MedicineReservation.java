@@ -86,9 +86,33 @@ public class MedicineReservation {
     @Column(name = "prescription_rejection_reason")
     private String prescriptionRejectionReason;
 
+    @Column(name = "prescription_clarification_message", length = 2000)
+    private String prescriptionClarificationMessage;
+
+    @Column(name = "prescription_clarification_at")
+    private LocalDateTime prescriptionClarificationAt;
+
+    @Column(name = "fulfilled_by_telegram_id")
+    private Long fulfilledByTelegramId;
+
     @Column(name = "reservation_group_id")
     private String reservationGroupId;
 
     @Column(name = "hidden_from_user_at")
     private LocalDateTime hiddenFromUserAt;
+
+    @Column(name = "hidden_from_pharmacy_at")
+    private LocalDateTime hiddenFromPharmacyAt;
+
+    @Column(name = "unit_price", precision = 12, scale = 2)
+    private java.math.BigDecimal unitPrice;
+
+    @Column(name = "total_price", precision = 12, scale = 2)
+    private java.math.BigDecimal totalPrice;
+
+    @Column(name = "currency", length = 8)
+    private String currency;
+
+    @Column(name = "price_locked_at")
+    private LocalDateTime priceLockedAt;
 }

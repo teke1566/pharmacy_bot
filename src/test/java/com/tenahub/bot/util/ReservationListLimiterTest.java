@@ -79,6 +79,13 @@ class ReservationListLimiterTest {
         assertEquals("pharm", rx.scope());
         assertEquals("RX_UPLOAD", rx.kind());
         assertEquals(10, rx.offset());
+
+        ReservationListLimiter.MoreCallback history = ReservationListLimiter.parseMoreCallback(
+                ReservationListLimiter.moreCallback("user", "HISTORY", 5));
+        assertEquals("user", history.scope());
+        assertEquals("HISTORY", history.kind());
+        assertEquals(5, history.offset());
+
         assertFalse(ReservationListLimiter.isMoreCallback("cancel_res_1"));
         assertNull(ReservationListLimiter.parseMoreCallback("res_more_bad"));
     }

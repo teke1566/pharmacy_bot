@@ -1,8 +1,8 @@
 package com.tenahub.bot.config;
 
-import java.util.Arrays;
 import java.util.List;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
@@ -16,8 +16,8 @@ import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 @Configuration
 public class SecurityConfig {
 
-    private static final List<String> MINI_APP_ALLOWED_ORIGINS =
-            List.copyOf(Arrays.asList(MiniAppCorsConfig.MINI_APP_ALLOWED_ORIGINS));
+    @Value("${tenahub.mini-app.allowed-origins:https://tenahub-miniapp.vercel.app}")
+    private String allowedOriginsCsv;
 
     @Bean
         public SecurityFilterChain securityFilterChain(HttpSecurity http) {
@@ -35,7 +35,7 @@ public class SecurityConfig {
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration configuration = new CorsConfiguration();
-        configuration.setAllowedOrigins(MINI_APP_ALLOWED_ORIGINS);
+        configuration.setAllowedOrigins(MiniAppCorsConfig.parseOrigins(allowedOriginsCsv));
         configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
         configuration.setAllowedHeaders(List.of("*"));
         configuration.setExposedHeaders(List.of("*"));

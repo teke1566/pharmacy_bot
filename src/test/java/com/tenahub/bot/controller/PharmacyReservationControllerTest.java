@@ -10,6 +10,7 @@ import com.tenahub.bot.repository.MedicineReservationRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
 import com.tenahub.bot.service.MiniAppActorResolver;
 import com.tenahub.bot.service.MiniAppAuthException;
+import com.tenahub.bot.service.PharmacyService;
 import com.tenahub.bot.service.PrescriptionReviewService;
 import com.tenahub.bot.service.ReservationService;
 import org.junit.jupiter.api.BeforeEach;
@@ -21,11 +22,13 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -42,6 +45,8 @@ class PharmacyReservationControllerTest {
     private PrescriptionReviewService prescriptionReviewService;
     @Mock
     private MiniAppActorResolver miniAppActorResolver;
+    @Mock
+    private PharmacyService pharmacyService;
 
     private PharmacyReservationController controller;
 
@@ -52,7 +57,33 @@ class PharmacyReservationControllerTest {
                 pharmacyRepository,
                 medicineReservationRepository,
                 prescriptionReviewService,
-                miniAppActorResolver);
+                miniAppActorResolver,
+                pharmacyService);
+    }
+
+    @Test
+    void checkAccess_returnsRegisteredPharmacyFlag() {
+        when(miniAppActorResolver.requirePharmacyTelegramId(9001L, null)).thenReturn(9001L);
+        when(pharmacyService.isRegisteredPharmacy(9001L)).thenReturn(true);
+
+        ResponseEntity<?> response = controller.checkAccess(9001L, null);
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        Map<?, ?> body = (Map<?, ?>) response.getBody();
+        assertTrue((Boolean) body.get("isPharmacy"));
+        assertEquals(9001L, body.get("telegramId"));
+    }
+
+    @Test
+    void checkAccess_returnsFalseWhenNotRegistered() {
+        when(miniAppActorResolver.requirePharmacyTelegramId(9001L, null)).thenReturn(9001L);
+        when(pharmacyService.isRegisteredPharmacy(9001L)).thenReturn(false);
+
+        ResponseEntity<?> response = controller.checkAccess(9001L, null);
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        Map<?, ?> body = (Map<?, ?>) response.getBody();
+        assertFalse((Boolean) body.get("isPharmacy"));
     }
 
     @Test

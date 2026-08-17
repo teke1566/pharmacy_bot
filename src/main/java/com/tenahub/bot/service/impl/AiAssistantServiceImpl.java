@@ -3,8 +3,14 @@ package com.tenahub.bot.service.impl;
 import com.tenahub.bot.dto.AiChatDebugResponseDTO;
 import com.tenahub.bot.dto.AiChatRequestDTO;
 import com.tenahub.bot.dto.AiChatResponseDTO;
+import com.tenahub.bot.dto.MedicineBatchDTO;
 import com.tenahub.bot.dto.MedicineInfoDTO;
 import com.tenahub.bot.dto.MiniAppReservationCardDTO;
+import com.tenahub.bot.dto.MiniAppMedicineSummaryDTO;
+import com.tenahub.bot.dto.PharmacyNotificationDTO;
+import com.tenahub.bot.dto.PharmacyPerformanceReportDTO;
+import com.tenahub.bot.dto.PharmacySalesSummaryDTO;
+import com.tenahub.bot.dto.RestockSuggestionDTO;
 import com.tenahub.bot.entity.MedicineReservation;
 import com.tenahub.bot.entity.PrescriptionReviewStatus;
 import com.tenahub.bot.repository.PharmacyRepository;
@@ -12,9 +18,12 @@ import com.tenahub.bot.service.AdminService;
 import com.tenahub.bot.service.AiAssistantService;
 import com.tenahub.bot.service.InventoryService;
 import com.tenahub.bot.service.LicenseComplianceService;
-import com.tenahub.bot.service.MiniAppService;
-import com.tenahub.bot.service.ReservationService;
 import com.tenahub.bot.service.MedicineKnowledgeService;
+import com.tenahub.bot.service.MiniAppService;
+import com.tenahub.bot.service.PharmacyNotificationService;
+import com.tenahub.bot.service.PharmacyPerformanceService;
+import com.tenahub.bot.service.PharmacySalesService;
+import com.tenahub.bot.service.ReservationService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -25,6 +34,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -37,6 +47,9 @@ public class AiAssistantServiceImpl implements AiAssistantService {
     private final LicenseComplianceService licenseComplianceService;
     private final PharmacyRepository pharmacyRepository;
     private final MedicineKnowledgeService medicineKnowledgeService;
+    private final PharmacyPerformanceService pharmacyPerformanceService;
+    private final PharmacySalesService pharmacySalesService;
+    private final PharmacyNotificationService pharmacyNotificationService;
 
     @Value("${tenahub.admin.chat-id:0}")
     private long adminChatId;
@@ -129,7 +142,23 @@ public class AiAssistantServiceImpl implements AiAssistantService {
             case PHARMACY_RESTOCK_SUGGESTIONS -> new ExecutionResult(
                 handlePharmacyRestockSuggestions(intent, resolvedRole),
                 intent, resolvedRole,
-                List.of("InventoryService.getAdvancedRestockSuggestions"));
+                List.of("InventoryService.listRestockSuggestions"));
+            case PHARMACY_PERFORMANCE -> new ExecutionResult(
+                handlePharmacyPerformance(intent, resolvedRole),
+                intent, resolvedRole,
+                List.of("PharmacyPerformanceService.getPerformanceReport"));
+            case PHARMACY_SALES -> new ExecutionResult(
+                handlePharmacySales(intent, resolvedRole),
+                intent, resolvedRole,
+                List.of("PharmacySalesService.summary"));
+            case PHARMACY_EXPIRY -> new ExecutionResult(
+                handlePharmacyExpiry(intent, resolvedRole),
+                intent, resolvedRole,
+                List.of("InventoryService.listExpiryBatches"));
+            case PHARMACY_NOTIFICATIONS -> new ExecutionResult(
+                handlePharmacyNotifications(intent, resolvedRole),
+                intent, resolvedRole,
+                List.of("PharmacyNotificationService.unreadCount", "PharmacyNotificationService.list"));
             case ADMIN_SYSTEM_SUMMARY -> new ExecutionResult(
                 handleAdminSystemSummary(intent, resolvedRole),
                 intent, resolvedRole,
@@ -164,6 +193,9 @@ public class AiAssistantServiceImpl implements AiAssistantService {
             case MEDICINE_MISSED_DOSE -> new ExecutionResult(
                 handleMedicineMissedDose(intent, resolvedRole, request),
                 intent, resolvedRole, List.of("MedicineKnowledgeService.lookup"));
+            case MEDICINE_SEARCH -> new ExecutionResult(
+                handleMedicineSearch(intent, resolvedRole, request),
+                intent, resolvedRole, List.of("MiniAppService.searchMedicineCatalog"));
             case UNKNOWN -> new ExecutionResult(
                 fallback(intent, resolvedRole),
                 intent, resolvedRole,
@@ -301,10 +333,118 @@ public class AiAssistantServiceImpl implements AiAssistantService {
         requireRole(role, Role.PHARMACY, "This question is available for pharmacy role only.");
         Long pharmacyTelegramId = requireActorId(role, "pharmacyTelegramId is required for pharmacy role.");
 
-        String suggestions = inventoryService.getAdvancedRestockSuggestions(pharmacyTelegramId);
-        return response(intent, role,
-                "Here are your restock suggestions based on reservation demand:\n" + suggestions,
-                List.of("Restock critical items immediately", "Review demand insights", "Update inventory"));
+        List<RestockSuggestionDTO> suggestions = inventoryService.listRestockSuggestions(pharmacyTelegramId);
+        if (suggestions == null || suggestions.isEmpty()) {
+            return response(intent, role,
+                    "No restock suggestions right now.",
+                    List.of("Open Restock page", "Review demand insights", "Check low stock"));
+        }
+
+        StringBuilder answer = new StringBuilder("Top restock suggestions:");
+        int shown = 0;
+        for (RestockSuggestionDTO s : suggestions) {
+            if (shown >= 5) {
+                break;
+            }
+            answer.append(" ").append(s.getMedicineName())
+                    .append(" (").append(s.getPriority() == null ? "—" : s.getPriority());
+            if (s.getDemandLabel() != null && !s.getDemandLabel().isBlank()) {
+                answer.append(", ").append(s.getDemandLabel());
+            }
+            answer.append(", qty ").append(s.getCurrentStock() == null ? 0 : s.getCurrentStock())
+                    .append(" → recommend ").append(s.getRecommendedQuantity() == null ? 0 : s.getRecommendedQuantity())
+                    .append(").");
+            shown++;
+        }
+        if (suggestions.size() > shown) {
+            answer.append(" Plus ").append(suggestions.size() - shown).append(" more in Restock.");
+        }
+        return response(intent, role, answer.toString(),
+                List.of("Open Restock", "Create purchase order", "Review demand insights"));
+    }
+
+    private AiChatResponseDTO handlePharmacyPerformance(Intent intent, ResolvedRole role) {
+        requireRole(role, Role.PHARMACY, "This question is available for pharmacy role only.");
+        Long pharmacyTelegramId = requireActorId(role, "pharmacyTelegramId is required for pharmacy role.");
+
+        PharmacyPerformanceReportDTO report = pharmacyPerformanceService.getPerformanceReport(pharmacyTelegramId, "weekly");
+        String answer = "Weekly health score: " + report.getHealthScore()
+                + " (grade " + report.getHealthGrade() + ")."
+                + " Reservations: " + (report.getReservations() == null ? 0 : report.getReservations().getTotal())
+                + " total, fulfillment "
+                + (report.getReservations() == null || report.getReservations().getFulfillmentRate() == null
+                        ? "0" : report.getReservations().getFulfillmentRate()) + "%."
+                + " Critical restock items: "
+                + (report.getCriticalRestockCount() == null ? 0 : report.getCriticalRestockCount()) + "."
+                + " Open Performance in the Mini App for full factors.";
+
+        return response(intent, role, answer,
+                List.of("Open Performance", "Review restock", "Check sales"));
+    }
+
+    private AiChatResponseDTO handlePharmacySales(Intent intent, ResolvedRole role) {
+        requireRole(role, Role.PHARMACY, "This question is available for pharmacy role only.");
+        Long pharmacyTelegramId = requireActorId(role, "pharmacyTelegramId is required for pharmacy role.");
+
+        PharmacySalesSummaryDTO summary = pharmacySalesService.summary(pharmacyTelegramId, "weekly");
+        String answer = "Weekly sales: revenue "
+                + (summary.getRevenue() == null ? "0" : summary.getRevenue())
+                + " ETB, " + (summary.getSaleCount() == null ? 0 : summary.getSaleCount()) + " sale(s), "
+                + (summary.getMedicinesDispensed() == null ? 0 : summary.getMedicinesDispensed())
+                + " unit(s) dispensed.";
+
+        return response(intent, role, answer,
+                List.of("Open Sales", "View today's sales", "Check performance"));
+    }
+
+    private AiChatResponseDTO handlePharmacyExpiry(Intent intent, ResolvedRole role) {
+        requireRole(role, Role.PHARMACY, "This question is available for pharmacy role only.");
+        Long pharmacyTelegramId = requireActorId(role, "pharmacyTelegramId is required for pharmacy role.");
+
+        List<MedicineBatchDTO> batches = inventoryService.listExpiryBatches(pharmacyTelegramId, "90");
+        if (batches == null || batches.isEmpty()) {
+            return response(intent, role,
+                    "No medicines are expiring within 90 days.",
+                    List.of("Open Expiring page", "Check inventory", "Review FEFO lots"));
+        }
+
+        String names = batches.stream()
+                .map(MedicineBatchDTO::getMedicineName)
+                .filter(Objects::nonNull)
+                .distinct()
+                .limit(5)
+                .collect(Collectors.joining(", "));
+        String answer = "You have " + batches.size() + " lot(s) expiring within 90 days."
+                + (names.isBlank() ? "" : " Examples: " + names + ".")
+                + " Open Expiring in the Mini App for FEFO details.";
+
+        return response(intent, role, answer,
+                List.of("Open Expiring", "Adjust near-expiry stock", "Review inventory"));
+    }
+
+    private AiChatResponseDTO handlePharmacyNotifications(Intent intent, ResolvedRole role) {
+        requireRole(role, Role.PHARMACY, "This question is available for pharmacy role only.");
+        Long pharmacyTelegramId = requireActorId(role, "pharmacyTelegramId is required for pharmacy role.");
+
+        long unread = pharmacyNotificationService.unreadCount(pharmacyTelegramId);
+        List<PharmacyNotificationDTO> unreadRows = pharmacyNotificationService.list(pharmacyTelegramId, true);
+        if (unread <= 0) {
+            return response(intent, role,
+                    "You have no unread notifications.",
+                    List.of("Open Notifications", "Mark all as read", "Check reservations"));
+        }
+
+        String titles = unreadRows.stream()
+                .map(PharmacyNotificationDTO::getTitle)
+                .filter(Objects::nonNull)
+                .limit(3)
+                .collect(Collectors.joining("; "));
+        String answer = "You have " + unread + " unread notification(s)."
+                + (titles.isBlank() ? "" : " Latest: " + titles + ".")
+                + " Open Notifications in the Mini App to review.";
+
+        return response(intent, role, answer,
+                List.of("Open Notifications", "Mark all as read", "Review reservations"));
     }
 
     private AiChatResponseDTO handleAdminReservationOversight(Intent intent, ResolvedRole role) {
@@ -579,7 +719,7 @@ public class AiAssistantServiceImpl implements AiAssistantService {
     private AiChatResponseDTO fallback(Intent intent, ResolvedRole role) {
         String answer = switch (role.role()) {
             case USER -> "I can help with: reservation status, reservation history, cancel guidance, prescription status, prescription upload, QR visibility, and medicine information questions.";
-            case PHARMACY -> "I can help with: pending reservations, approved reservations, prescription review queue, low stock, demand insights, and restock suggestions.";
+            case PHARMACY -> "I can help with: pending/approved reservations, prescription reviews, low stock, demand, restock, performance/health score, sales, expiring lots, and unread notifications.";
             case ADMIN -> "I can help with: system summary, reservation oversight, top medicines, compliance summary, and platform low-stock status.";
         };
         return response(intent, role, answer,
@@ -607,8 +747,13 @@ public class AiAssistantServiceImpl implements AiAssistantService {
         Optional<MedicineInfoDTO> opt = medicineKnowledgeService.lookup(name);
         if (opt.isEmpty()) return medicineNotFound(intent, role, name);
         MedicineInfoDTO m = opt.get();
+        // Curated package text may appear on the card only — answer body stays non-numeric personal advice.
+        String answer = "For " + m.getName()
+                + ", follow the package label or your clinician's prescription. "
+                + "Do not treat general package guidance as personal dosing advice. "
+                + m.getSafetyNote();
         return medicineResponse(intent, role, m.getName(),
-            m.getHowToTake() + " " + m.getSafetyNote(),
+            answer,
             null, m.getHowToTake(), null, null, "consult_pharmacist",
             List.of("Ask about side effects of " + m.getName(),
                 "Ask about warnings for " + m.getName(),
@@ -669,6 +814,47 @@ public class AiAssistantServiceImpl implements AiAssistantService {
                 "Ask about warnings for " + m.getName()));
         }
 
+        private AiChatResponseDTO handleMedicineSearch(Intent intent, ResolvedRole role, AiChatRequestDTO request) {
+        String name = medicineKnowledgeService.detectMedicineName(normalize(request.getMessage()));
+        if (name == null || name.isBlank()) {
+            return response(intent, role,
+                    "Which medicine should I search for in the catalog?",
+                    List.of("Ask: where can I find insulin", "Ask: how much is paracetamol"));
+        }
+
+        List<MiniAppMedicineSummaryDTO> found = miniAppService.searchMedicineCatalog(name, null, null);
+        if (found == null || found.isEmpty()) {
+            return response(intent, role,
+                    "No catalog match for \"" + name + "\" in pharmacy inventory.",
+                    List.of("Try another medicine name", "Search in the Mini App"));
+        }
+
+        StringBuilder answer = new StringBuilder("Catalog results for " + name + ":");
+        int shown = 0;
+        for (MiniAppMedicineSummaryDTO item : found) {
+            if (shown >= 5) {
+                break;
+            }
+            answer.append(" ").append(item.getMedicineName() == null ? name : item.getMedicineName());
+            if (item.getPrice() != null) {
+                answer.append(" from ").append(item.getPrice()).append(" ETB");
+            }
+            if (item.isOutOfStock() || item.getAvailablePharmacies() <= 0) {
+                answer.append(" (out of stock)");
+            } else {
+                answer.append(", available in ").append(item.getAvailablePharmacies())
+                        .append(item.getAvailablePharmacies() == 1 ? " pharmacy" : " pharmacies");
+            }
+            if (item.isPrescriptionRequired()) {
+                answer.append(", prescription required");
+            }
+            answer.append(".");
+            shown++;
+        }
+        return response(intent, role, answer.toString(),
+                List.of("Open Mini App search", "Ask about a different medicine"));
+        }
+
         private AiChatResponseDTO medicineResponse(Intent intent, ResolvedRole role, String medicineName,
             String answer, String use, String howToTake, String sideEffects, String warnings,
             String safetyLevel, List<String> actions) {
@@ -694,8 +880,8 @@ public class AiAssistantServiceImpl implements AiAssistantService {
 
         private AiChatResponseDTO medicineNotFound(Intent intent, ResolvedRole role, String name) {
         return response(intent, role,
-            "Sorry, I don't have information about \"" + name + "\" in my knowledge base yet. "
-                + "Please consult a qualified pharmacist or clinician for accurate guidance.",
+            "Sorry, I don't have curated information about \"" + name + "\" yet. "
+                + "I will not invent dosing or clinical guidance. Please consult a qualified pharmacist or clinician.",
             List.of("Ask about a different medicine", "Consult a pharmacist"));
         }
 
@@ -750,6 +936,22 @@ public class AiAssistantServiceImpl implements AiAssistantService {
         }
         if (containsAny(text, "low stock", "low in stock", "stock low", "what is low in stock")) {
             return Intent.PHARMACY_LOW_STOCK;
+        }
+        if (containsAny(text, "health score", "pharmacy performance", "performance report",
+                "analytics", "pharmacy analytics", "my performance")) {
+            return Intent.PHARMACY_PERFORMANCE;
+        }
+        if (containsAny(text, "sales summary", "my sales", "revenue this", "weekly sales",
+                "daily sales", "how much revenue", "dispensed this week", "sales report")) {
+            return Intent.PHARMACY_SALES;
+        }
+        if (containsAny(text, "expiring", "expiry", "near expiry", "fefo", "expire soon",
+                "expiring stock", "batches expiring")) {
+            return Intent.PHARMACY_EXPIRY;
+        }
+        if (containsAny(text, "unread notifications", "notification inbox", "my notifications",
+                "pharmacy notifications", "how many unread")) {
+            return Intent.PHARMACY_NOTIFICATIONS;
         }
 
         // ── ADMIN-specific ────────────────────────────────────────────────────
@@ -812,6 +1014,13 @@ public class AiAssistantServiceImpl implements AiAssistantService {
             return Intent.USER_QR_VISIBILITY;
         }
 
+        // ── MEDICINE catalog search (availability/price) ──────────────────────
+        if (containsAny(text, "where can i find", "where can i buy", "where to buy", "where to find",
+                "search for", "look for", "available nearby", "pharmacies with", "pharmacies that have",
+                "how much is", "price of", "is available", "find medicine")) {
+            return Intent.MEDICINE_SEARCH;
+        }
+
         // ── MEDICINE information (role-agnostic) ──────────────────────────────
         if (containsAny(text, "side effects", "side effect", "adverse effects", "adverse reaction")) {
             return Intent.MEDICINE_SIDE_EFFECTS;
@@ -828,7 +1037,8 @@ public class AiAssistantServiceImpl implements AiAssistantService {
                 "safe to take", "interact with", "should i avoid")) {
             return Intent.MEDICINE_WARNINGS;
         }
-        if (containsAny(text, "how do i take", "how to take", "dosage", "how many mg", "when to take")
+        if (containsAny(text, "how do i take", "how to take", "dosage", "how many mg", "when to take",
+                "how much should i take", "dose for me", "what dose", "personal dose")
                 && !text.contains("prescription") && !text.contains("reservation")) {
             return Intent.MEDICINE_HOW_TO_TAKE;
         }
@@ -929,6 +1139,10 @@ public class AiAssistantServiceImpl implements AiAssistantService {
         PHARMACY_LOW_STOCK,
         PHARMACY_DEMAND_INSIGHTS,
         PHARMACY_RESTOCK_SUGGESTIONS,
+        PHARMACY_PERFORMANCE,
+        PHARMACY_SALES,
+        PHARMACY_EXPIRY,
+        PHARMACY_NOTIFICATIONS,
         ADMIN_SYSTEM_SUMMARY,
         ADMIN_RESERVATION_OVERSIGHT,
         ADMIN_TOP_MEDICINES,
@@ -939,6 +1153,7 @@ public class AiAssistantServiceImpl implements AiAssistantService {
         MEDICINE_WARNINGS,
         MEDICINE_STORAGE,
         MEDICINE_MISSED_DOSE,
+        MEDICINE_SEARCH,
         UNKNOWN
     }
 

@@ -25,6 +25,8 @@ public interface PrescriptionReviewService {
                                                      Long pharmacyTelegramId,
                                                      PrescriptionReviewRequestDTO request);
 
+    void notifyCustomerOfPrescriptionDecision(PrescriptionStatusResponseDTO status, boolean approved);
+
     PrescriptionFileContent downloadPrescriptionFile(Long prescriptionId, Long pharmacyTelegramId);
 
     record PrescriptionFileContent(byte[] fileData, String contentType, String originalFilename) {

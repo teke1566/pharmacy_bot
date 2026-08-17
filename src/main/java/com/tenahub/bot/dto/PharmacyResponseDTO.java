@@ -15,7 +15,10 @@ import lombok.NoArgsConstructor;
 public class PharmacyResponseDTO {
     private Long id;
     private String name;
+    private String city;
     private String area;
+    private String landmark;
+    private String formattedAddress;
     private String phone;
     private double distance;
     private double latitude;
@@ -33,8 +36,11 @@ public class PharmacyResponseDTO {
 
     private String medicineName;
     private Long medicineId;
+    private Long catalogMedicineId;
     private BigDecimal price;
     private boolean requiresPrescription;
+
+    private boolean expired;
 
     // add these for filters / display
     private boolean openNow;

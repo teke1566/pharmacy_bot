@@ -7,6 +7,9 @@ import com.tenahub.bot.repository.MedicineReservationRepository;
 import com.tenahub.bot.repository.PharmacyInventoryRepository;
 import com.tenahub.bot.repository.PharmacyRegistrationRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
+import com.tenahub.bot.service.MedicineLotService;
+import com.tenahub.bot.service.PharmacySalesService;
+import com.tenahub.bot.service.ReservationStatusHistoryService;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
@@ -20,6 +23,7 @@ import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -34,6 +38,12 @@ class AdminServiceImplTest {
     private MedicineReservationRepository reservationRepository;
     @Mock
     private PharmacyInventoryRepository pharmacyInventoryRepository;
+    @Mock
+    private MedicineLotService medicineLotService;
+    @Mock
+    private PharmacySalesService pharmacySalesService;
+    @Mock
+    private ReservationStatusHistoryService reservationStatusHistoryService;
 
     @InjectMocks
     private AdminServiceImpl service;
@@ -92,5 +102,23 @@ class AdminServiceImplTest {
         verify(reservationRepository).save(captor.capture());
         assertEquals(MedicineReservationStatus.CANCELLED, captor.getValue().getStatus());
         assertEquals("ADMIN_FORCED_CANCEL", captor.getValue().getNote());
+    }
+
+    @Test
+    void adminFulfillReservation_recordsSale() {
+        MedicineReservation reservation = MedicineReservation.builder()
+                .id(9L)
+                .status(MedicineReservationStatus.APPROVED)
+                .requestedQuantity(2)
+                .build();
+        when(reservationRepository.findById(9L)).thenReturn(Optional.of(reservation));
+        when(reservationRepository.save(any(MedicineReservation.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        service.adminFulfillReservation(9L);
+
+        ArgumentCaptor<MedicineReservation> captor = ArgumentCaptor.forClass(MedicineReservation.class);
+        verify(reservationRepository).save(captor.capture());
+        assertEquals(MedicineReservationStatus.FULFILLED, captor.getValue().getStatus());
+        verify(pharmacySalesService).recordFromReservation(captor.getValue(), null);
     }
 }

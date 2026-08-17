@@ -8,6 +8,9 @@ import com.tenahub.bot.entity.PrescriptionReviewStatus;
 import com.tenahub.bot.repository.MedicineReservationRepository;
 import com.tenahub.bot.repository.PharmacyInventoryRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
+import com.tenahub.bot.service.MedicineLotService;
+import com.tenahub.bot.service.PharmacySalesService;
+import com.tenahub.bot.service.ReservationStatusHistoryService;
 import com.tenahub.bot.service.ReservationWorkflowService;
 import com.tenahub.bot.util.BotLanguage;
 import com.tenahub.bot.util.LocalizationService;
@@ -30,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -50,6 +54,12 @@ class ReservationServiceImplTest {
     private TelegramClient telegramClient;
     @Mock
     private ReservationWorkflowService reservationWorkflowService;
+    @Mock
+    private MedicineLotService medicineLotService;
+    @Mock
+    private PharmacySalesService pharmacySalesService;
+    @Mock
+    private ReservationStatusHistoryService reservationStatusHistoryService;
 
     private ReservationServiceImpl service;
 
@@ -61,8 +71,67 @@ class ReservationServiceImplTest {
                 inventoryRepository,
                 localizationService,
                 telegramClient,
-                reservationWorkflowService);
+                reservationWorkflowService,
+                medicineLotService,
+                pharmacySalesService,
+                reservationStatusHistoryService);
         ReflectionTestUtils.setField(service, "pendingTimeoutMinutes", 20L);
+        org.mockito.Mockito.lenient().when(medicineLotService.hasExpiredStock(any())).thenReturn(false);
+        org.mockito.Mockito.lenient().doAnswer(invocation -> {
+            MedicineReservation reservation = invocation.getArgument(0);
+            PharmacyInventory inventory = inventoryRepository
+                    .findByPharmacyIdAndMedicineNameIgnoreCase(reservation.getPharmacyId(), reservation.getMedicineName())
+                    .orElseThrow(() -> new RuntimeException("Medicine inventory not found"));
+            int availableQty = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
+            int requiredQty = reservation.getRequestedQuantity() == null ? 0 : reservation.getRequestedQuantity();
+            if (inventory.isOutOfStock() || availableQty <= 0) {
+                throw new RuntimeException("Medicine is currently out of stock.");
+            }
+            if (requiredQty > availableQty) {
+                throw new RuntimeException("Requested quantity exceeds available stock.");
+            }
+            inventory.setQuantity(availableQty - requiredQty);
+            inventory.setOutOfStock(inventory.getQuantity() <= 0);
+            inventoryRepository.save(inventory);
+            reservation.setInventoryHeld(true);
+            return null;
+        }).when(medicineLotService).holdForReservation(any());
+        org.mockito.Mockito.lenient().doAnswer(invocation -> {
+            MedicineReservation reservation = invocation.getArgument(0);
+            if (reservation == null || !reservation.isInventoryHeld()) {
+                return null;
+            }
+            inventoryRepository.findByPharmacyIdAndMedicineNameIgnoreCase(
+                            reservation.getPharmacyId(), reservation.getMedicineName())
+                    .ifPresent(inventory -> {
+                        int currentQty = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
+                        int releaseQty = reservation.getRequestedQuantity() == null ? 0 : reservation.getRequestedQuantity();
+                        inventory.setQuantity(currentQty + Math.max(releaseQty, 0));
+                        inventory.setOutOfStock(inventory.getQuantity() <= 0);
+                        inventoryRepository.save(inventory);
+                    });
+            reservation.setInventoryHeld(false);
+            return null;
+        }).when(medicineLotService).releaseHeldForReservation(any());
+        org.mockito.Mockito.lenient().doAnswer(invocation -> {
+            MedicineReservation reservation = invocation.getArgument(0);
+            if (!reservation.isInventoryHeld()) {
+                PharmacyInventory inventory = inventoryRepository
+                        .findByPharmacyIdAndMedicineNameIgnoreCase(reservation.getPharmacyId(), reservation.getMedicineName())
+                        .orElseThrow(() -> new RuntimeException("Medicine inventory not found"));
+                int currentQty = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
+                int newQty = currentQty - reservation.getRequestedQuantity();
+                if (newQty < 0) {
+                    throw new RuntimeException("Requested quantity exceeds available stock.");
+                }
+                inventory.setQuantity(newQty);
+                inventory.setOutOfStock(newQty <= 0);
+                inventoryRepository.save(inventory);
+            }
+            reservation.setInventoryHeld(false);
+            return null;
+        }).when(medicineLotService).fulfillReservation(any(), org.mockito.ArgumentMatchers.nullable(Long.class));
+        org.mockito.Mockito.lenient().doAnswer(invocation -> null).when(medicineLotService).ensureBackfillAndSync(any());
     }
 
     @Test
@@ -81,6 +150,8 @@ class ReservationServiceImplTest {
         when(pharmacyRepository.findById(pharmacyId)).thenReturn(Optional.of(pharmacy));
         when(inventoryRepository.findByPharmacyIdAndMedicineNameIgnoreCase(pharmacyId, "paracetamol"))
                 .thenReturn(Optional.of(inventory));
+        when(reservationRepository.findByUserIdAndStatusIn(eq(9L), any()))
+                .thenReturn(List.of());
         when(reservationRepository.save(any(MedicineReservation.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
 
@@ -110,6 +181,8 @@ class ReservationServiceImplTest {
         when(pharmacyRepository.findById(pharmacyId)).thenReturn(Optional.of(pharmacy));
         when(inventoryRepository.findByPharmacyIdAndMedicineNameIgnoreCase(pharmacyId, "amoxicillin"))
                 .thenReturn(Optional.of(inventory));
+        when(reservationRepository.findByUserIdAndStatusIn(eq(11L), any()))
+                .thenReturn(List.of());
         when(reservationRepository.save(any(MedicineReservation.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
 
@@ -120,6 +193,69 @@ class ReservationServiceImplTest {
         assertEquals(8, inventory.getQuantity());
         verify(inventoryRepository, never()).save(inventory);
         verify(reservationWorkflowService).notifyPharmacyPendingReservation(created, 20L);
+    }
+
+    @Test
+    void createReservation_blocksActiveDuplicateSamePharmacyMedicine() {
+        Long pharmacyId = 5L;
+        Pharmacy pharmacy = Pharmacy.builder().id(pharmacyId).build();
+        PharmacyInventory inventory = PharmacyInventory.builder()
+                .pharmacyId(pharmacyId)
+                .medicineName("paracetamol")
+                .quantity(10)
+                .outOfStock(false)
+                .requiresPrescription(false)
+                .build();
+        MedicineReservation existing = MedicineReservation.builder()
+                .id(1L)
+                .userId(9L)
+                .pharmacyId(pharmacyId)
+                .medicineName("paracetamol")
+                .status(MedicineReservationStatus.PENDING)
+                .build();
+
+        when(pharmacyRepository.findById(pharmacyId)).thenReturn(Optional.of(pharmacy));
+        when(inventoryRepository.findByPharmacyIdAndMedicineNameIgnoreCase(pharmacyId, "paracetamol"))
+                .thenReturn(Optional.of(inventory));
+        when(reservationRepository.findByUserIdAndStatusIn(eq(9L), any()))
+                .thenReturn(List.of(existing));
+
+        RuntimeException ex = assertThrows(RuntimeException.class,
+                () -> service.createReservation(9L, pharmacyId, "paracetamol", 1, "+251911000000", "Abel"));
+        assertTrue(ex.getMessage().contains("already have an active reservation"));
+        verify(reservationRepository, never()).save(any());
+    }
+
+    @Test
+    void createReservation_allowsSameMedicineAtDifferentPharmacy() {
+        Long pharmacyId = 6L;
+        Pharmacy pharmacy = Pharmacy.builder().id(pharmacyId).build();
+        PharmacyInventory inventory = PharmacyInventory.builder()
+                .pharmacyId(pharmacyId)
+                .medicineName("paracetamol")
+                .quantity(10)
+                .outOfStock(false)
+                .requiresPrescription(false)
+                .build();
+        MedicineReservation existingOtherPharmacy = MedicineReservation.builder()
+                .id(1L)
+                .userId(9L)
+                .pharmacyId(5L)
+                .medicineName("paracetamol")
+                .status(MedicineReservationStatus.PENDING)
+                .build();
+
+        when(pharmacyRepository.findById(pharmacyId)).thenReturn(Optional.of(pharmacy));
+        when(inventoryRepository.findByPharmacyIdAndMedicineNameIgnoreCase(pharmacyId, "paracetamol"))
+                .thenReturn(Optional.of(inventory));
+        when(reservationRepository.findByUserIdAndStatusIn(eq(9L), any()))
+                .thenReturn(List.of(existingOtherPharmacy));
+        when(reservationRepository.save(any(MedicineReservation.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        MedicineReservation created = service.createReservation(9L, pharmacyId, "paracetamol", 1, "+251911000000", "Abel");
+        assertEquals(MedicineReservationStatus.PENDING, created.getStatus());
+        assertEquals(pharmacyId, created.getPharmacyId());
     }
 
     @Test
@@ -164,12 +300,14 @@ class ReservationServiceImplTest {
         when(pharmacyRepository.findByTelegramId(pharmacyTelegramId)).thenReturn(Optional.of(pharmacy));
         when(localizationService.getLanguage(555L)).thenReturn(BotLanguage.ENGLISH);
         when(reservationRepository.save(any(MedicineReservation.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        when(telegramClient.buildMiniAppUserReservationStatusUrl(eq("history"), eq(reservationId), any()))
+                .thenReturn("https://tenahub-miniapp.vercel.app/#/search?section=history&reservationId=50");
 
         MedicineReservation saved = service.cancelReservationByPharmacy(reservationId, pharmacyTelegramId);
 
         assertEquals(MedicineReservationStatus.CANCELLED, saved.getStatus());
         assertEquals(null, saved.getQrToken());
-        verify(telegramClient).sendMessage(eq(555L), any(String.class));
+        verify(telegramClient).sendMessageWithMiniAppButton(eq(555L), any(String.class), anyString(), anyString());
     }
 
     @Test
@@ -308,11 +446,13 @@ class ReservationServiceImplTest {
         when(localizationService.getLanguage(11L)).thenReturn(BotLanguage.ENGLISH);
         when(localizationService.text(eq(11L), eq("reservation_approved_user"), any(), any(), any()))
                 .thenReturn("approved");
+        when(telegramClient.buildMiniAppUserReservationStatusUrl(eq("active"), eq(86L), any()))
+                .thenReturn("https://tenahub-miniapp.vercel.app/#/search?section=active&reservationId=86");
 
         MedicineReservation saved = service.approveReservationAndNotify(86L);
 
         assertEquals(MedicineReservationStatus.READY_FOR_PICKUP, saved.getStatus());
-        verify(telegramClient).sendMessage(eq(11L), eq("approved"));
+        verify(telegramClient).sendMessageWithMiniAppButton(eq(11L), eq("approved"), anyString(), anyString());
     }
 
     @Test
@@ -332,6 +472,31 @@ class ReservationServiceImplTest {
     }
 
     @Test
+    void rejectReservationAndNotify_sendsCustomerDmWithReason() {
+        MedicineReservation reservation = MedicineReservation.builder()
+                .id(83L)
+                .userId(11L)
+                .medicineName("paracetamol")
+                .requestedQuantity(2)
+                .status(MedicineReservationStatus.PENDING)
+                .inventoryHeld(false)
+                .build();
+        when(reservationRepository.findById(83L)).thenReturn(Optional.of(reservation));
+        when(reservationRepository.save(any(MedicineReservation.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        when(localizationService.getLanguage(11L)).thenReturn(BotLanguage.ENGLISH);
+        when(localizationService.text(eq(11L), eq("reservation_rejected_user"), any(), any(), any()))
+                .thenReturn("rejected-with-reason");
+        when(telegramClient.buildMiniAppUserReservationStatusUrl(eq("history"), eq(83L), any()))
+                .thenReturn("https://tenahub-miniapp.vercel.app/#/search?section=history&reservationId=83");
+
+        MedicineReservation saved = service.rejectReservationAndNotify(83L, "blurry prescription");
+
+        assertEquals(MedicineReservationStatus.REJECTED, saved.getStatus());
+        assertEquals("blurry prescription", saved.getRejectionReason());
+        verify(telegramClient).sendMessageWithMiniAppButton(eq(11L), eq("rejected-with-reason"), anyString(), anyString());
+    }
+
+    @Test
     void fulfillReservation_readyForPickup_setsFulfilled() {
         MedicineReservation reservation = MedicineReservation.builder()
                 .id(82L)
@@ -347,6 +512,7 @@ class ReservationServiceImplTest {
         assertEquals(MedicineReservationStatus.FULFILLED, saved.getStatus());
         assertFalse(saved.isInventoryHeld());
         assertNotNull(saved.getFulfilledAt());
+        verify(pharmacySalesService).recordFromReservation(saved, null);
     }
 
     @Test
@@ -421,6 +587,7 @@ class ReservationServiceImplTest {
                 .thenReturn(Optional.of(paracetamol));
         when(inventoryRepository.findByPharmacyIdAndMedicineNameIgnoreCase(pharmacyId, "ibuprofen"))
                 .thenReturn(Optional.of(ibuprofen));
+        when(reservationRepository.findByUserIdAndStatusIn(eq(9L), any())).thenReturn(List.of());
         when(reservationRepository.save(any(MedicineReservation.class))).thenAnswer(invocation -> invocation.getArgument(0));
 
         List<MedicineReservation> created = service.createReservationGroup(
@@ -449,5 +616,156 @@ class ReservationServiceImplTest {
         RuntimeException error = assertThrows(RuntimeException.class,
                 () -> service.scanReservationByQrToken("QR-1", 8000L));
         assertEquals("Reservation does not belong to this pharmacy.", error.getMessage());
+    }
+
+    @Test
+    void approveGroupAndNotify_rejectsForeignPharmacy() {
+        Pharmacy pharmacy = Pharmacy.builder().id(1L).telegramId(9001L).build();
+        MedicineReservation foreign = MedicineReservation.builder()
+                .id(1L)
+                .pharmacyId(99L)
+                .reservationGroupId("g1")
+                .status(MedicineReservationStatus.PENDING)
+                .build();
+        when(pharmacyRepository.findByTelegramId(9001L)).thenReturn(Optional.of(pharmacy));
+        when(reservationRepository.findByReservationGroupId("g1")).thenReturn(List.of(foreign));
+
+        RuntimeException error = assertThrows(RuntimeException.class,
+                () -> service.approveGroupAndNotify("g1", 9001L));
+        assertEquals("This reservation group does not belong to your pharmacy.", error.getMessage());
+    }
+
+    @Test
+    void rejectGroup_rejectsPendingOwnedRows() {
+        Pharmacy pharmacy = Pharmacy.builder().id(1L).telegramId(9001L).build();
+        MedicineReservation pending = MedicineReservation.builder()
+                .id(11L)
+                .pharmacyId(1L)
+                .reservationGroupId("g2")
+                .status(MedicineReservationStatus.PENDING)
+                .inventoryHeld(false)
+                .build();
+        when(pharmacyRepository.findByTelegramId(9001L)).thenReturn(Optional.of(pharmacy));
+        when(reservationRepository.findByReservationGroupId("g2")).thenReturn(List.of(pending));
+        when(reservationRepository.findByReservationGroupIdAndStatus("g2", MedicineReservationStatus.PENDING))
+                .thenReturn(List.of(pending));
+        when(reservationRepository.findById(11L)).thenReturn(Optional.of(pending));
+        when(reservationRepository.save(any(MedicineReservation.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        List<MedicineReservation> rejected = service.rejectGroup("g2", 9001L, "no stock");
+
+        assertEquals(1, rejected.size());
+        assertEquals(MedicineReservationStatus.REJECTED, rejected.get(0).getStatus());
+        assertEquals("no stock", rejected.get(0).getRejectionReason());
+    }
+
+    @Test
+    void cancelGroupByPharmacy_cancelsNonTerminalOwnedRows() {
+        Pharmacy pharmacy = Pharmacy.builder().id(1L).telegramId(9001L).build();
+        MedicineReservation ready = MedicineReservation.builder()
+                .id(21L)
+                .pharmacyId(1L)
+                .reservationGroupId("g3")
+                .status(MedicineReservationStatus.READY_FOR_PICKUP)
+                .inventoryHeld(false)
+                .build();
+        MedicineReservation fulfilled = MedicineReservation.builder()
+                .id(22L)
+                .pharmacyId(1L)
+                .reservationGroupId("g3")
+                .status(MedicineReservationStatus.FULFILLED)
+                .build();
+        when(pharmacyRepository.findByTelegramId(9001L)).thenReturn(Optional.of(pharmacy));
+        when(reservationRepository.findByReservationGroupId("g3")).thenReturn(List.of(ready, fulfilled));
+        when(reservationRepository.findById(21L)).thenReturn(Optional.of(ready));
+        when(reservationRepository.save(any(MedicineReservation.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        List<MedicineReservation> cancelled = service.cancelGroupByPharmacy("g3", 9001L);
+
+        assertEquals(1, cancelled.size());
+        assertEquals(MedicineReservationStatus.CANCELLED, cancelled.get(0).getStatus());
+    }
+
+    @Test
+    void fulfillReservationAndNotify_stampsPassedActorOnSaleLotsAndHistory() {
+        MedicineReservation reservation = MedicineReservation.builder()
+                .id(200L)
+                .pharmacyId(5L)
+                .userId(11L)
+                .medicineName("paracetamol")
+                .status(MedicineReservationStatus.READY_FOR_PICKUP)
+                .inventoryHeld(true)
+                .requestedQuantity(1)
+                .build();
+        Pharmacy pharmacy = Pharmacy.builder().id(5L).telegramId(777L).build();
+        when(reservationRepository.findById(200L)).thenReturn(Optional.of(reservation));
+        when(pharmacyRepository.findByTelegramId(9001L)).thenReturn(Optional.of(pharmacy));
+        when(reservationRepository.save(any(MedicineReservation.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        when(localizationService.getLanguage(11L)).thenReturn(BotLanguage.ENGLISH);
+        when(localizationService.text(eq(11L), eq("reservation_fulfilled_user"), any(), any()))
+                .thenReturn("fulfilled");
+        when(telegramClient.buildMiniAppUserReservationStatusUrl(eq("history"), eq(200L), any()))
+                .thenReturn("https://example/#/history");
+
+        MedicineReservation saved = service.fulfillReservationAndNotify(200L, 9001L);
+
+        assertEquals(MedicineReservationStatus.FULFILLED, saved.getStatus());
+        assertEquals(9001L, saved.getFulfilledByTelegramId());
+        verify(medicineLotService).fulfillReservation(saved, 9001L);
+        verify(pharmacySalesService).recordFromReservation(saved, 9001L);
+        verify(reservationStatusHistoryService).record(
+                saved,
+                MedicineReservationStatus.READY_FOR_PICKUP.name(),
+                MedicineReservationStatus.FULFILLED.name(),
+                9001L,
+                "fulfilled");
+    }
+
+    @Test
+    void approveReservation_appendsStatusHistory() {
+        MedicineReservation reservation = MedicineReservation.builder()
+                .id(201L)
+                .pharmacyId(5L)
+                .medicineName("ibuprofen")
+                .status(MedicineReservationStatus.PENDING)
+                .prescriptionRequired(false)
+                .prescriptionReviewStatus(PrescriptionReviewStatus.NOT_REQUIRED)
+                .inventoryHeld(true)
+                .requestedQuantity(1)
+                .build();
+        when(reservationRepository.findById(201L)).thenReturn(Optional.of(reservation));
+        when(reservationRepository.save(any(MedicineReservation.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        MedicineReservation saved = service.approveReservation(201L);
+
+        assertEquals(MedicineReservationStatus.READY_FOR_PICKUP, saved.getStatus());
+        verify(reservationStatusHistoryService).record(
+                saved,
+                MedicineReservationStatus.PENDING.name(),
+                MedicineReservationStatus.READY_FOR_PICKUP.name(),
+                null,
+                "approved");
+    }
+
+    @Test
+    void expireReservation_appendsStatusHistory() {
+        MedicineReservation reservation = MedicineReservation.builder()
+                .id(202L)
+                .pharmacyId(5L)
+                .status(MedicineReservationStatus.READY_FOR_PICKUP)
+                .inventoryHeld(false)
+                .build();
+        when(reservationRepository.findById(202L)).thenReturn(Optional.of(reservation));
+        when(reservationRepository.save(any(MedicineReservation.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        MedicineReservation saved = service.expireReservation(202L);
+
+        assertEquals(MedicineReservationStatus.EXPIRED, saved.getStatus());
+        verify(reservationStatusHistoryService).record(
+                saved,
+                MedicineReservationStatus.READY_FOR_PICKUP.name(),
+                MedicineReservationStatus.EXPIRED.name(),
+                null,
+                "expired");
     }
 }

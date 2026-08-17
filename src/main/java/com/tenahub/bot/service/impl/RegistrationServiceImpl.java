@@ -245,6 +245,11 @@ public Long register(String name,
                 .orElse(null);
     }
 
+    @Override
+    public PharmacyRegistration getLatest(Long telegramId) {
+        return registrationRepository.findTopByTelegramIdOrderByIdDesc(telegramId).orElse(null);
+    }
+
 @Override
 public Long restartRejectedRegistration(Long telegramId) {
     PharmacyRegistration rejected = registrationRepository

@@ -13,11 +13,14 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -81,6 +84,81 @@ class PharmacyServiceImplTest {
         assertEquals("City Rx", results.get(0).getName());
         assertEquals(5, results.get(0).getStockQuantity());
         assertEquals("paracetamol", results.get(0).getMedicineName());
+        assertFalse(results.get(0).isExpired());
+    }
+
+    @Test
+    void searchMedicine_skipsArchivedInventory() {
+        PharmacyInventory archived = PharmacyInventory.builder()
+                .id(21L)
+                .pharmacyId(2L)
+                .medicineName("paracetamol")
+                .quantity(8)
+                .archived(true)
+                .build();
+        when(inventoryRepository.findByMedicineNameIgnoreCase("paracetamol")).thenReturn(List.of(archived));
+
+        assertTrue(service.searchMedicine("paracetamol").isEmpty());
+    }
+
+    @Test
+    void searchMedicine_flagsExpiredAsUnavailable() {
+        PharmacyInventory expired = PharmacyInventory.builder()
+                .id(22L)
+                .pharmacyId(2L)
+                .medicineName("paracetamol")
+                .quantity(8)
+                .outOfStock(false)
+                .expiryDate(LocalDate.now().minusDays(1))
+                .build();
+        when(inventoryRepository.findByMedicineNameIgnoreCase("paracetamol")).thenReturn(List.of(expired));
+        when(pharmacyRepository.findById(2L)).thenReturn(Optional.of(
+                Pharmacy.builder()
+                        .id(2L)
+                        .name("City Rx")
+                        .approved(true)
+                        .licenseSuspended(false)
+                        .latitude(9.01)
+                        .longitude(38.75)
+                        .build()));
+
+        List<PharmacyResponseDTO> results = service.searchMedicine("paracetamol");
+
+        assertEquals(1, results.size());
+        assertTrue(results.get(0).isExpired());
+        assertTrue(results.get(0).isOutOfStock());
+    }
+
+    @Test
+    void searchMedicine_usesCatalogIdWhenPresent() {
+        PharmacyInventory item = PharmacyInventory.builder()
+                .id(20L)
+                .pharmacyId(2L)
+                .catalogMedicineId(5L)
+                .medicineName("insulin glargine")
+                .quantity(5)
+                .price(new BigDecimal("420.00"))
+                .requiresPrescription(true)
+                .build();
+        when(inventoryRepository.findByCatalogMedicineId(5L)).thenReturn(List.of(item));
+        when(pharmacyRepository.findById(2L)).thenReturn(Optional.of(
+                Pharmacy.builder()
+                        .id(2L)
+                        .name("City Rx")
+                        .area("Bole")
+                        .approved(true)
+                        .licenseSuspended(false)
+                        .latitude(9.01)
+                        .longitude(38.75)
+                        .build()));
+
+        List<PharmacyResponseDTO> results = service.searchMedicine("insulin", 5L);
+
+        assertEquals(1, results.size());
+        assertEquals(20L, results.get(0).getMedicineId());
+        assertEquals(5L, results.get(0).getCatalogMedicineId());
+        assertEquals(new BigDecimal("420.00"), results.get(0).getPrice());
+        assertTrue(results.get(0).isRequiresPrescription());
     }
 
     @Test
@@ -104,5 +182,27 @@ class PharmacyServiceImplTest {
 
         assertEquals(1, service.searchMedicineWithArea("paracetamol", "bole").size());
         assertTrue(service.searchMedicineWithArea("paracetamol", "piassa").isEmpty());
+    }
+
+    @Test
+    void updateLocation_savesCoordinatesAndArea() {
+        Pharmacy pharmacy = Pharmacy.builder()
+                .id(2L)
+                .telegramId(9001L)
+                .city("Old City")
+                .area("Old Area")
+                .build();
+        when(pharmacyRepository.findByTelegramId(9001L)).thenReturn(Optional.of(pharmacy));
+        when(pharmacyRepository.save(pharmacy)).thenReturn(pharmacy);
+
+        service.updateLocation(9001L, 11.793, 41.005, "Semera", "Semera Center", "Near bus station", "Clock tower");
+
+        assertEquals(11.793, pharmacy.getLatitude());
+        assertEquals(41.005, pharmacy.getLongitude());
+        assertEquals("Semera", pharmacy.getCity());
+        assertEquals("Semera Center", pharmacy.getArea());
+        assertEquals("Near bus station", pharmacy.getFormattedAddress());
+        assertEquals("Clock tower", pharmacy.getLandmark());
+        verify(pharmacyRepository).save(pharmacy);
     }
 }

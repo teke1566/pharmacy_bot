@@ -12,4 +12,5 @@ import lombok.NoArgsConstructor;
 public class PrescriptionReviewRequestDTO {
     private String decision;
     private String rejectionReason;
+    private String clarificationMessage;
 }

@@ -14,6 +14,7 @@ import com.tenahub.bot.repository.MedicineReservationRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
 import com.tenahub.bot.service.MiniAppActorResolver;
 import com.tenahub.bot.service.MiniAppAuthException;
+import com.tenahub.bot.service.PharmacyService;
 import com.tenahub.bot.service.PrescriptionReviewService;
 import com.tenahub.bot.service.ReservationService;
 import org.springframework.http.MediaType;
@@ -32,7 +33,9 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDateTime;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping({"/api/pharmacy", "/proxyapi/api/pharmacy"})
@@ -43,17 +46,32 @@ public class PharmacyReservationController {
     private final MedicineReservationRepository medicineReservationRepository;
     private final PrescriptionReviewService prescriptionReviewService;
     private final MiniAppActorResolver miniAppActorResolver;
+    private final PharmacyService pharmacyService;
 
     public PharmacyReservationController(ReservationService reservationService,
                                          PharmacyRepository pharmacyRepository,
                                          MedicineReservationRepository medicineReservationRepository,
                                          PrescriptionReviewService prescriptionReviewService,
-                                         MiniAppActorResolver miniAppActorResolver) {
+                                         MiniAppActorResolver miniAppActorResolver,
+                                         PharmacyService pharmacyService) {
         this.reservationService = reservationService;
         this.pharmacyRepository = pharmacyRepository;
         this.medicineReservationRepository = medicineReservationRepository;
         this.prescriptionReviewService = prescriptionReviewService;
         this.miniAppActorResolver = miniAppActorResolver;
+        this.pharmacyService = pharmacyService;
+    }
+
+    @GetMapping("/check-access")
+    public ResponseEntity<?> checkAccess(
+            @RequestHeader(value = "X-Pharmacy-Telegram-Id", required = false) Long headerPharmacyId,
+            @RequestParam(value = "pharmacyTelegramId", required = false) Long paramPharmacyId) {
+        Long resolved = miniAppActorResolver.requirePharmacyTelegramId(headerPharmacyId, paramPharmacyId);
+        boolean isPharmacy = pharmacyService.isRegisteredPharmacy(resolved);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("isPharmacy", isPharmacy);
+        body.put("telegramId", resolved != null ? resolved : 0L);
+        return ResponseEntity.ok(body);
     }
 
     @PostMapping("/reservations/scan")
@@ -88,6 +106,8 @@ public class PharmacyReservationController {
                     .pharmacyName(pharmacy == null ? null : pharmacy.getName())
                     .phone(reservation.getCustomerPhone())
                     .qrToken(reservation.getQrToken())
+                    .scannedByTelegramId(resolvedPharmacyTelegramId)
+                    .fulfilledByTelegramId(reservation.getFulfilledByTelegramId())
                     .expiresAt(resolveGroupedExpiresAt(groupedReservations))
                     .items(groupedReservations.stream().map(this::toScanItem).toList())
                     .build());
@@ -109,6 +129,8 @@ public class PharmacyReservationController {
                     .quantity(reservation.getRequestedQuantity())
                     .phone(reservation.getCustomerPhone())
                     .qrToken(reservation.getQrToken())
+                    .scannedByTelegramId(resolvedPharmacyTelegramId)
+                    .fulfilledByTelegramId(reservation.getFulfilledByTelegramId())
                     .expiresAt(resolveExpiresAt(reservation))
                     .items(List.of(toScanItem(reservation)))
                     .build());
@@ -191,7 +213,7 @@ public class PharmacyReservationController {
             return ResponseEntity.ok()
                     .contentType(mediaType)
                     .header(HttpHeaders.CONTENT_DISPOSITION,
-                            ContentDisposition.attachment().filename(file.originalFilename()).build().toString())
+                            ContentDisposition.inline().filename(file.originalFilename()).build().toString())
                     .body(file.fileData());
         } catch (MiniAppAuthException e) {
             throw e;
@@ -272,6 +294,18 @@ public class PharmacyReservationController {
                 .allMatch(reservation -> reservation.getPrescriptionReviewStatus()
                         == com.tenahub.bot.entity.PrescriptionReviewStatus.APPROVED)) {
             return com.tenahub.bot.entity.PrescriptionReviewStatus.APPROVED.name();
+        }
+        if (reservations.stream()
+                .filter(MedicineReservation::isPrescriptionRequired)
+                .anyMatch(reservation -> reservation.getPrescriptionReviewStatus()
+                        == com.tenahub.bot.entity.PrescriptionReviewStatus.NEEDS_CLARIFICATION)) {
+            return com.tenahub.bot.entity.PrescriptionReviewStatus.NEEDS_CLARIFICATION.name();
+        }
+        if (reservations.stream()
+                .filter(MedicineReservation::isPrescriptionRequired)
+                .anyMatch(reservation -> reservation.getPrescriptionReviewStatus()
+                        == com.tenahub.bot.entity.PrescriptionReviewStatus.PENDING_REVIEW)) {
+            return com.tenahub.bot.entity.PrescriptionReviewStatus.PENDING_REVIEW.name();
         }
         if (reservations.stream()
             .filter(MedicineReservation::isPrescriptionRequired)

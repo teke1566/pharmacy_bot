@@ -10,6 +10,8 @@ public interface PharmacyService {
 
     List<PharmacyResponseDTO> searchMedicine(String medicine);
 
+    List<PharmacyResponseDTO> searchMedicine(String medicine, Long catalogMedicineId);
+
     List<PharmacyResponseDTO> searchMedicineWithArea(String medicine, String area);
 
     List<PharmacyResponseDTO> searchMedicineWithCity(String medicine, String city);
@@ -25,6 +27,16 @@ public interface PharmacyService {
             Long userId
     );
 
+    List<PharmacyResponseDTO> searchMedicineNearby(
+            String medicine,
+            Long catalogMedicineId,
+            double userLat,
+            double userLon,
+            Long userId
+    );
+
+    List<PharmacyResponseDTO> listNearbyApproved(Double userLat, Double userLon);
+
     boolean isRegisteredPharmacy(Long telegramId);
 
     void updatePhone(Long telegramId, String phone);
@@ -32,6 +44,9 @@ public interface PharmacyService {
     void updateMedicines(Long telegramId, String medicines);
 
     void updateHours(Long telegramId, String openTime, String closeTime);
+
+    void updateLocation(Long telegramId, Double latitude, Double longitude, String city, String area,
+                        String formattedAddress, String landmark);
 
     void updateLicense(Long telegramId, String fileId);
 

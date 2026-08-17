@@ -31,6 +31,8 @@ public class PharmacyReservationScanResponseDTO {
     private Integer quantity;
     private String phone;
     private String qrToken;
+    private Long scannedByTelegramId;
+    private Long fulfilledByTelegramId;
     private LocalDateTime expiresAt;
     private List<MiniAppReservationConfirmItemResponseDTO> items;
 }

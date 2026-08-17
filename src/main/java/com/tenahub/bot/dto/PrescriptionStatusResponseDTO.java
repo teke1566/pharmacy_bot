@@ -18,12 +18,14 @@ public class PrescriptionStatusResponseDTO {
     private Long userId;
     private Long pharmacyId;
     private String customerPhone;
+    private String customerName;
     private String note;
     private boolean prescriptionRequired;
     private String reviewStatus;
     private LocalDateTime reviewedAt;
     private Long reviewedBy;
     private String rejectionReason;
+    private String clarificationMessage;
     private List<PrescriptionStatusItemDTO> items;
     private List<PrescriptionFileMetadataDTO> files;
 
