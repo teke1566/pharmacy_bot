@@ -62,9 +62,17 @@ public interface MedicineReservationRepository extends JpaRepository<MedicineRes
             LocalDateTime end
     );
 
+    List<MedicineReservation> findByStatusInAndExpiresAtBetweenAndReminderSentFalse(
+            List<MedicineReservationStatus> statuses,
+            LocalDateTime start,
+            LocalDateTime end
+    );
+
     long countByUserIdAndStatusIn(Long userId, List<MedicineReservationStatus> statuses);
 
     long countByStatus(MedicineReservationStatus status);
+
+    long countByStatusIn(List<MedicineReservationStatus> statuses);
 
     long countByCreatedAtAfter(LocalDateTime time);
 
@@ -87,5 +95,19 @@ public interface MedicineReservationRepository extends JpaRepository<MedicineRes
         Optional<MedicineReservation> findByQrToken(String qrToken);
 
         List<MedicineReservation> findAllByQrToken(String qrToken);
-    
+
+    @Query("""
+           select r from MedicineReservation r
+           where r.status in :statuses
+             and (
+                  (r.fulfilledAt is not null and r.fulfilledAt < :cutoff)
+               or (r.fulfilledAt is null and r.approvedAt is not null and r.approvedAt < :cutoff)
+               or (r.fulfilledAt is null and r.approvedAt is null and r.createdAt < :cutoff)
+             )
+             and (r.hiddenFromUserAt is null or r.hiddenFromPharmacyAt is null)
+           """)
+    List<MedicineReservation> findTerminalNeedingArchive(
+            @org.springframework.data.repository.query.Param("statuses") List<MedicineReservationStatus> statuses,
+            @org.springframework.data.repository.query.Param("cutoff") LocalDateTime cutoff
+    );
 }

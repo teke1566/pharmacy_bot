@@ -8,6 +8,7 @@ import com.tenahub.bot.repository.PharmacyRepository;
 import com.tenahub.bot.service.ReservationService;
 import com.tenahub.bot.util.TelegramClient;
 import lombok.RequiredArgsConstructor;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -15,8 +16,15 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 
+/**
+ * Legacy APPROVED-only expiry scheduler. Disabled by default because
+ * {@link com.tenahub.bot.scheduler.ReservationScheduler} already expires
+ * APPROVED + READY_FOR_PICKUP. Enable only with
+ * tenahub.reservation.legacy-expiry-scheduler-enabled=true.
+ */
 @Service
 @RequiredArgsConstructor
+@ConditionalOnProperty(name = "tenahub.reservation.legacy-expiry-scheduler-enabled", havingValue = "true")
 public class ReservationExpiryScheduler {
 
     private final MedicineReservationRepository reservationRepository;
@@ -80,7 +88,7 @@ public class ReservationExpiryScheduler {
                     "⏰ Reminder: your reservation expires soon.\n\n" +
                     "💊 Medicine: " + reservation.getMedicineName() + "\n" +
                     "🔢 Quantity: " + reservation.getRequestedQuantity() + "\n" +
-                    "⏳ Hold until: " + reservation.getExpiresAt().format(formatter)
+                    "⏳ Expires around: " + reservation.getExpiresAt().format(formatter)
             );
         }
     }

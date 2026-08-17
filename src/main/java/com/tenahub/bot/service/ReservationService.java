@@ -30,6 +30,8 @@ public interface ReservationService {
 
     MedicineReservation rejectReservation(Long reservationId, String reason);
 
+    MedicineReservation rejectReservationAndNotify(Long reservationId, String reason);
+
     MedicineReservation fulfillReservation(Long reservationId);
 
     MedicineReservation fulfillReservationAndNotify(Long reservationId);
@@ -45,6 +47,14 @@ public interface ReservationService {
     MedicineReservation cancelReservationByUser(Long userId, Long reservationId);
 
     MedicineReservation cancelReservationByPharmacy(Long reservationId, Long pharmacyTelegramId);
+
+    List<MedicineReservation> approveGroupAndNotify(String reservationGroupId, Long pharmacyTelegramId);
+
+    List<MedicineReservation> rejectGroup(String reservationGroupId, Long pharmacyTelegramId, String reason);
+
+    List<MedicineReservation> fulfillGroupAndNotify(String reservationGroupId, Long pharmacyTelegramId);
+
+    List<MedicineReservation> cancelGroupByPharmacy(String reservationGroupId, Long pharmacyTelegramId);
 
     MedicineReservation autoCancelPendingReservation(Long reservationId, String reason);
 
@@ -69,5 +79,9 @@ public interface ReservationService {
     List<MedicineReservation> getPrescriptionReservations(Long pharmacyTelegramId);
     List<MedicineReservation> getApprovedReservations(Long pharmacyTelegramId);
     List<MedicineReservation> getFulfillableReservations(Long pharmacyTelegramId);
+    List<MedicineReservation> getTerminalReservations(Long pharmacyTelegramId);
+    MedicineReservation hideReservationFromPharmacy(Long reservationId, Long pharmacyTelegramId);
+    int hideReservationsFromPharmacy(List<Long> reservationIds, Long pharmacyTelegramId);
+    int hideTerminalReservationsFromPharmacy(Long pharmacyTelegramId);
     void holdInventoryForApprovedPrescription(MedicineReservation reservation);
 }

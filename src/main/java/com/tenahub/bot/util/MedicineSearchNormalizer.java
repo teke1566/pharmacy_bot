@@ -8,6 +8,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 public final class MedicineSearchNormalizer {
@@ -268,5 +270,99 @@ public final class MedicineSearchNormalizer {
         }
 
         return CANONICAL_TO_SEARCH_FORMS.getOrDefault(normalizeToEnglishCanonical(canonical), List.of());
+    }
+
+    /**
+     * First significant token of the canonical name so related products share a stem
+     * (e.g. "insulin" and "insulin glargine").
+     */
+    public static String analogueSearchStem(String input) {
+        String canonical = normalizeToEnglishCanonical(input);
+        if (canonical.isBlank()) {
+            return "";
+        }
+
+        String spaced = canonical.replace('-', ' ').replace('/', ' ').replaceAll("\\s+", " ").trim();
+        int space = spaced.indexOf(' ');
+        return space < 0 ? spaced : spaced.substring(0, space);
+    }
+
+    public static boolean sharesAnalogueStem(String left, String right) {
+        String leftStem = analogueSearchStem(left);
+        String rightStem = analogueSearchStem(right);
+        return !leftStem.isBlank() && leftStem.equals(rightStem);
+    }
+
+    /**
+     * Structured analogue key from a stored catalog name. Uses the name stem, except
+     * when the name already contains the token "insulin" (regular insulin, nph insulin).
+     */
+    public static String catalogActiveIngredient(String input) {
+        String canonical = normalizeToEnglishCanonical(input);
+        if (canonical.isBlank()) {
+            return "";
+        }
+
+        String spaced = canonical.replace('-', ' ').replace('/', ' ').replaceAll("\\s+", " ").trim();
+        for (String token : spaced.split(" ")) {
+            if ("insulin".equals(token)) {
+                return "insulin";
+            }
+        }
+        return analogueSearchStem(canonical);
+    }
+
+    public static String catalogStrength(String input) {
+        String canonical = normalizeToEnglishCanonical(input);
+        if (canonical.isBlank()) {
+            return "";
+        }
+
+        Matcher matcher = STRENGTH_PATTERN.matcher(canonical);
+        if (!matcher.find()) {
+            return "";
+        }
+        String amount = matcher.group(1).replace(',', '.');
+        String unit = matcher.group(2).replaceAll("\\s+", "").toLowerCase(Locale.ROOT);
+        return amount + unit;
+    }
+
+    public static String catalogDosageForm(String input) {
+        String canonical = normalizeToEnglishCanonical(input);
+        if (canonical.isBlank()) {
+            return "";
+        }
+
+        String spaced = " " + canonical.replace('-', ' ').replace('/', ' ').replaceAll("\\s+", " ") + " ";
+        for (Map.Entry<String, String> form : DOSAGE_FORM_ALIASES.entrySet()) {
+            if (spaced.contains(" " + form.getKey() + " ") || spaced.contains(" " + form.getKey() + "s ")) {
+                return form.getValue();
+            }
+        }
+        return "";
+    }
+
+    private static final Pattern STRENGTH_PATTERN = Pattern.compile(
+            "(?i)(\\d+(?:[.,]\\d+)?)\\s*(iu\\s*/\\s*ml|mcg|mg|µg|iu|ml|g|%)"
+    );
+
+    private static final LinkedHashMap<String, String> DOSAGE_FORM_ALIASES = buildDosageFormAliases();
+
+    private static LinkedHashMap<String, String> buildDosageFormAliases() {
+        LinkedHashMap<String, String> forms = new LinkedHashMap<>();
+        forms.put("injection", "injection");
+        forms.put("injectable", "injection");
+        forms.put("infusion", "infusion");
+        forms.put("suspension", "suspension");
+        forms.put("ointment", "ointment");
+        forms.put("capsule", "capsule");
+        forms.put("cap", "capsule");
+        forms.put("tablet", "tablet");
+        forms.put("tab", "tablet");
+        forms.put("syrup", "syrup");
+        forms.put("cream", "cream");
+        forms.put("drops", "drops");
+        forms.put("solution", "solution");
+        return forms;
     }
 }

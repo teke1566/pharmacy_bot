@@ -22,8 +22,11 @@ public class PharmacyMiniAppReservationDTO {
     private boolean prescriptionRequired;
     private String prescriptionReviewStatus;
     private String prescriptionRejectionReason;
+    private String prescriptionClarificationMessage;
     private String rejectionReason;
+    private java.util.List<String> prescriptionImages;
     private String qrToken;
+    private Long fulfilledByTelegramId;
     private LocalDateTime createdAt;
     private LocalDateTime approvedAt;
     private LocalDateTime expiresAt;

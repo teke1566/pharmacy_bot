@@ -55,6 +55,8 @@ public interface RegistrationService {
 
     PharmacyRegistration getLatestRejected(Long telegramId);
 
+    PharmacyRegistration getLatest(Long telegramId);
+
     Long restartRejectedRegistration(Long telegramId);
 
 }

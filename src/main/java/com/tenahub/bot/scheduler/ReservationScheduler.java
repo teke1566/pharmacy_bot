@@ -46,6 +46,9 @@ public class ReservationScheduler {
     @Value("${tenahub.admin.chat-id:0}")
     private long adminChatId;
 
+    @Value("${tenahub.reservation.archive-idle-after-minutes:60}")
+    private long archiveIdleAfterMinutes;
+
     @Scheduled(cron = "0 */5 * * * *")
     public void expireReservations() {
 
@@ -62,15 +65,99 @@ public class ReservationScheduler {
             try {
                 reservationService.expireReservation(reservation.getId());
 
-                telegramClient.sendMessage(
+                String statusUrl = telegramClient.buildMiniAppUserReservationStatusUrl(
+                        "history",
+                        reservation.getId(),
+                        reservation.getReservationGroupId());
+                telegramClient.sendMessageWithMiniAppButton(
                         reservation.getUserId(),
                         "⏳ Your reservation expired.\n\n"
                                 + "💊 Medicine: " + reservation.getMedicineName() + "\n"
-                                + "🔢 Quantity: " + reservation.getRequestedQuantity()
+                                + "🔢 Quantity: " + reservation.getRequestedQuantity(),
+                        statusUrl,
+                        "📄 View reservation"
                 );
 
             } catch (Exception ignored) {
             }
+        }
+    }
+
+    @Scheduled(cron = "0 */5 * * * *")
+    public void sendHoldExpiryReminders() {
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime upcoming = now.plusMinutes(15);
+
+        List<MedicineReservation> reservations =
+                reservationRepository.findByStatusInAndExpiresAtBetweenAndReminderSentFalse(
+                        List.of(
+                                MedicineReservationStatus.APPROVED,
+                                MedicineReservationStatus.READY_FOR_PICKUP
+                        ),
+                        now,
+                        upcoming
+                );
+
+        java.time.format.DateTimeFormatter formatter = java.time.format.DateTimeFormatter.ofPattern("h:mm a");
+        for (MedicineReservation reservation : reservations) {
+            try {
+                reservation.setReminderSent(true);
+                reservationRepository.save(reservation);
+                if (reservation.getUserId() == null || reservation.getExpiresAt() == null) {
+                    continue;
+                }
+                telegramClient.sendMessage(
+                        reservation.getUserId(),
+                        "⏰ Reminder: your reservation expires soon.\n\n"
+                                + "💊 Medicine: " + reservation.getMedicineName() + "\n"
+                                + "🔢 Quantity: " + reservation.getRequestedQuantity() + "\n"
+                                + "⏳ Expires around: " + reservation.getExpiresAt().format(formatter)
+                );
+            } catch (Exception e) {
+                log.warn("Failed to send hold expiry reminder for reservation {}: {}",
+                        reservation.getId(), e.getMessage());
+            }
+        }
+    }
+
+    @Scheduled(cron = "0 */5 * * * *")
+    public void archiveIdleTerminalReservations() {
+        if (archiveIdleAfterMinutes <= 0) {
+            return;
+        }
+        LocalDateTime cutoff = LocalDateTime.now().minusMinutes(archiveIdleAfterMinutes);
+        List<MedicineReservation> candidates = reservationRepository.findTerminalNeedingArchive(
+                List.of(
+                        MedicineReservationStatus.FULFILLED,
+                        MedicineReservationStatus.EXPIRED,
+                        MedicineReservationStatus.REJECTED,
+                        MedicineReservationStatus.CANCELLED
+                ),
+                cutoff
+        );
+        if (candidates.isEmpty()) {
+            return;
+        }
+        LocalDateTime hiddenAt = LocalDateTime.now();
+        int updated = 0;
+        for (MedicineReservation reservation : candidates) {
+            boolean changed = false;
+            if (reservation.getHiddenFromUserAt() == null) {
+                reservation.setHiddenFromUserAt(hiddenAt);
+                changed = true;
+            }
+            if (reservation.getHiddenFromPharmacyAt() == null) {
+                reservation.setHiddenFromPharmacyAt(hiddenAt);
+                changed = true;
+            }
+            if (changed) {
+                updated++;
+            }
+        }
+        if (updated > 0) {
+            reservationRepository.saveAll(candidates);
+            log.info("Auto soft-archived {} idle terminal reservation(s) older than {} minutes",
+                    updated, archiveIdleAfterMinutes);
         }
     }
 
@@ -124,10 +211,15 @@ public class ReservationScheduler {
                     continue;
                 }
 
-                telegramClient.sendMessage(
+                telegramClient.sendMessageWithMiniAppButton(
                         cancelled.getUserId(),
                         "⌛ Your reservation request expired because the pharmacy did not respond in time.\n\n"
-                                + "Please try another pharmacy or submit again."
+                                + "Please try another pharmacy or submit again.",
+                        telegramClient.buildMiniAppUserReservationStatusUrl(
+                                "history",
+                                cancelled.getId(),
+                                cancelled.getReservationGroupId()),
+                        "📄 View reservation"
                 );
 
                 if (pharmacy != null && pharmacy.getTelegramId() != null && pharmacy.getTelegramId() > 0) {

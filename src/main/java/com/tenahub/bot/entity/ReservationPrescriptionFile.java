@@ -1,5 +1,6 @@
 package com.tenahub.bot.entity;
 
+import jakarta.persistence.Basic;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -55,6 +56,7 @@ public class ReservationPrescriptionFile {
     @Column(name = "file_size")
     private Long fileSize;
 
+    @Basic(fetch = FetchType.LAZY)
     @Lob
     @Column(name = "file_data", nullable = false)
     private byte[] fileData;

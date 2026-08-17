@@ -7,7 +7,10 @@ import com.tenahub.bot.entity.PrescriptionReviewStatus;
 import com.tenahub.bot.repository.MedicineReservationRepository;
 import com.tenahub.bot.repository.PharmacyInventoryRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
+import com.tenahub.bot.service.MedicineLotService;
+import com.tenahub.bot.service.PharmacySalesService;
 import com.tenahub.bot.service.ReservationService;
+import com.tenahub.bot.service.ReservationStatusHistoryService;
 import com.tenahub.bot.service.ReservationWorkflowService;
 import com.tenahub.bot.util.LocalizationService;
 import com.tenahub.bot.util.MedicineSearchNormalizer;
@@ -31,62 +34,29 @@ public class ReservationServiceImpl implements ReservationService {
     private final LocalizationService localizationService;
     private final TelegramClient telegramClient;
     private final ReservationWorkflowService reservationWorkflowService;
+    private final MedicineLotService medicineLotService;
+    private final PharmacySalesService pharmacySalesService;
+    private final ReservationStatusHistoryService reservationStatusHistoryService;
 
     @Value("${tenahub.reservation.pending-timeout-minutes:20}")
     private long pendingTimeoutMinutes;
 
-    private static final int APPROVED_HOLD_MINUTES = 60;
+    @Value("${tenahub.reservation.approved-hold-minutes:60}")
+    private long approvedHoldMinutes;
+
+    private static final List<MedicineReservationStatus> TERMINAL_STATUSES = List.of(
+            MedicineReservationStatus.FULFILLED,
+            MedicineReservationStatus.EXPIRED,
+            MedicineReservationStatus.REJECTED,
+            MedicineReservationStatus.CANCELLED
+    );
 
     private void releaseHeldInventory(MedicineReservation reservation) {
-        if (reservation == null || !reservation.isInventoryHeld()) {
-            return;
-        }
-
-        var inventory = inventoryRepository
-                .findByPharmacyIdAndMedicineNameIgnoreCase(
-                        reservation.getPharmacyId(),
-                        reservation.getMedicineName()
-                )
-                .orElse(null);
-
-        if (inventory != null) {
-            int currentQty = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
-            int releaseQty = reservation.getRequestedQuantity() == null ? 0 : reservation.getRequestedQuantity();
-            int newQty = currentQty + Math.max(releaseQty, 0);
-
-            inventory.setQuantity(newQty);
-            inventory.setOutOfStock(newQty <= 0);
-            inventoryRepository.save(inventory);
-        }
-
-        reservation.setInventoryHeld(false);
+        medicineLotService.releaseHeldForReservation(reservation);
     }
 
     private void holdInventoryOrThrow(MedicineReservation reservation) {
-        var inventory = inventoryRepository
-                .findByPharmacyIdAndMedicineNameIgnoreCase(
-                        reservation.getPharmacyId(),
-                        reservation.getMedicineName()
-                )
-                .orElseThrow(() -> new RuntimeException("Medicine inventory not found"));
-
-        int availableQty = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
-        int requiredQty = reservation.getRequestedQuantity() == null ? 0 : reservation.getRequestedQuantity();
-
-        if (inventory.isOutOfStock() || availableQty <= 0) {
-            throw new RuntimeException("Medicine is currently out of stock.");
-        }
-
-        if (requiredQty > availableQty) {
-            throw new RuntimeException("Requested quantity exceeds available stock.");
-        }
-
-        int newQty = availableQty - requiredQty;
-        inventory.setQuantity(Math.max(newQty, 0));
-        inventory.setOutOfStock(newQty <= 0);
-        inventoryRepository.save(inventory);
-
-        reservation.setInventoryHeld(true);
+        medicineLotService.holdForReservation(reservation);
     }
 
    @Override
@@ -109,16 +79,22 @@ public MedicineReservation createReservation(Long userId,
     var inventory = inventoryRepository
             .findByPharmacyIdAndMedicineNameIgnoreCase(pharmacyId, normalizedMedicine)
             .orElseThrow(() -> new RuntimeException("Medicine not found in pharmacy inventory"));
+    medicineLotService.ensureBackfillAndSync(inventory);
 
     Integer availableQty = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
 
     if (inventory.isOutOfStock() || availableQty <= 0) {
+        if (medicineLotService.hasExpiredStock(inventory)) {
+            throw new RuntimeException("Cannot dispense expired medicine.");
+        }
         throw new RuntimeException("Medicine is currently out of stock.");
     }
 
     if (requestedQuantity > availableQty) {
         throw new RuntimeException("Requested quantity exceeds available stock.");
     }
+
+    assertNoActiveDuplicateForPharmacyMedicine(userId, pharmacyId, normalizedMedicine);
 
     MedicineReservation reservation = MedicineReservation.builder()
             .userId(userId)
@@ -134,6 +110,12 @@ public MedicineReservation createReservation(Long userId,
             .customerPhone(customerPhone)
             .customerName(customerName)
                 .inventoryHeld(false)
+            .unitPrice(inventory.getPrice())
+            .totalPrice(inventory.getPrice() == null ? null
+                    : inventory.getPrice().multiply(java.math.BigDecimal.valueOf(requestedQuantity))
+                    .setScale(2, java.math.RoundingMode.HALF_UP))
+            .currency(inventory.getCurrency() == null || inventory.getCurrency().isBlank() ? "ETB" : inventory.getCurrency())
+            .priceLockedAt(LocalDateTime.now())
             .build();
 
         if (!reservation.isPrescriptionRequired()) {
@@ -180,16 +162,22 @@ public MedicineReservation createReservation(Long userId,
             var inventory = inventoryRepository
                     .findByPharmacyIdAndMedicineNameIgnoreCase(pharmacyId, normalizedMedicine)
                     .orElseThrow(() -> new RuntimeException("Medicine not found in pharmacy inventory: " + medicineName));
+            medicineLotService.ensureBackfillAndSync(inventory);
 
             Integer availableQty = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
 
             if (inventory.isOutOfStock() || availableQty <= 0) {
+                if (medicineLotService.hasExpiredStock(inventory)) {
+                    throw new RuntimeException("Cannot dispense expired medicine: " + medicineName);
+                }
                 throw new RuntimeException("Medicine is currently out of stock: " + medicineName);
             }
 
             if (requestedQuantity > availableQty) {
                 throw new RuntimeException("Requested quantity exceeds available stock for: " + medicineName);
             }
+
+            assertNoActiveDuplicateForPharmacyMedicine(userId, pharmacyId, normalizedMedicine);
 
             MedicineReservation reservation = MedicineReservation.builder()
                     .userId(userId)
@@ -206,6 +194,12 @@ public MedicineReservation createReservation(Long userId,
                     .customerName(customerName)
                     .inventoryHeld(false)
                     .reservationGroupId(groupId)
+                    .unitPrice(inventory.getPrice())
+                    .totalPrice(inventory.getPrice() == null ? null
+                            : inventory.getPrice().multiply(java.math.BigDecimal.valueOf(requestedQuantity))
+                            .setScale(2, java.math.RoundingMode.HALF_UP))
+                    .currency(inventory.getCurrency() == null || inventory.getCurrency().isBlank() ? "ETB" : inventory.getCurrency())
+                    .priceLockedAt(java.time.LocalDateTime.now())
                     .build();
 
             if (!reservation.isPrescriptionRequired()) {
@@ -237,6 +231,9 @@ public MedicineReservation createReservation(Long userId,
             if (reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.UPLOAD_REQUIRED) {
                 throw new RuntimeException("Prescription upload is required before pharmacy review can begin.");
             }
+            if (reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.NEEDS_CLARIFICATION) {
+                throw new RuntimeException("Prescription clarification is still pending for this reservation.");
+            }
             if (reservation.getPrescriptionReviewStatus() == PrescriptionReviewStatus.REJECTED) {
                 throw new RuntimeException("Prescription was rejected for this reservation.");
             }
@@ -257,9 +254,16 @@ public MedicineReservation createReservation(Long userId,
         reservation.setFirstReminderSentAt(null);
         reservation.setSecondReminderSentAt(null);
         reservation.setSlaEscalatedAt(null);
-        reservation.setExpiresAt(LocalDateTime.now().plusMinutes(APPROVED_HOLD_MINUTES));
+        reservation.setExpiresAt(LocalDateTime.now().plusMinutes(approvedHoldMinutes));
 
-        return reservationRepository.save(reservation);
+        MedicineReservation saved = reservationRepository.save(reservation);
+        reservationStatusHistoryService.record(
+                saved,
+                MedicineReservationStatus.PENDING.name(),
+                MedicineReservationStatus.READY_FOR_PICKUP.name(),
+                null,
+                "approved");
+        return saved;
     }
 
     @Override
@@ -267,6 +271,45 @@ public MedicineReservation createReservation(Long userId,
         MedicineReservation approved = approveReservation(reservationId);
         notifyCustomerReservationApproved(approved);
         return approved;
+    }
+
+    private void assertNoActiveDuplicateForPharmacyMedicine(Long userId, Long pharmacyId, String normalizedMedicine) {
+        if (userId == null || pharmacyId == null || normalizedMedicine == null || normalizedMedicine.isBlank()) {
+            return;
+        }
+        List<MedicineReservation> active = reservationRepository.findByUserIdAndStatusIn(
+                userId,
+                List.of(
+                        MedicineReservationStatus.PENDING,
+                        MedicineReservationStatus.APPROVED,
+                        MedicineReservationStatus.READY_FOR_PICKUP
+                )
+        );
+        boolean duplicate = active.stream().anyMatch(existing ->
+                pharmacyId.equals(existing.getPharmacyId())
+                        && normalizedMedicine.equalsIgnoreCase(existing.getMedicineName()));
+        if (duplicate) {
+            throw new RuntimeException(
+                    "You already have an active reservation for this medicine at this pharmacy.");
+        }
+    }
+
+    private void notifyCustomerWithReservationMiniApp(MedicineReservation reservation, String section, String text) {
+        if (reservation == null || reservation.getUserId() == null || reservation.getUserId() <= 0) {
+            return;
+        }
+        if (text == null || text.isBlank()) {
+            return;
+        }
+        String statusUrl = telegramClient.buildMiniAppUserReservationStatusUrl(
+                section,
+                reservation.getId(),
+                reservation.getReservationGroupId());
+        telegramClient.sendMessageWithMiniAppButton(
+                reservation.getUserId(),
+                text,
+                statusUrl,
+                "📄 View reservation");
     }
 
     private void notifyCustomerReservationApproved(MedicineReservation reservation) {
@@ -284,8 +327,9 @@ public MedicineReservation createReservation(Long userId,
                 localizationService.getLanguage(reservation.getUserId())
         );
 
-        telegramClient.sendMessage(
-                reservation.getUserId(),
+        notifyCustomerWithReservationMiniApp(
+                reservation,
+                "active",
                 localizationService.text(
                         reservation.getUserId(),
                         "reservation_approved_user",
@@ -306,9 +350,45 @@ public MedicineReservation createReservation(Long userId,
         }
 
         releaseHeldInventory(reservation);
+        String from = reservation.getStatus() == null ? null : reservation.getStatus().name();
         reservation.setStatus(MedicineReservationStatus.REJECTED);
         reservation.setRejectionReason(reason);
-        return reservationRepository.save(reservation);
+        MedicineReservation saved = reservationRepository.save(reservation);
+        reservationStatusHistoryService.record(
+                saved, from, MedicineReservationStatus.REJECTED.name(), null, reason);
+        return saved;
+    }
+
+    @Override
+    public MedicineReservation rejectReservationAndNotify(Long reservationId, String reason) {
+        String resolvedReason = (reason == null || reason.isBlank()) ? "Rejected by pharmacy" : reason.trim();
+        MedicineReservation rejected = rejectReservation(reservationId, resolvedReason);
+        notifyCustomerReservationRejected(rejected);
+        return rejected;
+    }
+
+    private void notifyCustomerReservationRejected(MedicineReservation reservation) {
+        if (reservation == null || reservation.getUserId() == null || reservation.getUserId() <= 0) {
+            return;
+        }
+        String medicineName = MedicineSearchNormalizer.toDisplayName(
+                reservation.getMedicineName(),
+                localizationService.getLanguage(reservation.getUserId())
+        );
+        String reason = reservation.getRejectionReason() == null || reservation.getRejectionReason().isBlank()
+                ? "Rejected by pharmacy"
+                : reservation.getRejectionReason();
+        notifyCustomerWithReservationMiniApp(
+                reservation,
+                "history",
+                localizationService.text(
+                        reservation.getUserId(),
+                        "reservation_rejected_user",
+                        medicineName,
+                        reservation.getRequestedQuantity(),
+                        reason
+                )
+        );
     }
 
     @Override
@@ -316,7 +396,7 @@ public MedicineReservation createReservation(Long userId,
         MedicineReservation reservation = reservationRepository.findById(reservationId)
                 .orElseThrow(() -> new RuntimeException("Reservation not found"));
 
-        return fulfillReservationInternal(reservation);
+        return fulfillReservationInternal(reservation, null);
     }
 
     @Override
@@ -324,7 +404,7 @@ public MedicineReservation createReservation(Long userId,
         MedicineReservation reservation = reservationRepository.findById(reservationId)
                 .orElseThrow(() -> new RuntimeException("Reservation not found"));
 
-        MedicineReservation fulfilledReservation = fulfillReservationInternal(reservation);
+        MedicineReservation fulfilledReservation = fulfillReservationInternal(reservation, null);
         notifyCustomerReservationFulfilled(fulfilledReservation);
         return fulfilledReservation;
     }
@@ -336,12 +416,12 @@ public MedicineReservation createReservation(Long userId,
 
         validateReservationForPharmacyFulfillment(reservation, pharmacyTelegramId);
 
-        MedicineReservation fulfilledReservation = fulfillReservationInternal(reservation);
+        MedicineReservation fulfilledReservation = fulfillReservationInternal(reservation, pharmacyTelegramId);
         notifyCustomerReservationFulfilled(fulfilledReservation);
         return fulfilledReservation;
     }
 
-    private MedicineReservation fulfillReservationInternal(MedicineReservation reservation) {
+    private MedicineReservation fulfillReservationInternal(MedicineReservation reservation, Long actorTelegramId) {
         if (reservation == null) {
             throw new RuntimeException("Reservation not found");
         }
@@ -351,29 +431,24 @@ public MedicineReservation createReservation(Long userId,
             throw new RuntimeException("Only approved reservations can be fulfilled.");
         }
 
-        // If hold exists, fulfillment consumes held stock with no further deduction.
-        // Fallback for legacy rows: deduct now if not held.
-        if (!reservation.isInventoryHeld()) {
-            var inventory = inventoryRepository
-                .findByPharmacyIdAndMedicineNameIgnoreCase(
-                    reservation.getPharmacyId(),
-                    reservation.getMedicineName()
-                )
-                .orElseThrow(() -> new RuntimeException("Medicine inventory not found"));
-
-            Integer currentQty = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
-            int newQty = currentQty - reservation.getRequestedQuantity();
-
-            inventory.setQuantity(Math.max(newQty, 0));
-            inventory.setOutOfStock(newQty <= 0);
-            inventoryRepository.save(inventory);
+        String from = reservation.getStatus() == null ? null : reservation.getStatus().name();
+        Long resolvedActor = actorTelegramId;
+        if (resolvedActor == null || resolvedActor <= 0) {
+            resolvedActor = pharmacyRepository.findById(reservation.getPharmacyId())
+                    .map(Pharmacy::getTelegramId)
+                    .orElse(null);
         }
+        medicineLotService.fulfillReservation(reservation, resolvedActor);
 
-        reservation.setInventoryHeld(false);
         reservation.setStatus(MedicineReservationStatus.FULFILLED);
         reservation.setFulfilledAt(LocalDateTime.now());
+        reservation.setFulfilledByTelegramId(resolvedActor);
 
-        return reservationRepository.save(reservation);
+        MedicineReservation saved = reservationRepository.save(reservation);
+        pharmacySalesService.recordFromReservation(saved, resolvedActor);
+        reservationStatusHistoryService.record(
+                saved, from, MedicineReservationStatus.FULFILLED.name(), resolvedActor, "fulfilled");
+        return saved;
     }
 
     private void notifyCustomerReservationFulfilled(MedicineReservation reservation) {
@@ -386,8 +461,9 @@ public MedicineReservation createReservation(Long userId,
                 localizationService.getLanguage(reservation.getUserId())
         );
 
-        telegramClient.sendMessage(
-                reservation.getUserId(),
+        notifyCustomerWithReservationMiniApp(
+                reservation,
+                "history",
                 localizationService.text(
                         reservation.getUserId(),
                         "reservation_fulfilled_user",
@@ -425,8 +501,12 @@ public MedicineReservation createReservation(Long userId,
         }
 
         releaseHeldInventory(reservation);
+        String from = reservation.getStatus() == null ? null : reservation.getStatus().name();
         reservation.setStatus(MedicineReservationStatus.EXPIRED);
-        return reservationRepository.save(reservation);
+        MedicineReservation saved = reservationRepository.save(reservation);
+        reservationStatusHistoryService.record(
+                saved, from, MedicineReservationStatus.EXPIRED.name(), null, "expired");
+        return saved;
     }
 
     @Override
@@ -453,8 +533,12 @@ public MedicineReservation createReservation(Long userId,
         }
 
         releaseHeldInventory(reservation);
+        String fromStatus = reservation.getStatus() == null ? null : reservation.getStatus().name();
         reservation.setStatus(MedicineReservationStatus.CANCELLED);
-        return reservationRepository.save(reservation);
+        MedicineReservation saved = reservationRepository.save(reservation);
+        reservationStatusHistoryService.record(
+                saved, fromStatus, MedicineReservationStatus.CANCELLED.name(), userId, "cancelled_by_user");
+        return saved;
     }
 
     @Override
@@ -477,17 +561,21 @@ public MedicineReservation createReservation(Long userId,
         }
 
         releaseHeldInventory(reservation);
+        String fromStatus = reservation.getStatus() == null ? null : reservation.getStatus().name();
         reservation.setStatus(MedicineReservationStatus.CANCELLED);
         reservation.setQrToken(null);
         MedicineReservation saved = reservationRepository.save(reservation);
+        reservationStatusHistoryService.record(
+                saved, fromStatus, MedicineReservationStatus.CANCELLED.name(), pharmacyTelegramId, "cancelled_by_pharmacy");
 
         // Notify user
         if (saved.getUserId() != null && saved.getUserId() > 0) {
             String medicineName = MedicineSearchNormalizer.toDisplayName(
                     saved.getMedicineName(),
                     localizationService.getLanguage(saved.getUserId()));
-            telegramClient.sendMessage(
-                    saved.getUserId(),
+            notifyCustomerWithReservationMiniApp(
+                    saved,
+                    "history",
                     "❌ Your reservation has been cancelled by the pharmacy.\n\n"
                             + "🆔 ID: " + saved.getId() + "\n"
                             + "💊 Medicine: " + medicineName + "\n"
@@ -509,9 +597,13 @@ public MedicineReservation createReservation(Long userId,
         }
 
         releaseHeldInventory(reservation);
+        String fromStatus = reservation.getStatus() == null ? null : reservation.getStatus().name();
         reservation.setStatus(MedicineReservationStatus.CANCELLED);
         reservation.setNote(reason == null || reason.isBlank() ? "AUTO_CANCELLED_PENDING_TIMEOUT" : reason);
-        return reservationRepository.save(reservation);
+        MedicineReservation saved = reservationRepository.save(reservation);
+        reservationStatusHistoryService.record(
+                saved, fromStatus, MedicineReservationStatus.CANCELLED.name(), null, saved.getNote());
+        return saved;
     }
 
   @Override
@@ -524,7 +616,9 @@ public List<MedicineReservation> getUserReservations(Long userId) {
     public List<MedicineReservation> getPharmacyReservations(Long pharmacyTelegramId) {
         Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
                 .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
-        return reservationRepository.findByPharmacyIdOrderByCreatedAtDesc(pharmacy.getId());
+        return reservationRepository.findByPharmacyIdOrderByCreatedAtDesc(pharmacy.getId()).stream()
+                .filter(r -> r.getHiddenFromPharmacyAt() == null)
+                .toList();
     }
 
     @Override
@@ -536,6 +630,98 @@ public List<MedicineReservation> getUserReservations(Long userId) {
         if (!pharmacy.getId().equals(reservation.getPharmacyId())) {
             throw new RuntimeException("Reservation does not belong to this pharmacy");
         }
+    }
+
+    private Pharmacy requirePharmacyForGroup(String reservationGroupId, Long pharmacyTelegramId) {
+        if (reservationGroupId == null || reservationGroupId.isBlank()) {
+            throw new RuntimeException("Reservation group id is required");
+        }
+        Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
+                .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+        List<MedicineReservation> reservations = reservationRepository.findByReservationGroupId(reservationGroupId);
+        if (reservations == null || reservations.isEmpty()) {
+            throw new RuntimeException("No reservations found for this group.");
+        }
+        boolean ownsAll = reservations.stream().allMatch(r -> pharmacy.getId().equals(r.getPharmacyId()));
+        if (!ownsAll) {
+            throw new RuntimeException("This reservation group does not belong to your pharmacy.");
+        }
+        return pharmacy;
+    }
+
+    @Override
+    public List<MedicineReservation> approveGroupAndNotify(String reservationGroupId, Long pharmacyTelegramId) {
+        requirePharmacyForGroup(reservationGroupId, pharmacyTelegramId);
+        List<MedicineReservation> pending = reservationRepository.findByReservationGroupIdAndStatus(
+                reservationGroupId,
+                MedicineReservationStatus.PENDING
+        );
+        List<MedicineReservation> approved = new java.util.ArrayList<>();
+        for (MedicineReservation res : pending) {
+            try {
+                approved.add(approveReservationAndNotify(res.getId()));
+            } catch (RuntimeException e) {
+                System.out.println("Error approving reservation " + res.getId() + ": " + e.getMessage());
+            }
+        }
+        return approved;
+    }
+
+    @Override
+    public List<MedicineReservation> rejectGroup(String reservationGroupId, Long pharmacyTelegramId, String reason) {
+        requirePharmacyForGroup(reservationGroupId, pharmacyTelegramId);
+        String rejectReason = (reason == null || reason.isBlank()) ? "Rejected by pharmacy" : reason;
+        List<MedicineReservation> pending = reservationRepository.findByReservationGroupIdAndStatus(
+                reservationGroupId,
+                MedicineReservationStatus.PENDING
+        );
+        List<MedicineReservation> rejected = new java.util.ArrayList<>();
+        for (MedicineReservation res : pending) {
+            try {
+                rejected.add(rejectReservationAndNotify(res.getId(), rejectReason));
+            } catch (RuntimeException e) {
+                System.out.println("Error rejecting reservation " + res.getId() + ": " + e.getMessage());
+            }
+        }
+        return rejected;
+    }
+
+    @Override
+    public List<MedicineReservation> fulfillGroupAndNotify(String reservationGroupId, Long pharmacyTelegramId) {
+        requirePharmacyForGroup(reservationGroupId, pharmacyTelegramId);
+        List<MedicineReservation> reservations = reservationRepository.findByReservationGroupId(reservationGroupId);
+        List<MedicineReservation> fulfilled = new java.util.ArrayList<>();
+        for (MedicineReservation r : reservations) {
+            if (r.getStatus() == MedicineReservationStatus.APPROVED
+                    || r.getStatus() == MedicineReservationStatus.READY_FOR_PICKUP) {
+                try {
+                    fulfilled.add(fulfillReservationAndNotify(r.getId(), pharmacyTelegramId));
+                } catch (RuntimeException e) {
+                    System.out.println("Error fulfilling reservation " + r.getId() + ": " + e.getMessage());
+                }
+            }
+        }
+        return fulfilled;
+    }
+
+    @Override
+    public List<MedicineReservation> cancelGroupByPharmacy(String reservationGroupId, Long pharmacyTelegramId) {
+        requirePharmacyForGroup(reservationGroupId, pharmacyTelegramId);
+        List<MedicineReservation> reservations = reservationRepository.findByReservationGroupId(reservationGroupId);
+        List<MedicineReservation> cancelled = new java.util.ArrayList<>();
+        for (MedicineReservation r : reservations) {
+            if (r.getStatus() != MedicineReservationStatus.FULFILLED
+                    && r.getStatus() != MedicineReservationStatus.CANCELLED
+                    && r.getStatus() != MedicineReservationStatus.EXPIRED
+                    && r.getStatus() != MedicineReservationStatus.REJECTED) {
+                try {
+                    cancelled.add(cancelReservationByPharmacy(r.getId(), pharmacyTelegramId));
+                } catch (RuntimeException e) {
+                    System.out.println("Error cancelling reservation " + r.getId() + ": " + e.getMessage());
+                }
+            }
+        }
+        return cancelled;
     }
 
     @Override
@@ -806,7 +992,8 @@ public List<MedicineReservation> getPendingReservations(Long pharmacyTelegramId)
 
     return reservationRepository.findByPharmacyIdAndStatus(pharmacy.getId(), MedicineReservationStatus.PENDING)
             .stream()
-        .filter(this::isVisibleInPharmacyPendingQueue)
+            .filter(r -> r.getHiddenFromPharmacyAt() == null)
+            .filter(this::isVisibleInPharmacyPendingQueue)
             .sorted((a, b) -> b.getCreatedAt().compareTo(a.getCreatedAt()))
             .toList();
 }
@@ -816,9 +1003,23 @@ public List<MedicineReservation> getPrescriptionReservations(Long pharmacyTelegr
     Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
             .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
 
-    return reservationRepository.findByPharmacyIdAndStatus(pharmacy.getId(), MedicineReservationStatus.PENDING)
+    return reservationRepository.findByPharmacyIdOrderByCreatedAtDesc(pharmacy.getId())
             .stream()
+            .filter(r -> r.getHiddenFromPharmacyAt() == null)
             .filter(MedicineReservation::isPrescriptionRequired)
+            .filter(r -> {
+                MedicineReservationStatus status = r.getStatus();
+                return status == MedicineReservationStatus.PENDING
+                        || status == MedicineReservationStatus.APPROVED
+                        || status == MedicineReservationStatus.READY_FOR_PICKUP;
+            })
+            .filter(r -> {
+                PrescriptionReviewStatus st = r.getPrescriptionReviewStatus();
+                return st == PrescriptionReviewStatus.PENDING_REVIEW
+                        || st == PrescriptionReviewStatus.NEEDS_CLARIFICATION
+                        || st == PrescriptionReviewStatus.APPROVED
+                        || st == PrescriptionReviewStatus.UPLOAD_REQUIRED;
+            })
             .sorted((a, b) -> b.getCreatedAt().compareTo(a.getCreatedAt()))
             .toList();
 }
@@ -832,9 +1033,92 @@ public List<MedicineReservation> getApprovedReservations(Long pharmacyTelegramId
                     pharmacy.getId(),
                     List.of(MedicineReservationStatus.APPROVED, MedicineReservationStatus.READY_FOR_PICKUP))
             .stream()
+            .filter(r -> r.getHiddenFromPharmacyAt() == null)
             .filter(r -> r.getExpiresAt() == null || r.getExpiresAt().isAfter(LocalDateTime.now()))
             .sorted((a, b) -> b.getCreatedAt().compareTo(a.getCreatedAt()))
             .toList();
+}
+
+@Override
+public List<MedicineReservation> getTerminalReservations(Long pharmacyTelegramId) {
+    Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
+            .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+    return reservationRepository.findByPharmacyIdAndStatusIn(pharmacy.getId(), TERMINAL_STATUSES)
+            .stream()
+            .filter(r -> r.getHiddenFromPharmacyAt() == null)
+            .sorted((a, b) -> b.getCreatedAt().compareTo(a.getCreatedAt()))
+            .toList();
+}
+
+@Override
+public MedicineReservation hideReservationFromPharmacy(Long reservationId, Long pharmacyTelegramId) {
+    assertPharmacyOwnsReservation(reservationId, pharmacyTelegramId);
+    MedicineReservation reservation = reservationRepository.findById(reservationId)
+            .orElseThrow(() -> new RuntimeException("Reservation not found"));
+    if (!isTerminalStatus(reservation.getStatus())) {
+        throw new RuntimeException("Only completed, expired, cancelled, or rejected reservations can be dismissed");
+    }
+    if (reservation.getHiddenFromPharmacyAt() == null) {
+        reservation.setHiddenFromPharmacyAt(LocalDateTime.now());
+        reservationRepository.save(reservation);
+    }
+    return reservation;
+}
+
+@Override
+public int hideReservationsFromPharmacy(List<Long> reservationIds, Long pharmacyTelegramId) {
+    if (reservationIds == null || reservationIds.isEmpty()) {
+        return 0;
+    }
+    Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
+            .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+    LocalDateTime hiddenAt = LocalDateTime.now();
+    int count = 0;
+    for (Long id : reservationIds) {
+        if (id == null) {
+            continue;
+        }
+        MedicineReservation reservation = reservationRepository.findById(id).orElse(null);
+        if (reservation == null || !pharmacy.getId().equals(reservation.getPharmacyId())) {
+            continue;
+        }
+        if (!isTerminalStatus(reservation.getStatus())) {
+            continue;
+        }
+        if (reservation.getHiddenFromPharmacyAt() == null) {
+            reservation.setHiddenFromPharmacyAt(hiddenAt);
+            reservationRepository.save(reservation);
+            count++;
+        }
+    }
+    return count;
+}
+
+@Override
+public int hideTerminalReservationsFromPharmacy(Long pharmacyTelegramId) {
+    Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
+            .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+    LocalDateTime hiddenAt = LocalDateTime.now();
+    List<MedicineReservation> terminal = reservationRepository.findByPharmacyIdAndStatusIn(
+            pharmacy.getId(), TERMINAL_STATUSES);
+    int count = 0;
+    for (MedicineReservation reservation : terminal) {
+        if (reservation.getHiddenFromPharmacyAt() == null) {
+            reservation.setHiddenFromPharmacyAt(hiddenAt);
+            count++;
+        }
+    }
+    if (count > 0) {
+        reservationRepository.saveAll(terminal);
+    }
+    return count;
+}
+
+private boolean isTerminalStatus(MedicineReservationStatus status) {
+    return status == MedicineReservationStatus.FULFILLED
+            || status == MedicineReservationStatus.EXPIRED
+            || status == MedicineReservationStatus.REJECTED
+            || status == MedicineReservationStatus.CANCELLED;
 }
 
 @Override

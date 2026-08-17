@@ -3,17 +3,26 @@ package com.tenahub.bot.service.impl;
 import com.tenahub.bot.dto.AiChatDebugResponseDTO;
 import com.tenahub.bot.dto.AiChatRequestDTO;
 import com.tenahub.bot.dto.AiChatResponseDTO;
-import com.tenahub.bot.dto.MiniAppReservationCardDTO;
+import com.tenahub.bot.dto.MedicineBatchDTO;
 import com.tenahub.bot.dto.MedicineInfoDTO;
+import com.tenahub.bot.dto.MiniAppMedicineSummaryDTO;
+import com.tenahub.bot.dto.MiniAppReservationCardDTO;
+import com.tenahub.bot.dto.PharmacyNotificationDTO;
+import com.tenahub.bot.dto.PharmacyPerformanceReportDTO;
+import com.tenahub.bot.dto.PharmacyPerformanceWindowDTO;
+import com.tenahub.bot.dto.PharmacySalesSummaryDTO;
 import com.tenahub.bot.entity.MedicineReservation;
 import com.tenahub.bot.entity.PrescriptionReviewStatus;
 import com.tenahub.bot.repository.PharmacyRepository;
 import com.tenahub.bot.service.AdminService;
 import com.tenahub.bot.service.InventoryService;
 import com.tenahub.bot.service.LicenseComplianceService;
-import com.tenahub.bot.service.MiniAppService;
-import com.tenahub.bot.service.ReservationService;
 import com.tenahub.bot.service.MedicineKnowledgeService;
+import com.tenahub.bot.service.MiniAppService;
+import com.tenahub.bot.service.PharmacyNotificationService;
+import com.tenahub.bot.service.PharmacyPerformanceService;
+import com.tenahub.bot.service.PharmacySalesService;
+import com.tenahub.bot.service.ReservationService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -45,8 +54,14 @@ class AiAssistantServiceImplTest {
     private LicenseComplianceService licenseComplianceService;
     @Mock
     private PharmacyRepository pharmacyRepository;
-        @Mock
-        private MedicineKnowledgeService medicineKnowledgeService;
+    @Mock
+    private MedicineKnowledgeService medicineKnowledgeService;
+    @Mock
+    private PharmacyPerformanceService pharmacyPerformanceService;
+    @Mock
+    private PharmacySalesService pharmacySalesService;
+    @Mock
+    private PharmacyNotificationService pharmacyNotificationService;
 
     private AiAssistantServiceImpl service;
 
@@ -58,8 +73,11 @@ class AiAssistantServiceImplTest {
                 inventoryService,
                 adminService,
                 licenseComplianceService,
-                                pharmacyRepository,
-                                medicineKnowledgeService);
+                pharmacyRepository,
+                medicineKnowledgeService,
+                pharmacyPerformanceService,
+                pharmacySalesService,
+                pharmacyNotificationService);
         ReflectionTestUtils.setField(service, "adminChatId", 999L);
     }
 
@@ -318,6 +336,33 @@ class AiAssistantServiceImplTest {
     }
 
     @Test
+    void medicineSearch_usesCatalogSummariesNotKnowledgeLookup() {
+        when(medicineKnowledgeService.detectMedicineName("where can i find insulin"))
+                .thenReturn("insulin");
+        when(miniAppService.searchMedicineCatalog("insulin", null, null)).thenReturn(List.of(
+                MiniAppMedicineSummaryDTO.builder()
+                        .medicineId(5L)
+                        .medicineName("insulin")
+                        .price(new java.math.BigDecimal("120.00"))
+                        .availablePharmacies(3)
+                        .prescriptionRequired(true)
+                        .outOfStock(false)
+                        .build()
+        ));
+
+        AiChatResponseDTO response = service.chat(
+                AiChatRequestDTO.builder().message("where can i find insulin").build(),
+                111L, null, null);
+
+        assertEquals("MEDICINE_SEARCH", response.getIntent());
+        assertEquals(true, response.getAnswer().contains("120.00"));
+        assertEquals(true, response.getAnswer().contains("3 pharmacies"));
+        assertEquals(true, response.getAnswer().contains("prescription required"));
+        verify(miniAppService).searchMedicineCatalog("insulin", null, null);
+        verify(medicineKnowledgeService, org.mockito.Mockito.never()).lookup(org.mockito.ArgumentMatchers.any());
+    }
+
+    @Test
     void medicineHowToTake_includesConsultPharmacistSafetyLevel() {
         MedicineInfoDTO info = MedicineInfoDTO.builder()
                 .name("Paracetamol")
@@ -335,6 +380,10 @@ class AiAssistantServiceImplTest {
         assertEquals("MEDICINE_HOW_TO_TAKE", response.getIntent());
         assertEquals("consult_pharmacist", response.getSafetyLevel());
         assertEquals("Paracetamol", response.getMedicineName());
+        assertEquals(true, response.getAnswer().toLowerCase().contains("package label")
+                || response.getAnswer().toLowerCase().contains("prescription"));
+        assertEquals(false, response.getAnswer().contains("500mg"));
+        assertEquals("Take 500mg every 4–6 hours.", response.getHowToTake());
     }
 
     @Test
@@ -349,7 +398,8 @@ class AiAssistantServiceImplTest {
 
         assertEquals("MEDICINE_SIDE_EFFECTS", response.getIntent());
         assertEquals(true, response.getAnswer().contains("xyz123"));
-        assertEquals(true, response.getAnswer().contains("don't have information"));
+        assertEquals(true, response.getAnswer().contains("will not invent"));
+        assertEquals(false, response.getAnswer().toLowerCase().contains("mg"));
     }
 
     @Test
@@ -382,5 +432,97 @@ class AiAssistantServiceImplTest {
         assertEquals("USER_RESERVATION_HISTORY", response.getIntent());
         assertEquals("user", response.getRole());
         verify(miniAppService).getReservationHistory(111L);
+    }
+
+    @Test
+    void pharmacyPerformance_usesPerformanceReport() {
+        when(pharmacyRepository.existsByTelegramId(222L)).thenReturn(true);
+        when(pharmacyPerformanceService.getPerformanceReport(222L, "weekly")).thenReturn(
+                PharmacyPerformanceReportDTO.builder()
+                        .period("weekly")
+                        .healthScore(78)
+                        .healthGrade("B")
+                        .criticalRestockCount(2)
+                        .reservations(PharmacyPerformanceWindowDTO.builder()
+                                .total(10)
+                                .fulfillmentRate(80.0)
+                                .build())
+                        .build());
+
+        AiChatResponseDTO response = service.chat(
+                AiChatRequestDTO.builder().message("show my pharmacy performance").build(),
+                null, 222L, null);
+
+        assertEquals("PHARMACY_PERFORMANCE", response.getIntent());
+        assertEquals("pharmacy", response.getRole());
+        assertEquals(true, response.getAnswer().contains("78"));
+        assertEquals(true, response.getAnswer().contains("B"));
+        verify(pharmacyPerformanceService).getPerformanceReport(222L, "weekly");
+    }
+
+    @Test
+    void pharmacySales_usesSalesSummary() {
+        when(pharmacyRepository.existsByTelegramId(222L)).thenReturn(true);
+        when(pharmacySalesService.summary(222L, "weekly")).thenReturn(
+                PharmacySalesSummaryDTO.builder()
+                        .period("weekly")
+                        .revenue(new java.math.BigDecimal("500.00"))
+                        .saleCount(4)
+                        .medicinesDispensed(9)
+                        .build());
+
+        AiChatResponseDTO response = service.chat(
+                AiChatRequestDTO.builder().message("what are my weekly sales").build(),
+                null, 222L, null);
+
+        assertEquals("PHARMACY_SALES", response.getIntent());
+        assertEquals(true, response.getAnswer().contains("500.00"));
+        assertEquals(true, response.getAnswer().contains("4"));
+        verify(pharmacySalesService).summary(222L, "weekly");
+    }
+
+    @Test
+    void pharmacyExpiry_summarizesBatches() {
+        when(pharmacyRepository.existsByTelegramId(222L)).thenReturn(true);
+        when(inventoryService.listExpiryBatches(222L, "90")).thenReturn(List.of(
+                MedicineBatchDTO.builder().medicineName("Amoxicillin").quantity(5).build(),
+                MedicineBatchDTO.builder().medicineName("Ibuprofen").quantity(2).build()
+        ));
+
+        AiChatResponseDTO response = service.chat(
+                AiChatRequestDTO.builder().message("what is expiring soon").build(),
+                null, 222L, null);
+
+        assertEquals("PHARMACY_EXPIRY", response.getIntent());
+        assertEquals(true, response.getAnswer().contains("2 lot"));
+        assertEquals(true, response.getAnswer().contains("Amoxicillin"));
+        verify(inventoryService).listExpiryBatches(222L, "90");
+    }
+
+    @Test
+    void pharmacyNotifications_returnsUnreadCount() {
+        when(pharmacyRepository.existsByTelegramId(222L)).thenReturn(true);
+        when(pharmacyNotificationService.unreadCount(222L)).thenReturn(2L);
+        when(pharmacyNotificationService.list(222L, true)).thenReturn(List.of(
+                PharmacyNotificationDTO.builder().title("New reservation").build(),
+                PharmacyNotificationDTO.builder().title("Low stock").build()
+        ));
+
+        AiChatResponseDTO response = service.chat(
+                AiChatRequestDTO.builder().message("how many unread notifications do I have").build(),
+                null, 222L, null);
+
+        assertEquals("PHARMACY_NOTIFICATIONS", response.getIntent());
+        assertEquals(true, response.getAnswer().contains("2 unread"));
+        verify(pharmacyNotificationService).unreadCount(222L);
+    }
+
+    @Test
+    void userCannotAccessPharmacyPerformance() {
+        RuntimeException ex = assertThrows(RuntimeException.class,
+                () -> service.chat(
+                        AiChatRequestDTO.builder().message("show my pharmacy performance").build(),
+                        101L, null, null));
+        assertEquals("This question is available for pharmacy role only.", ex.getMessage());
     }
 }

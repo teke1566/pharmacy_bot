@@ -22,6 +22,7 @@ public class MiniAppReservationCardDTO {
     private String prescriptionReviewStatus;
     private String prescriptionStatusLabel;
     private String prescriptionRejectionReason;
+    private String prescriptionClarificationMessage;
     private Long pharmacyId;
     private String pharmacyName;
     private Long medicineId;

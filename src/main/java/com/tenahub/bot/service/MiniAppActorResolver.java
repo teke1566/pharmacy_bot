@@ -1,7 +1,11 @@
 package com.tenahub.bot.service;
 
+import com.tenahub.bot.dto.PharmacyActor;
+import com.tenahub.bot.entity.Pharmacy;
+import com.tenahub.bot.repository.PharmacyRepository;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
@@ -12,21 +16,37 @@ public class MiniAppActorResolver {
     public static final String INIT_DATA_HEADER = "X-Telegram-Init-Data";
 
     private final TelegramWebAppAuthService telegramWebAppAuthService;
+    private final PharmacyRepository pharmacyRepository;
+    private final PharmacyStaffAccessService pharmacyStaffAccessService;
 
     @Value("${tenahub.admin.chat-id:0}")
     private long adminChatId;
 
-    public MiniAppActorResolver(TelegramWebAppAuthService telegramWebAppAuthService) {
+    public MiniAppActorResolver(TelegramWebAppAuthService telegramWebAppAuthService,
+                                PharmacyRepository pharmacyRepository,
+                                @Lazy PharmacyStaffAccessService pharmacyStaffAccessService) {
         this.telegramWebAppAuthService = telegramWebAppAuthService;
+        this.pharmacyRepository = pharmacyRepository;
+        this.pharmacyStaffAccessService = pharmacyStaffAccessService;
     }
 
+    /**
+     * Returns the pharmacy owner telegram id used for data scoping.
+     * Supports owner (actor == claim) and ACTIVE staff of that pharmacy.
+     */
     public Long requirePharmacyTelegramId(Long headerValue, Long paramValue) {
-        Long claimed = firstPositive(headerValue, paramValue);
-        Long fromInitData = telegramWebAppAuthService.requireUserId(currentInitData());
-        if (claimed != null && !claimed.equals(fromInitData)) {
-            throw new MiniAppAuthException("Telegram identity does not match pharmacyTelegramId");
-        }
-        return fromInitData;
+        return requirePharmacyActor(headerValue, paramValue).getPharmacyTelegramId();
+    }
+
+    public PharmacyActor requirePharmacyActor(Long headerValue, Long paramValue) {
+        Long actorTelegramId = telegramWebAppAuthService.requireUserId(currentInitData());
+        Long claimedPharmacyTelegramId = firstPositive(headerValue, paramValue);
+
+        Long pharmacyTelegramId = claimedPharmacyTelegramId != null ? claimedPharmacyTelegramId : actorTelegramId;
+        Pharmacy pharmacy = pharmacyRepository.findByTelegramId(pharmacyTelegramId)
+                .orElseThrow(() -> new MiniAppAuthException("Pharmacy not found"));
+
+        return pharmacyStaffAccessService.resolveActor(pharmacy, actorTelegramId);
     }
 
     public Long requireAdminTelegramId(Long headerValue, Long paramValue) {
@@ -42,13 +62,16 @@ public class MiniAppActorResolver {
     }
 
     public Long resolveAdminIdForAccessCheck(Long headerValue, Long paramValue) {
-        // Always require verified Telegram initData — never trust spoofable header/param alone.
         Long fromInitData = telegramWebAppAuthService.requireUserId(currentInitData());
         Long claimed = firstPositive(headerValue, paramValue);
         if (claimed != null && !claimed.equals(fromInitData)) {
             throw new MiniAppAuthException("Telegram identity does not match adminTelegramId");
         }
         return fromInitData;
+    }
+
+    public Long requireUserId() {
+        return telegramWebAppAuthService.requireUserId(currentInitData());
     }
 
     public String currentInitData() {
@@ -70,7 +93,6 @@ public class MiniAppActorResolver {
         if (header != null && !header.isBlank()) {
             return header;
         }
-        // Some clients / proxies only forward lowercase custom headers.
         String lowerHeader = request.getHeader("x-telegram-init-data");
         if (lowerHeader != null && !lowerHeader.isBlank()) {
             return lowerHeader;

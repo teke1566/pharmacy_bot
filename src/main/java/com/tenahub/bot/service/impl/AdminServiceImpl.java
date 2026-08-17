@@ -10,6 +10,9 @@ import com.tenahub.bot.repository.PharmacyInventoryRepository;
 import com.tenahub.bot.repository.PharmacyRegistrationRepository;
 import com.tenahub.bot.repository.PharmacyRepository;
 import com.tenahub.bot.service.AdminService;
+import com.tenahub.bot.service.MedicineLotService;
+import com.tenahub.bot.service.PharmacySalesService;
+import com.tenahub.bot.service.ReservationStatusHistoryService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
@@ -29,6 +32,9 @@ public class AdminServiceImpl implements AdminService {
     private final PharmacyRepository pharmacyRepository;
     private final MedicineReservationRepository reservationRepository;
     private final PharmacyInventoryRepository pharmacyInventoryRepository;
+    private final MedicineLotService medicineLotService;
+    private final PharmacySalesService pharmacySalesService;
+    private final ReservationStatusHistoryService reservationStatusHistoryService;
 
     private static final int DETAIL_LIMIT = 3;
     private static final DateTimeFormatter FORMATTER =
@@ -91,14 +97,24 @@ public class AdminServiceImpl implements AdminService {
     public String viewReservationOversight() {
 
         List<MedicineReservation> pending = reservationRepository.findByStatusOrderByCreatedAtDesc(MedicineReservationStatus.PENDING);
-        List<MedicineReservation> approved = reservationRepository.findByStatusOrderByCreatedAtDesc(MedicineReservationStatus.APPROVED);
+        List<MedicineReservation> approved = new java.util.ArrayList<>(
+                reservationRepository.findByStatusOrderByCreatedAtDesc(MedicineReservationStatus.APPROVED));
+        approved.addAll(reservationRepository.findByStatusOrderByCreatedAtDesc(MedicineReservationStatus.READY_FOR_PICKUP));
+        approved.sort((a, b) -> {
+            var left = a.getCreatedAt();
+            var right = b.getCreatedAt();
+            if (left == null && right == null) return 0;
+            if (left == null) return 1;
+            if (right == null) return -1;
+            return right.compareTo(left);
+        });
         List<MedicineReservation> fulfilled = reservationRepository.findByStatusOrderByCreatedAtDesc(MedicineReservationStatus.FULFILLED);
         List<MedicineReservation> rejected = reservationRepository.findByStatusOrderByCreatedAtDesc(MedicineReservationStatus.REJECTED);
         List<MedicineReservation> expired = reservationRepository.findByStatusOrderByCreatedAtDesc(MedicineReservationStatus.EXPIRED);
 
         StringBuilder sb = new StringBuilder("📦 <b>Reservation Oversight</b>\n\n")
                 .append("⏳ Pending: ").append(pending.size()).append("\n")
-                .append("✅ Approved: ").append(approved.size()).append("\n")
+                .append("✅ Approved / Ready: ").append(approved.size()).append("\n")
                 .append("📦 Fulfilled: ").append(fulfilled.size()).append("\n")
                 .append("❌ Rejected: ").append(rejected.size()).append("\n")
                 .append("⌛ Expired: ").append(expired.size()).append("\n\n");
@@ -109,7 +125,7 @@ public class AdminServiceImpl implements AdminService {
         }
 
         if (!approved.isEmpty()) {
-            sb.append("\n<b>Latest Approved</b>\n");
+            sb.append("\n<b>Latest Approved / Ready</b>\n");
             appendReservations(sb, approved, 5);
         }
 
@@ -126,7 +142,9 @@ public class AdminServiceImpl implements AdminService {
 
         long totalReservations = reservationRepository.count();
         long pendingReservations = reservationRepository.countByStatus(MedicineReservationStatus.PENDING);
-        long approvedReservations = reservationRepository.countByStatus(MedicineReservationStatus.APPROVED);
+        long approvedReservations = reservationRepository.countByStatusIn(List.of(
+                MedicineReservationStatus.APPROVED,
+                MedicineReservationStatus.READY_FOR_PICKUP));
         long fulfilledReservations = reservationRepository.countByStatus(MedicineReservationStatus.FULFILLED);
         long rejectedReservations = reservationRepository.countByStatus(MedicineReservationStatus.REJECTED);
         long expiredReservations = reservationRepository.countByStatus(MedicineReservationStatus.EXPIRED);
@@ -138,7 +156,7 @@ public class AdminServiceImpl implements AdminService {
                 + "📄 Pending License Updates: " + pendingLicenseUpdates + "\n\n"
                 + "📦 Total Reservations: " + totalReservations + "\n"
                 + "⏳ Pending Reservations: " + pendingReservations + "\n"
-                + "✅ Approved Reservations: " + approvedReservations + "\n"
+                + "✅ Approved / Ready Reservations: " + approvedReservations + "\n"
                 + "📦 Fulfilled Reservations: " + fulfilledReservations + "\n"
                 + "❌ Rejected Reservations: " + rejectedReservations + "\n"
                 + "⌛ Expired Reservations: " + expiredReservations;
@@ -160,10 +178,14 @@ public class AdminServiceImpl implements AdminService {
           .append("\n");
         appendReservations(sb, pending, DETAIL_LIMIT);
 
-        sb.append("\n✅ <b>Approved Reservations: </b>")
-          .append(reservationRepository.countByStatus(MedicineReservationStatus.APPROVED))
+        sb.append("\n✅ <b>Approved / Ready Reservations: </b>")
+          .append(reservationRepository.countByStatusIn(List.of(
+                  MedicineReservationStatus.APPROVED,
+                  MedicineReservationStatus.READY_FOR_PICKUP)))
           .append("\n");
-        appendReservations(sb, approved, DETAIL_LIMIT);
+        List<MedicineReservation> readyList = new java.util.ArrayList<>(approved);
+        readyList.addAll(reservationRepository.findTop10ByStatusOrderByCreatedAtDesc(MedicineReservationStatus.READY_FOR_PICKUP));
+        appendReservations(sb, readyList, DETAIL_LIMIT);
 
         sb.append("\n📦 <b>Fulfilled Reservations: </b>")
           .append(reservationRepository.countByStatus(MedicineReservationStatus.FULFILLED))
@@ -204,7 +226,9 @@ public String viewDetailedSystemSummary() {
 
     long totalReservations = reservationRepository.count();
     long pendingReservations = reservationRepository.countByStatus(MedicineReservationStatus.PENDING);
-    long approvedReservations = reservationRepository.countByStatus(MedicineReservationStatus.APPROVED);
+    long approvedReservations = reservationRepository.countByStatusIn(List.of(
+            MedicineReservationStatus.APPROVED,
+            MedicineReservationStatus.READY_FOR_PICKUP));
     long fulfilledReservations = reservationRepository.countByStatus(MedicineReservationStatus.FULFILLED);
     long rejectedReservations = reservationRepository.countByStatus(MedicineReservationStatus.REJECTED);
     long expiredReservations = reservationRepository.countByStatus(MedicineReservationStatus.EXPIRED);
@@ -726,21 +750,7 @@ public String viewReservationsByStatus(MedicineReservationStatus status) {
     }
 
     private void releaseInventoryIfHeld(MedicineReservation reservation) {
-        if (!reservation.isInventoryHeld()) return;
-        var inventory = pharmacyInventoryRepository
-                .findByPharmacyIdAndMedicineNameIgnoreCase(
-                        reservation.getPharmacyId(),
-                        reservation.getMedicineName())
-                .orElse(null);
-        if (inventory != null) {
-            int qty = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
-            int release = reservation.getRequestedQuantity() == null ? 0 : reservation.getRequestedQuantity();
-            int newQty = qty + Math.max(release, 0);
-            inventory.setQuantity(newQty);
-            inventory.setOutOfStock(newQty <= 0);
-            pharmacyInventoryRepository.save(inventory);
-        }
-        reservation.setInventoryHeld(false);
+        medicineLotService.releaseHeldForReservation(reservation);
     }
 
     @Override
@@ -762,8 +772,9 @@ public String viewReservationsByStatus(MedicineReservationStatus status) {
     public void adminExpireReservation(Long id) {
         MedicineReservation r = getReservation(id);
         if (r.getStatus() != MedicineReservationStatus.PENDING
-                && r.getStatus() != MedicineReservationStatus.APPROVED) {
-            throw new RuntimeException("Only active (PENDING/APPROVED) reservations can be force-expired.");
+                && r.getStatus() != MedicineReservationStatus.APPROVED
+                && r.getStatus() != MedicineReservationStatus.READY_FOR_PICKUP) {
+            throw new RuntimeException("Only active (PENDING/APPROVED/READY_FOR_PICKUP) reservations can be force-expired.");
         }
         releaseInventoryIfHeld(r);
         r.setStatus(MedicineReservationStatus.EXPIRED);
@@ -779,11 +790,14 @@ public String viewReservationsByStatus(MedicineReservationStatus status) {
                 || r.getStatus() == MedicineReservationStatus.EXPIRED) {
             throw new RuntimeException("Reservation is already in a terminal state: " + r.getStatus());
         }
-        // Consuming held inventory — do not release back to stock.
-        r.setInventoryHeld(false);
+        String from = r.getStatus() == null ? null : r.getStatus().name();
+        medicineLotService.fulfillReservation(r, null);
         r.setStatus(MedicineReservationStatus.FULFILLED);
         r.setFulfilledAt(LocalDateTime.now());
-        reservationRepository.save(r);
+        MedicineReservation saved = reservationRepository.save(r);
+        pharmacySalesService.recordFromReservation(saved, null);
+        reservationStatusHistoryService.record(
+                saved, from, MedicineReservationStatus.FULFILLED.name(), null, "admin_fulfilled");
     }
 
     @Override

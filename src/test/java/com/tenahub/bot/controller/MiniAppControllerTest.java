@@ -1,10 +1,13 @@
 package com.tenahub.bot.controller;
 
 import com.tenahub.bot.dto.MiniAppOperationResponseDTO;
+import com.tenahub.bot.dto.MiniAppMedicineSummaryDTO;
 import com.tenahub.bot.dto.MiniAppReservationCardDTO;
 import com.tenahub.bot.dto.MiniAppReservationConfirmRequestDTO;
 import com.tenahub.bot.dto.MiniAppReservationConfirmResponseDTO;
+import com.tenahub.bot.dto.MiniAppPharmacyReportRequestDTO;
 import com.tenahub.bot.dto.PharmacyResponseDTO;
+import com.tenahub.bot.service.AdminInboxService;
 import com.tenahub.bot.service.MiniAppActorResolver;
 import com.tenahub.bot.service.MiniAppAuthException;
 import com.tenahub.bot.service.MiniAppService;
@@ -38,6 +41,8 @@ class MiniAppControllerTest {
     private TelegramWebAppAuthService telegramWebAppAuthService;
     @Mock
     private MiniAppActorResolver miniAppActorResolver;
+    @Mock
+    private AdminInboxService adminInboxService;
 
     private MiniAppController controller;
 
@@ -47,11 +52,12 @@ class MiniAppControllerTest {
         ReflectionTestUtils.setField(controller, "miniAppService", miniAppService);
         ReflectionTestUtils.setField(controller, "telegramWebAppAuthService", telegramWebAppAuthService);
         ReflectionTestUtils.setField(controller, "miniAppActorResolver", miniAppActorResolver);
+        ReflectionTestUtils.setField(controller, "adminInboxService", adminInboxService);
     }
 
     @Test
     void search_prefersSortAndFilterOverAliases() {
-        when(miniAppService.search(any(), any(), any(), any(), any(), any()))
+        when(miniAppService.search(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());
 
         ResponseEntity<?> response = controller.search(
@@ -62,11 +68,13 @@ class MiniAppControllerTest {
                 "Cheapest",
                 "Nearest",
                 "Verified only",
-                "No prescription");
+                "No prescription",
+                77L);
 
         assertEquals(HttpStatus.OK, response.getStatusCode());
         verify(miniAppService).search(
                 eq("paracetamol"),
+                eq(77L),
                 eq(9.01),
                 eq(38.75),
                 eq(42L),
@@ -76,7 +84,7 @@ class MiniAppControllerTest {
 
     @Test
     void search_usesSortByAndFilterByWhenPrimaryValuesMissing() {
-        when(miniAppService.search(any(), any(), any(), any(), any(), any()))
+        when(miniAppService.search(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of(PharmacyResponseDTO.builder().name("A").build()));
 
         ResponseEntity<?> response = controller.search(
@@ -87,11 +95,13 @@ class MiniAppControllerTest {
                 null,
                 "Highest Rated",
                 null,
-                "Prescription required");
+                "Prescription required",
+                null);
 
         assertEquals(HttpStatus.OK, response.getStatusCode());
         verify(miniAppService).search(
                 eq("ibuprofen"),
+                isNull(),
                 eq(null),
                 eq(null),
                 eq(99L),
@@ -100,12 +110,95 @@ class MiniAppControllerTest {
     }
 
     @Test
+    void searchMedicineCatalog_forwardsQueryParams() {
+        when(miniAppService.searchMedicineCatalog(any(), any(), any()))
+                .thenReturn(List.of(MiniAppMedicineSummaryDTO.builder().medicineId(5L).medicineName("insulin").build()));
+
+        ResponseEntity<?> response = controller.searchMedicineCatalog("insulin", 9.01, 38.75);
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        verify(miniAppService).searchMedicineCatalog(eq("insulin"), eq(9.01), eq(38.75));
+    }
+
+    @Test
+    void searchAnalogues_forwardsQueryParams() {
+        when(miniAppService.searchAnalogues(any(), any(), any(), any(), any()))
+                .thenReturn(List.of());
+
+        ResponseEntity<?> response = controller.searchAnalogues(
+                "insulin glargine",
+                "11",
+                9.01,
+                38.75,
+                42L);
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        verify(miniAppService).searchAnalogues(
+                eq("insulin glargine"),
+                eq(11L),
+                eq(9.01),
+                eq(38.75),
+                eq(42L));
+    }
+
+    @Test
+    void searchAnalogues_ignoresNonNumericMedicineId() {
+        when(miniAppService.searchAnalogues(any(), any(), any(), any(), any()))
+                .thenReturn(List.of());
+
+        ResponseEntity<?> response = controller.searchAnalogues(
+                "insulin",
+                "insulin",
+                null,
+                null,
+                null);
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        verify(miniAppService).searchAnalogues(
+                eq("insulin"),
+                isNull(),
+                isNull(),
+                isNull(),
+                isNull());
+    }
+
+    @Test
+    void searchMultipleMedicines_forwardsQueryParams() {
+        when(miniAppService.searchMultipleMedicines(any(), any(), any(), any()))
+                .thenReturn(List.of());
+
+        ResponseEntity<?> response = controller.searchMultipleMedicines(
+                "insulin,paracetamol",
+                9.01,
+                38.75,
+                42L);
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        verify(miniAppService).searchMultipleMedicines(
+                eq(List.of("insulin", "paracetamol")),
+                eq(9.01),
+                eq(38.75),
+                eq(42L));
+    }
+
+    @Test
+    void searchMultipleMedicines_requiresMedicinesAndCoordinates() {
+        ResponseEntity<?> missingNames = controller.searchMultipleMedicines("  ", 9.01, 38.75, null);
+        ResponseEntity<?> missingCoords = controller.searchMultipleMedicines("insulin", null, 38.75, null);
+
+        assertEquals(HttpStatus.BAD_REQUEST, missingNames.getStatusCode());
+        assertEquals(HttpStatus.BAD_REQUEST, missingCoords.getStatusCode());
+        verify(miniAppService, never()).searchMultipleMedicines(any(), any(), any(), any());
+    }
+
+    @Test
     void search_returnsBadRequestOnRuntimeException() {
-        when(miniAppService.search(any(), any(), any(), any(), any(), any()))
+        when(miniAppService.search(any(), any(), any(), any(), any(), any(), any()))
                 .thenThrow(new RuntimeException("medicine is required"));
 
         ResponseEntity<?> response = controller.search(
                 "",
+                null,
                 null,
                 null,
                 null,
@@ -238,5 +331,27 @@ class MiniAppControllerTest {
         assertEquals(HttpStatus.OK, response.getStatusCode());
         assertEquals("init-from-header", request.getTelegramInitData());
         verify(miniAppService).confirmReservation(request);
+    }
+
+    @Test
+    void reportPharmacy_createsInboxIssue() {
+        when(miniAppActorResolver.currentInitData()).thenReturn(null);
+        when(telegramWebAppAuthService.requireUserId(eq("init-data"), isNull(), isNull(), isNull())).thenReturn(42L);
+        MiniAppPharmacyReportRequestDTO request = MiniAppPharmacyReportRequestDTO.builder()
+                .issueType("wrong_hours")
+                .note("Closes earlier")
+                .pharmacyName("Bole Pharmacy")
+                .medicineName("Paracetamol")
+                .build();
+
+        ResponseEntity<?> response = controller.reportPharmacy(9L, request, null, null, "init-data");
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        verify(adminInboxService).createIssueItem(
+                eq(42L),
+                eq(9L),
+                eq("Paracetamol"),
+                eq("wrong_hours"),
+                org.mockito.ArgumentMatchers.contains("Bole Pharmacy"));
     }
 }

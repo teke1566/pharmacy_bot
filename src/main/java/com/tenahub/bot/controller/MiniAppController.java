@@ -15,12 +15,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.tenahub.bot.dto.MiniAppMedicinePhotosDTO;
+import com.tenahub.bot.dto.MiniAppMedicineSummaryDTO;
 import com.tenahub.bot.dto.MiniAppAuthSendCodeRequestDTO;
 import com.tenahub.bot.dto.MiniAppAuthVerifyCodeRequestDTO;
 import com.tenahub.bot.dto.MiniAppAuthVerifyCodeResponseDTO;
 import com.tenahub.bot.dto.MiniAppOperationResponseDTO;
 import com.tenahub.bot.dto.MiniAppPharmacyDetailDTO;
 import com.tenahub.bot.dto.MiniAppPharmacyPhotosDTO;
+import com.tenahub.bot.dto.MultiMedicinePharmacyResultDTO;
 import com.tenahub.bot.dto.MiniAppReservationCardDTO;
 import com.tenahub.bot.dto.MiniAppReservationConfirmRequestDTO;
 import com.tenahub.bot.dto.MiniAppReservationConfirmResponseDTO;
@@ -28,7 +30,9 @@ import com.tenahub.bot.dto.MiniAppReservationPreloadResponseDTO;
 import com.tenahub.bot.dto.MiniAppReservationCreateRequestDTO;
 import com.tenahub.bot.dto.MiniAppReservationResponseDTO;
 import com.tenahub.bot.dto.PrescriptionStatusResponseDTO;
+import com.tenahub.bot.dto.MiniAppPharmacyReportRequestDTO;
 import com.tenahub.bot.dto.PharmacyResponseDTO;
+import com.tenahub.bot.service.AdminInboxService;
 import com.tenahub.bot.service.MiniAppActorResolver;
 import com.tenahub.bot.service.MiniAppAuthException;
 import com.tenahub.bot.service.MiniAppService;
@@ -38,6 +42,8 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Stream;
 
 /**
@@ -63,6 +69,9 @@ public class MiniAppController {
 
     @Autowired
     private MiniAppActorResolver miniAppActorResolver;
+
+    @Autowired
+    private AdminInboxService adminInboxService;
 
     private Long requireVerifiedTelegramUserId(String... initDataCandidates) {
         return telegramWebAppAuthService.requireUserId(
@@ -111,18 +120,20 @@ public class MiniAppController {
 
     @GetMapping("/search")
     public ResponseEntity<?> search(
-            @RequestParam String medicine,
+            @RequestParam(required = false) String medicine,
             @RequestParam(required = false) Double latitude,
             @RequestParam(required = false) Double longitude,
             @RequestParam(required = false) Long userId,
             @RequestParam(required = false) String sort,
             @RequestParam(required = false, name = "sortBy") String sortBy,
             @RequestParam(required = false) String filter,
-            @RequestParam(required = false, name = "filterBy") String filterBy
+            @RequestParam(required = false, name = "filterBy") String filterBy,
+            @RequestParam(required = false) Long medicineId
     ) {
         try {
             List<PharmacyResponseDTO> result = miniAppService.search(
                     medicine,
+                    medicineId,
                     latitude,
                     longitude,
                     userId,
@@ -134,6 +145,88 @@ public class MiniAppController {
         } catch (RuntimeException e) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body("Error searching pharmacies: " + e.getMessage());
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("Unexpected error: " + e.getMessage());
+        }
+    }
+
+    @GetMapping("/medicines/search")
+    public ResponseEntity<?> searchMedicineCatalog(
+            @RequestParam(required = false) String medicine,
+            @RequestParam(required = false) Double latitude,
+            @RequestParam(required = false) Double longitude
+    ) {
+        try {
+            List<MiniAppMedicineSummaryDTO> result = miniAppService.searchMedicineCatalog(
+                    medicine,
+                    latitude,
+                    longitude);
+            return ResponseEntity.ok(result);
+        } catch (MiniAppAuthException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body("Error searching medicines: " + e.getMessage());
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("Unexpected error: " + e.getMessage());
+        }
+    }
+
+    @GetMapping("/search/multi")
+    public ResponseEntity<?> searchMultipleMedicines(
+            @RequestParam(required = false) String medicines,
+            @RequestParam(required = false) Double latitude,
+            @RequestParam(required = false) Double longitude,
+            @RequestParam(required = false) Long userId
+    ) {
+        try {
+            List<String> names = parseMedicineNames(medicines);
+            if (names.isEmpty()) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("medicines is required");
+            }
+            if (latitude == null || longitude == null) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("latitude and longitude are required");
+            }
+            List<MultiMedicinePharmacyResultDTO> result = miniAppService.searchMultipleMedicines(
+                    names,
+                    latitude,
+                    longitude,
+                    userId);
+            return ResponseEntity.ok(result);
+        } catch (MiniAppAuthException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body("Error searching pharmacies: " + e.getMessage());
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("Unexpected error: " + e.getMessage());
+        }
+    }
+
+    @GetMapping("/medicines/analogues")
+    public ResponseEntity<?> searchAnalogues(
+            @RequestParam String medicine,
+            @RequestParam(required = false) String medicineId,
+            @RequestParam(required = false) Double latitude,
+            @RequestParam(required = false) Double longitude,
+            @RequestParam(required = false) Long userId
+    ) {
+        try {
+            List<MiniAppMedicineSummaryDTO> result = miniAppService.searchAnalogues(
+                    medicine,
+                    parseOptionalLong(medicineId),
+                    latitude,
+                    longitude,
+                    userId);
+            return ResponseEntity.ok(result);
+        } catch (MiniAppAuthException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body("Error searching analogues: " + e.getMessage());
         } catch (Exception e) {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body("Unexpected error: " + e.getMessage());
@@ -355,6 +448,39 @@ public class MiniAppController {
         }
     }
 
+    @PostMapping("/reservations/history/hide-selected")
+    public ResponseEntity<?> hideSelectedReservationHistory(@RequestBody(required = false) Map<String, Object> body,
+                                                            @RequestParam(required = false) Long telegramUserId,
+                                                            @RequestParam(required = false) String telegramInitData,
+                                                            @RequestParam(required = false) String initData,
+                                                            @RequestHeader(value = MiniAppActorResolver.INIT_DATA_HEADER, required = false) String initDataHeader) {
+        try {
+            Long resolvedUserId = requireVerifiedTelegramUserId(initDataHeader, telegramInitData, initData);
+            if (telegramUserId != null && telegramUserId > 0 && !telegramUserId.equals(resolvedUserId)) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                        .body(MiniAppOperationResponseDTO.builder().success(false).message("Telegram identity does not match telegramUserId").build());
+            }
+            @SuppressWarnings("unchecked")
+            List<Object> rawIds = body == null ? List.of() : (List<Object>) body.getOrDefault("reservationIds", List.of());
+            List<Long> ids = rawIds.stream()
+                    .filter(Objects::nonNull)
+                    .map(value -> Long.valueOf(String.valueOf(value)))
+                    .toList();
+            MiniAppOperationResponseDTO response = miniAppService.hideReservationsFromHistory(ids, resolvedUserId);
+            return ResponseEntity.ok(response);
+        } catch (MiniAppAuthException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            log.warn("[API] /reservations/history/hide-selected rejected: {}", e.getMessage());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(MiniAppOperationResponseDTO.builder().success(false).message(e.getMessage()).build());
+        } catch (Exception e) {
+            log.error("[API] /reservations/history/hide-selected error: {}", e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(MiniAppOperationResponseDTO.builder().success(false).message("Unexpected error").build());
+        }
+    }
+
     @PostMapping(value = "/reservations/prescriptions", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<?> uploadPrescriptionFiles(@RequestParam(required = false) Long reservationId,
                                                      @RequestParam(required = false) String reservationGroupId,
@@ -421,6 +547,40 @@ public class MiniAppController {
         }
     }
     
+    @PostMapping("/pharmacies/{pharmacyId}/report")
+    public ResponseEntity<?> reportPharmacy(
+            @PathVariable Long pharmacyId,
+            @RequestBody(required = false) MiniAppPharmacyReportRequestDTO request,
+            @RequestParam(required = false) String telegramInitData,
+            @RequestParam(required = false) String initData,
+            @RequestHeader(value = MiniAppActorResolver.INIT_DATA_HEADER, required = false) String initDataHeader) {
+        try {
+            Long userId = requireVerifiedTelegramUserId(initDataHeader, telegramInitData, initData);
+            MiniAppPharmacyReportRequestDTO body = request == null ? new MiniAppPharmacyReportRequestDTO() : request;
+            String issueType = body.getIssueType() == null || body.getIssueType().isBlank() ? "other" : body.getIssueType().trim();
+            String pharmacyName = body.getPharmacyName() == null ? "" : body.getPharmacyName().trim();
+            String note = body.getNote() == null ? "" : body.getNote().trim();
+            String message = "Pharmacy report"
+                    + (pharmacyName.isBlank() ? "" : ": " + pharmacyName)
+                    + " (#" + pharmacyId + ")\nReason: " + issueType
+                    + (note.isBlank() ? "" : "\n" + note);
+            adminInboxService.createIssueItem(userId, pharmacyId, body.getMedicineName(), issueType, message);
+            return ResponseEntity.ok(MiniAppOperationResponseDTO.builder()
+                    .success(true)
+                    .message("Report received")
+                    .build());
+        } catch (MiniAppAuthException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(MiniAppOperationResponseDTO.builder().success(false).message(e.getMessage()).build());
+        } catch (Exception e) {
+            log.error("[API] /pharmacies/{}/report error: {}", pharmacyId, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(MiniAppOperationResponseDTO.builder().success(false).message("Unexpected error").build());
+        }
+    }
+
     /**
      * GET /api/miniapp/pharmacies/{pharmacyId}/photos
      * 
@@ -592,10 +752,31 @@ public class MiniAppController {
                 .toList();
     }
 
+    private List<String> parseMedicineNames(String medicines) {
+        if (medicines == null || medicines.isBlank()) {
+            return List.of();
+        }
+        return java.util.Arrays.stream(medicines.split(","))
+                .map(String::trim)
+                .filter(value -> !value.isBlank())
+                .toList();
+    }
+
     private String firstNonBlank(String... values) {
         return Stream.of(values)
                 .filter(value -> value != null && !value.isBlank())
                 .findFirst()
                 .orElse(null);
+    }
+
+    private Long parseOptionalLong(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return Long.valueOf(value.trim());
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
     }
 }

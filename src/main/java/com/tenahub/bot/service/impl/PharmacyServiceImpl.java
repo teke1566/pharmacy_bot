@@ -35,16 +35,16 @@ public class PharmacyServiceImpl implements PharmacyService {
     private final PharmacyRatingRepository ratingRepository;
     private final PharmacyInventoryRepository inventoryRepository;
     private static final int SEARCH_RESULT_LIMIT = 10;
+    private static final int NEARBY_RESULT_LIMIT = 12;
 
     @Override
     public List<PharmacyResponseDTO> searchMedicine(String medicine) {
-        String normalizedMedicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(medicine);
-        if (normalizedMedicine.isBlank()) {
-            return List.of();
-        }
+        return searchMedicine(medicine, null);
+    }
 
-        List<PharmacyInventory> inventoryList =
-                inventoryRepository.findByMedicineNameIgnoreCase(normalizedMedicine);
+    @Override
+    public List<PharmacyResponseDTO> searchMedicine(String medicine, Long catalogMedicineId) {
+        List<PharmacyInventory> inventoryList = findInventoryForSearch(medicine, catalogMedicineId);
 
         return inventoryList.stream()
             .map(item -> pharmacyRepository.findById(item.getPharmacyId())
@@ -63,7 +63,7 @@ public class PharmacyServiceImpl implements PharmacyService {
         }
 
         List<PharmacyInventory> inventoryList =
-                inventoryRepository.findByMedicineNameIgnoreCase(normalizedMedicine);
+                visibleForCustomerSearch(inventoryRepository.findByMedicineNameIgnoreCase(normalizedMedicine));
 
         return inventoryList.stream()
             .map(item -> pharmacyRepository.findById(item.getPharmacyId())
@@ -83,7 +83,7 @@ public class PharmacyServiceImpl implements PharmacyService {
         }
 
         List<PharmacyInventory> inventoryList =
-                inventoryRepository.findByMedicineNameIgnoreCase(normalizedMedicine);
+                visibleForCustomerSearch(inventoryRepository.findByMedicineNameIgnoreCase(normalizedMedicine));
 
         return inventoryList.stream()
             .map(item -> pharmacyRepository.findById(item.getPharmacyId())
@@ -114,16 +114,18 @@ public List<PharmacyResponseDTO> searchMedicineNearby(
         double userLat,
         double userLon,
         Long userId) {
+    return searchMedicineNearby(medicine, null, userLat, userLon, userId);
+}
 
-    if (medicine == null || medicine.isBlank()) {
-        return List.of();
-    }
+@Override
+public List<PharmacyResponseDTO> searchMedicineNearby(
+        String medicine,
+        Long catalogMedicineId,
+        double userLat,
+        double userLon,
+        Long userId) {
 
-    String normalizedMedicine = medicine.trim().toLowerCase();
-    normalizedMedicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(normalizedMedicine);
-
-    List<PharmacyInventory> inventoryList =
-            inventoryRepository.findByMedicineNameIgnoreCase(normalizedMedicine);
+    List<PharmacyInventory> inventoryList = findInventoryForSearch(medicine, catalogMedicineId);
 
     List<PharmacyResponseDTO> allResults = new ArrayList<>();
 
@@ -181,7 +183,10 @@ public List<PharmacyResponseDTO> searchMedicineNearby(
         PharmacyResponseDTO dto = PharmacyResponseDTO.builder()
                 .id(p.getId())
                 .name(p.getName())
+                .city(p.getCity())
                 .area(p.getArea())
+                .landmark(p.getLandmark())
+                .formattedAddress(p.getFormattedAddress())
                 .phone(p.getPhone())
                 .latitude(p.getLatitude())
                 .longitude(p.getLongitude())
@@ -195,6 +200,7 @@ public List<PharmacyResponseDTO> searchMedicineNearby(
                 .outOfStock(outOfStock)
                 .medicineName(item.getMedicineName())
                 .medicineId(item.getId())
+                .catalogMedicineId(item.getCatalogMedicineId())
                 .price(item.getPrice())
                 .requiresPrescription(item.isRequiresPrescription())
                 .openNow(openNow)
@@ -220,21 +226,110 @@ public List<PharmacyResponseDTO> searchMedicineNearby(
             .limit(SEARCH_RESULT_LIMIT)
             .collect(Collectors.toList());
 }
+
+@Override
+public List<PharmacyResponseDTO> listNearbyApproved(Double userLat, Double userLon) {
+    boolean hasUserCoords = userLat != null && userLon != null;
+    List<PharmacyResponseDTO> results = new ArrayList<>();
+
+    for (Pharmacy pharmacy : pharmacyRepository.findByApprovedTrue()) {
+        if (pharmacy.isLicenseSuspended()) {
+            continue;
+        }
+        if (pharmacy.getLatitude() == null || pharmacy.getLongitude() == null) {
+            if (hasUserCoords) {
+                continue;
+            }
+        }
+
+        double distance = 0;
+        if (hasUserCoords && pharmacy.getLatitude() != null && pharmacy.getLongitude() != null) {
+            distance = GeoUtils.distance(userLat, userLon, pharmacy.getLatitude(), pharmacy.getLongitude());
+        }
+
+        boolean temporaryClosureActive = isTemporaryClosureActive(pharmacy);
+        boolean openNow = !temporaryClosureActive && isOpenNow(pharmacy.getOpenTime(), pharmacy.getCloseTime());
+
+        results.add(PharmacyResponseDTO.builder()
+                .id(pharmacy.getId())
+                .name(pharmacy.getName())
+                .city(pharmacy.getCity())
+                .area(pharmacy.getArea())
+                .landmark(pharmacy.getLandmark())
+                .formattedAddress(pharmacy.getFormattedAddress())
+                .phone(pharmacy.getPhone())
+                .latitude(pharmacy.getLatitude() == null ? 0 : pharmacy.getLatitude())
+                .longitude(pharmacy.getLongitude() == null ? 0 : pharmacy.getLongitude())
+                .distance(distance)
+                .rating(pharmacy.getRating())
+                .approved(pharmacy.isApproved())
+                .verified(isVerifiedPharmacy(pharmacy))
+                .openNow(openNow)
+                .openTime(pharmacy.getOpenTime() == null ? null : pharmacy.getOpenTime().toString())
+                .closeTime(pharmacy.getCloseTime() == null ? null : pharmacy.getCloseTime().toString())
+                .temporarilyClosed(temporaryClosureActive)
+                .temporaryClosureReason(temporaryClosureActive ? pharmacy.getTemporaryClosureReason() : null)
+                .temporaryClosedUntil(temporaryClosureActive ? pharmacy.getTemporaryClosedUntil() : null)
+                .build());
+    }
+
+    Comparator<PharmacyResponseDTO> sorter = hasUserCoords
+            ? Comparator.comparingDouble(PharmacyResponseDTO::getDistance)
+            : Comparator.comparing(PharmacyResponseDTO::getName, Comparator.nullsLast(String.CASE_INSENSITIVE_ORDER));
+
+    return results.stream()
+            .sorted(sorter)
+            .limit(NEARBY_RESULT_LIMIT)
+            .collect(Collectors.toList());
+}
+   private List<PharmacyInventory> findInventoryForSearch(String medicine, Long catalogMedicineId) {
+        List<PharmacyInventory> matches;
+        if (catalogMedicineId != null) {
+            List<PharmacyInventory> byCatalog = inventoryRepository.findByCatalogMedicineId(catalogMedicineId);
+            matches = byCatalog.isEmpty() && medicine != null && !medicine.isBlank()
+                    ? inventoryRepository.findByMedicineNameIgnoreCase(
+                            MedicineSearchNormalizer.normalizeToEnglishCanonical(medicine))
+                    : byCatalog;
+        } else if (medicine == null || medicine.isBlank()) {
+            matches = List.of();
+        } else {
+            String normalizedMedicine = MedicineSearchNormalizer.normalizeToEnglishCanonical(medicine);
+            matches = normalizedMedicine.isBlank()
+                    ? List.of()
+                    : inventoryRepository.findByMedicineNameIgnoreCase(normalizedMedicine);
+        }
+        return visibleForCustomerSearch(matches);
+   }
+
+   private List<PharmacyInventory> visibleForCustomerSearch(List<PharmacyInventory> items) {
+        if (items == null || items.isEmpty()) {
+            return List.of();
+        }
+        return items.stream().filter(item -> !item.isArchived()).toList();
+   }
+
    private PharmacyResponseDTO mapBasic(Pharmacy p, PharmacyInventory item) {
+    int qty = item.getQuantity() == null ? 0 : item.getQuantity();
+    boolean expired = item.getExpiryDate() != null && item.getExpiryDate().isBefore(LocalDate.now());
     return PharmacyResponseDTO.builder()
             .id(p.getId())
             .name(p.getName())
+            .city(p.getCity())
             .area(p.getArea())
+            .landmark(p.getLandmark())
+            .formattedAddress(p.getFormattedAddress())
             .phone(p.getPhone())
             .latitude(p.getLatitude())
             .longitude(p.getLongitude())
             .rating(p.getRating())
             .approved(p.isApproved())
             .verified(isVerifiedPharmacy(p))
-        .stockQuantity(item.getQuantity())
-        .outOfStock(item.isOutOfStock() || item.getQuantity() == null || item.getQuantity() <= 0)
+        .stockQuantity(qty)
+        .outOfStock(expired || item.isOutOfStock() || qty <= 0)
+        .expired(expired)
         .medicineName(item.getMedicineName())
         .medicineId(item.getId())
+        .catalogMedicineId(item.getCatalogMedicineId())
         .price(item.getPrice())
             .requiresPrescription(item.isRequiresPrescription())
             .openNow(!isTemporaryClosureActive(p) && isOpenNow(p.getOpenTime(), p.getCloseTime()))
@@ -303,6 +398,35 @@ private boolean isTemporaryClosureActive(Pharmacy pharmacy) {
                 .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
 
         pharmacy.setPhone(phone);
+        pharmacyRepository.save(pharmacy);
+    }
+
+    @Override
+    public void updateLocation(Long telegramId, Double latitude, Double longitude, String city, String area,
+                               String formattedAddress, String landmark) {
+        Pharmacy pharmacy = pharmacyRepository.findByTelegramId(telegramId)
+                .orElseThrow(() -> new RuntimeException("Pharmacy not found"));
+        if (latitude == null || longitude == null) {
+            throw new RuntimeException("Latitude and longitude are required");
+        }
+        if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+            throw new RuntimeException("Coordinates are out of range");
+        }
+
+        pharmacy.setLatitude(latitude);
+        pharmacy.setLongitude(longitude);
+        if (city != null && !city.isBlank()) {
+            pharmacy.setCity(city.trim());
+        }
+        if (area != null && !area.isBlank()) {
+            pharmacy.setArea(area.trim());
+        }
+        if (formattedAddress != null) {
+            pharmacy.setFormattedAddress(formattedAddress.isBlank() ? null : formattedAddress.trim());
+        }
+        if (landmark != null) {
+            pharmacy.setLandmark(landmark.isBlank() ? null : landmark.trim());
+        }
         pharmacyRepository.save(pharmacy);
     }
 
@@ -461,7 +585,8 @@ public List<MultiMedicinePharmacyResultDTO> searchMultipleMedicinesNearby(
             continue;
         }
 
-        List<PharmacyInventory> inventoryList = inventoryRepository.findByPharmacyId(pharmacy.getId());
+        List<PharmacyInventory> inventoryList = visibleForCustomerSearch(
+                inventoryRepository.findByPharmacyId(pharmacy.getId()));
 
         Map<String, PharmacyInventory> inventoryMap = new HashMap<>();
         for (PharmacyInventory item : inventoryList) {
@@ -473,7 +598,10 @@ public List<MultiMedicinePharmacyResultDTO> searchMultipleMedicinesNearby(
         MultiMedicinePharmacyResultDTO dto = new MultiMedicinePharmacyResultDTO();
         dto.setPharmacyId(pharmacy.getId());
         dto.setName(pharmacy.getName());
+        dto.setCity(pharmacy.getCity());
         dto.setArea(pharmacy.getArea());
+        dto.setLandmark(pharmacy.getLandmark());
+        dto.setFormattedAddress(pharmacy.getFormattedAddress());
         dto.setPhone(pharmacy.getPhone());
         dto.setLatitude(pharmacy.getLatitude());
         dto.setLongitude(pharmacy.getLongitude());
@@ -487,7 +615,14 @@ public List<MultiMedicinePharmacyResultDTO> searchMultipleMedicinesNearby(
 );
         dto.setDistance(distance);
 
-        dto.setOpenNow(isOpenNow(pharmacy.getOpenTime(), pharmacy.getCloseTime()));
+        dto.setOpenNow(!isTemporaryClosureActive(pharmacy) && isOpenNow(pharmacy.getOpenTime(), pharmacy.getCloseTime()));
+        dto.setTemporarilyClosed(isTemporaryClosureActive(pharmacy));
+        if (pharmacy.getOpenTime() != null) {
+            dto.setOpenTime(pharmacy.getOpenTime().toString());
+        }
+        if (pharmacy.getCloseTime() != null) {
+            dto.setCloseTime(pharmacy.getCloseTime().toString());
+        }
 
         for (String medicine : normalizedMedicines) {
             PharmacyInventory item = inventoryMap.get(medicine);
